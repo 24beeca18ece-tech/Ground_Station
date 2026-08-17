@@ -1,0 +1,10 @@
+# Ground Control Station — runtime dependencies
+#
+# Tested on Python 3.10 / 3.11 / 3.12.
+# NOTE: PyQt5 has no binary wheels for Python 3.13+ — use a 3.10-3.12
+# interpreter for the virtual environment.
+
+PyQt5>=5.15.9,<6
+pyqtgraph>=0.13.3
+pyserial>=3.5
+numpy>=1.23        # required by pyqtgraph for array handling

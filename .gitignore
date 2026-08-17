@@ -1,0 +1,71 @@
+# =============================================================================
+#  Ground Control Station -- git ignore rules
+# =============================================================================
+
+# --- Python virtual environments --------------------------------------------
+# Never commit the venv: it is ~70 MB of platform-specific binaries and is
+# rebuilt from requirements.txt in seconds.
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python bytecode and caches ---------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Flight logs (generated at runtime) --------------------------------------
+# Telemetry captures are session data, not source. The logs/ directory itself
+# IS tracked (via logs/.gitkeep) so the application has somewhere to write on
+# a fresh clone -- only its contents are ignored.
+logs/*.csv
+logs/*.log
+logs/*.txt
+
+# --- LaTeX build artefacts ---------------------------------------------------
+# docs/*.tex and the compiled docs/*.pdf are tracked deliverables; everything
+# the TeX engine regenerates on each build is not.
+*.aux
+*.lof
+*.log
+*.lot
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.xdv
+*.bbl
+*.blg
+*.idx
+*.ilg
+*.ind
+
+# --- Editor / IDE ------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# --- Claude Code local settings ----------------------------------------------
+# Machine-specific tool permissions; not useful to other team members.
+.claude/settings.local.json
+
+# --- Packaging / distribution ------------------------------------------------
+build/
+dist/
+*.egg-info/
+
+# --- OS cruft ----------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store

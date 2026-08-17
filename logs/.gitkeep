@@ -1,0 +1,2 @@
+﻿# Keeps the logs/ directory in version control.
+# Flight CSVs and error logs written here are ignored - see /.gitignore.
