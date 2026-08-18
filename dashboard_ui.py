@@ -39,6 +39,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QStackedWidget,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -57,9 +58,20 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
 from csv_logger import CsvLoggerThread
 from serial_worker import SerialWorker, list_serial_ports
-from telemetry_packet import FSM_COLORS, FSM_STATES, TelemetryPacket
+from session_summary_widget import SessionSummaryWidget
+from telemetry_packet import (
+    FSM_COLORS,
+    FSM_STATES,
+    PAYLOAD_CANSAT,
+    PAYLOAD_GENERIC,
+    PAYLOAD_ROCKET,
+    RECOVERY_STAGE_COLORS,
+    RECOVERY_STAGES,
+    TelemetryPacket,
+)
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -101,6 +113,12 @@ COL_PRESS = "#ffb74d"
 COL_TEMP = "#ff7a7a"
 COL_VOLT = "#7ee787"
 COL_XYZ = ("#ff6b6b", "#4ade80", "#60a5fa")  # X, Y, Z
+
+# Vehicle-specific payload colours.
+COL_PM1 = "#5ad2f4"    # SPS30 PM1.0
+COL_PM25 = "#f4b73f"   # SPS30 PM2.5
+COL_PM10 = "#f4685a"   # SPS30 PM10
+COL_WHEEL = "#c79bff"  # reaction wheel RPM
 
 DARK_QSS = f"""
 QWidget {{
@@ -236,6 +254,61 @@ class ReadoutTile(QFrame):
         self.value.setStyleSheet("color: %s;" % color)
 
 
+class StatusLight(QFrame):
+    """A labelled indicator lamp for a latching event (pyro fired / safe).
+
+    Deliberately shows three visual states rather than two: a lamp that is dark
+    because no telemetry has arrived must not look the same as a lamp that is
+    dark because the charge has not fired.
+    """
+
+    def __init__(self, caption: str, fired_text: str = "FIRED",
+                 safe_text: str = "SAFE", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setStyleSheet(
+            "QFrame { background-color: %s; border: 1px solid %s; border-radius: 5px; }"
+            % (COL_PANEL_HI, COL_BORDER)
+        )
+        self._fired_text = fired_text
+        self._safe_text = safe_text
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 6, 9, 7)
+        layout.setSpacing(3)
+
+        caption_label = QLabel(caption.upper())
+        caption_font = QFont()
+        caption_font.setPointSize(8)
+        caption_font.setBold(True)
+        caption_label.setFont(caption_font)
+        caption_label.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_TEXT_DIM)
+        layout.addWidget(caption_label)
+
+        self.lamp = QLabel("NO DATA")
+        lamp_font = QFont()
+        lamp_font.setPointSize(11)
+        lamp_font.setBold(True)
+        self.lamp.setFont(lamp_font)
+        self.lamp.setAlignment(Qt.AlignCenter)
+        self.lamp.setMinimumHeight(30)
+        layout.addWidget(self.lamp)
+
+        self.set_state(None)
+
+    def set_state(self, fired: Optional[bool]) -> None:
+        if fired is None:
+            text, bg, fg = "NO DATA", "#242c38", COL_TEXT_DIM
+        elif fired:
+            text, bg, fg = self._fired_text, COL_ALERT, "#ffffff"
+        else:
+            text, bg, fg = self._safe_text, "#1f6f3f", "#ffffff"
+        self.lamp.setText(text)
+        self.lamp.setStyleSheet(
+            "background-color: %s; color: %s; border-radius: 4px;" % (bg, fg)
+        )
+
+
 class StripChart(pg.PlotWidget):
     """Scrolling time-series plot holding its own data buffers.
 
@@ -259,6 +332,10 @@ class StripChart(pg.PlotWidget):
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=True, y=True)
         self.setMinimumHeight(170)
+        # A plot inside the scrollable left column must not take focus: Qt
+        # responds by calling ensureWidgetVisible on the QScrollArea, which
+        # silently scrolls the payload readouts out of view.
+        self.setFocusPolicy(Qt.NoFocus)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.getPlotItem().setContentsMargins(4, 4, 10, 4)
 
@@ -346,6 +423,7 @@ class GpsTrackPlot(pg.PlotWidget):
         self.showGrid(x=True, y=True, alpha=0.22)
         self.setMenuEnabled(False)
         self.setMinimumHeight(165)
+        self.setFocusPolicy(Qt.NoFocus)   # see StripChart: keeps the column put
 
         self._lats: List[float] = []
         self._lons: List[float] = []
@@ -407,11 +485,14 @@ class Dashboard(QMainWindow):
         self.total_frames = 0
         self.valid_packets = 0
         self.corrupt_packets = 0
+        self.resyncs = 0
         self.logging_enabled = False
         self.is_connected = False
         self._readouts_dirty = False
         self._was_stale = False
         self._last_fsm: Optional[int] = None
+        #: PAYLOAD_TYPE seen in the stream; drives the auto-detected panel.
+        self._detected_payload: str = ""
 
         # --- worker threads --------------------------------------------------
         self.serial_worker = SerialWorker(self)
@@ -433,6 +514,15 @@ class Dashboard(QMainWindow):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._update_link_status)
         self.status_timer.start(int(1000 / STATUS_HZ))
+
+        # The attitude model runs on its own timer: it wants a higher, smoother
+        # frame rate than the strip charts, and it is cheap (one 4x4 transform).
+        self.attitude_timer = QTimer(self)
+        self.attitude_timer.timeout.connect(self.attitude.redraw)
+        self.attitude_timer.start(int(1000 / ATTITUDE_RENDER_HZ))
+
+        # Once the first layout pass has run, park the left column at the top.
+        QTimer.singleShot(0, lambda: self._left_scroll.verticalScrollBar().setValue(0))
 
         self.refresh_ports()
         self.append_event("Ground station ready. Select a port and press CONNECT.")
@@ -456,12 +546,23 @@ class Dashboard(QMainWindow):
 
         root_layout.addWidget(self._build_connection_bar())
 
+        # Right-hand side is itself split vertically: strip charts on top,
+        # attitude + session summary below.  A splitter rather than a tab widget
+        # so a reviewer can see the flight profile and the summary at the same
+        # time, and still drag either to full height when they want detail.
+        right = QSplitter(Qt.Vertical)
+        right.addWidget(self._build_plot_grid())
+        right.addWidget(self._build_analysis_row())
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 1)
+        right.setSizes([620, 300])
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left_column())
-        splitter.addWidget(self._build_plot_grid())
+        splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([430, 1250])
+        splitter.setSizes([470, 1210])
         root_layout.addWidget(splitter, 1)
 
         self.statusBar().setStyleSheet(
@@ -535,13 +636,17 @@ class Dashboard(QMainWindow):
         never be able to scroll the mission-critical state out of view.
         """
         panel = QWidget()
-        panel.setMinimumWidth(400)
+        # Wide enough for three SPS30 tiles side by side plus the scrollbar.
+        panel.setMinimumWidth(452)
         outer = QVBoxLayout(panel)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
 
         outer.addWidget(self._build_fsm_banner())
         outer.addWidget(self._build_readouts())
+        # Pinned too: recovery status and the scored SPS30 payload are exactly
+        # the readouts an operator must not be able to scroll out of view.
+        outer.addWidget(self._build_payload_panel())
 
         scroll_content = QWidget()
         inner = QVBoxLayout(scroll_content)
@@ -558,6 +663,10 @@ class Dashboard(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll, 1)
+        # Kept so the dashboard can force the column back to the top once the
+        # layout settles — the payload panel is the first thing the operator
+        # should see, not whatever Qt last decided to scroll to.
+        self._left_scroll = scroll
         return panel
 
     def _build_fsm_banner(self) -> QWidget:
@@ -602,6 +711,148 @@ class Dashboard(QMainWindow):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         return box
+
+    # -- vehicle-specific payload panels ---------------------------------
+
+    def _build_payload_panel(self) -> QWidget:
+        """Stacked CanSat / Rocket / generic panels, switched by PAYLOAD_TYPE.
+
+        A ``QStackedWidget`` rather than show/hide so the layout height stays
+        constant when the vehicle changes -- nothing below it jumps around.
+        """
+        self.payload_box = QGroupBox("PAYLOAD — waiting for telemetry")
+        outer = QVBoxLayout(self.payload_box)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        self.payload_stack = QStackedWidget()
+        self.payload_stack.addWidget(self._build_generic_page())   # index 0
+        self.payload_stack.addWidget(self._build_cansat_page())    # index 1
+        self.payload_stack.addWidget(self._build_rocket_page())    # index 2
+        # Without an explicit floor the stack is the first thing the scrollable
+        # column squeezes when the content is taller than the viewport, and the
+        # panel collapses to a few pixels.  Each page declares its own minimum
+        # height and _apply_payload_panel() applies the active one.
+        self.payload_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        outer.addWidget(self.payload_stack)
+        return self.payload_box
+
+    def _build_generic_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(
+            "No vehicle-specific sensors in this stream.\n"
+            "Legacy v1 packets carry the common telemetry only."
+        )
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("color: %s;" % COL_TEXT_DIM)
+        label.setMinimumHeight(64)
+        layout.addWidget(label)
+        page.setMinimumHeight(80)
+        return page
+
+    def _build_cansat_page(self) -> QWidget:
+        """CanSat: SPS30 air quality, reaction wheel, recovery stage."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # --- SPS30 particulate trio ----------------------------------------
+        air_label = QLabel("AIR QUALITY — SENSIRION SPS30 (µg/m³)")
+        air_font = QFont()
+        air_font.setPointSize(8)
+        air_font.setBold(True)
+        air_label.setFont(air_font)
+        air_label.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_ACCENT)
+        layout.addWidget(air_label)
+
+        air_row = QHBoxLayout()
+        air_row.setSpacing(6)
+        self.tile_pm1 = ReadoutTile("PM1.0", "", COL_PM1, value_pt=13)
+        self.tile_pm25 = ReadoutTile("PM2.5", "", COL_PM25, value_pt=13)
+        self.tile_pm10 = ReadoutTile("PM10", "", COL_PM10, value_pt=13)
+        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm10):
+            # Equal stretch and a small floor: three tiles must share the
+            # column width evenly without the last one being clipped.
+            tile.setMinimumWidth(84)
+            air_row.addWidget(tile, 1)
+        layout.addLayout(air_row)
+
+        # --- reaction wheel -------------------------------------------------
+        wheel_row = QHBoxLayout()
+        wheel_row.setSpacing(6)
+        self.tile_wheel = ReadoutTile("Reaction wheel", "RPM", COL_WHEEL, value_pt=15)
+        self.tile_wheel.setToolTip(
+            "Active stabilisation reaction wheel speed.\n"
+            "Signed: sign indicates spin direction. Saturates at ±1124 RPM."
+        )
+        wheel_row.addWidget(self.tile_wheel, 1)
+
+        self.tile_recovery = ReadoutTile("Recovery", "", COL_TEXT, value_pt=15)
+        self.tile_recovery.setToolTip(
+            "Recovery sequencer stage: STOWED -> DROGUE -> PARAFOIL."
+        )
+        wheel_row.addWidget(self.tile_recovery, 1)
+        layout.addLayout(wheel_row)
+
+        # --- reaction wheel history ----------------------------------------
+        self.chart_wheel = StripChart(
+            "Reaction wheel RPM", "RPM", [("rpm", COL_WHEEL)]
+        )
+        # Compact: this page is pinned, so every pixel it takes is a pixel the
+        # scrollable panels below lose. The RPM value is the primary readout;
+        # the trace is here for trend, not for precise reading.
+        self.chart_wheel.setMinimumHeight(84)
+        self.chart_wheel.setMaximumHeight(96)
+        self.chart_wheel.setTitle(None)
+        layout.addWidget(self.chart_wheel)
+        page.setMinimumHeight(244)
+        return page
+
+    def _build_rocket_page(self) -> QWidget:
+        """Rocket: dual-stage recovery status lights."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        caption = QLabel("DUAL-STAGE RECOVERY")
+        caption_font = QFont()
+        caption_font.setPointSize(8)
+        caption_font.setBold(True)
+        caption.setFont(caption_font)
+        caption.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_ACCENT)
+        layout.addWidget(caption)
+
+        lights = QHBoxLayout()
+        lights.setSpacing(6)
+        self.light_solenoid = StatusLight("Solenoid (apogee)")
+        self.light_solenoid.setToolTip(
+            "6 V solenoid latch, released at apogee to deploy the drogue."
+        )
+        self.light_nichrome = StatusLight("Nichrome (400 m)")
+        self.light_nichrome.setToolTip(
+            "Nichrome line cutter, fired at 400 m AGL to deploy the main."
+        )
+        lights.addWidget(self.light_solenoid)
+        lights.addWidget(self.light_nichrome)
+        layout.addLayout(lights)
+
+        self.recovery_summary = QLabel("Recovery sequence not started")
+        self.recovery_summary.setAlignment(Qt.AlignCenter)
+        self.recovery_summary.setStyleSheet(
+            "color: %s; background:#242c38; border-radius:4px; padding:5px;"
+            % COL_TEXT_DIM
+        )
+        layout.addWidget(self.recovery_summary)
+        # The stack reserves the tallest page's height (CanSat), so send the
+        # slack to the bottom rather than letting it open gaps between rows.
+        layout.addStretch(1)
+        page.setMinimumHeight(152)
+        return page
 
     def _build_gps_panel(self) -> QWidget:
         box = QGroupBox("GPS / NavIC")
@@ -677,12 +928,23 @@ class Dashboard(QMainWindow):
         self.volt_spin.setValue(DEFAULT_VOLTAGE_WARN)
         grid.addWidget(self.volt_spin, 1, 1)
 
+        grid.addWidget(QLabel("Vehicle panel:"), 2, 0)
+        self.vehicle_combo = QComboBox()
+        self.vehicle_combo.addItems(["Auto-detect", "CanSat", "Rocket"])
+        self.vehicle_combo.setToolTip(
+            "Which payload panel to show.\n"
+            "Auto-detect follows the PAYLOAD_TYPE field in the incoming stream; "
+            "the manual settings pin the panel regardless of what arrives."
+        )
+        self.vehicle_combo.currentIndexChanged.connect(self._apply_payload_panel)
+        grid.addWidget(self.vehicle_combo, 2, 1)
+
         self.autoscroll_check = QCheckBox("Auto-scale Y axes")
         self.autoscroll_check.setChecked(True)
-        grid.addWidget(self.autoscroll_check, 2, 0, 1, 2)
+        grid.addWidget(self.autoscroll_check, 3, 0, 1, 2)
 
         self.clear_btn = QPushButton("Clear plots && counters")
-        grid.addWidget(self.clear_btn, 3, 0, 1, 2)
+        grid.addWidget(self.clear_btn, 4, 0, 1, 2)
 
         grid.setColumnStretch(1, 1)
         return box
@@ -734,6 +996,32 @@ class Dashboard(QMainWindow):
             grid.setRowStretch(row, 1)
         for col in range(2):
             grid.setColumnStretch(col, 1)
+        return container
+
+    # -- attitude + session summary row ----------------------------------
+
+    def _build_analysis_row(self) -> QWidget:
+        """Bottom-right row: live attitude model beside the session donut."""
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        attitude_box = QGroupBox("VEHICLE ATTITUDE")
+        attitude_layout = QVBoxLayout(attitude_box)
+        attitude_layout.setContentsMargins(8, 8, 8, 8)
+        self.attitude = AttitudeWidget()
+        attitude_layout.addWidget(self.attitude)
+        row.addWidget(attitude_box, 1)
+
+        summary_box = QGroupBox("SESSION SUMMARY")
+        summary_layout = QVBoxLayout(summary_box)
+        summary_layout.setContentsMargins(8, 8, 8, 8)
+        self.summary = SessionSummaryWidget()
+        summary_layout.addWidget(self.summary)
+        row.addWidget(summary_box, 1)
+
+        container.setMinimumHeight(230)
         return container
 
     # ==================================================================
@@ -870,6 +1158,22 @@ class Dashboard(QMainWindow):
                 x, {"X": packet.gyro_x, "Y": packet.gyro_y, "Z": packet.gyro_z}
             )
 
+            # Vehicle-specific series and panel switching.
+            if packet.payload_type != self._detected_payload:
+                self._detected_payload = packet.payload_type
+                self._apply_payload_panel()
+                self.append_event("Payload type detected: %s" % packet.payload_type)
+
+            if packet.is_cansat:
+                self.chart_wheel.add_point(
+                    x, {"rpm": float(packet.reaction_wheel_rpm)}
+                )
+
+            # Attitude estimator and session summary get every packet; both are
+            # cheap accumulate-only slots that repaint on their own timers.
+            self.attitude.on_packet(packet)
+            self.summary.on_packet(packet)
+
             if packet.has_fix:
                 self.gps_plot.add_fix(packet.lat, packet.lon)
 
@@ -894,10 +1198,13 @@ class Dashboard(QMainWindow):
         # still has data even if CSV logging was never switched on.
         self.csv_logger.log_error(raw, reason)
 
-    def on_stats(self, total_frames: int, valid: int, corrupt: int) -> None:
+    def on_stats(self, total_frames: int, valid: int, corrupt: int,
+                 resyncs: int) -> None:
         self.total_frames = total_frames
         self.valid_packets = valid
         self.corrupt_packets = corrupt
+        self.resyncs = resyncs
+        self.summary.set_link_stats(valid, corrupt, resyncs)
 
     def on_log_file_opened(self, path: str) -> None:
         self.log_path_label.setText("CSV: %s" % path)
@@ -918,6 +1225,11 @@ class Dashboard(QMainWindow):
                 autoscale = self.autoscroll_check.isChecked()
                 for chart in self.charts:
                     chart.redraw(window_s, autoscale)
+                # The reaction-wheel chart lives in the CanSat payload page, so
+                # it is redrawn explicitly rather than via self.charts (which is
+                # the main grid only) and only when that page is visible.
+                if self.payload_stack.currentIndex() == 1:
+                    self.chart_wheel.redraw(window_s, autoscale)
                 self.gps_plot.redraw()
         except Exception as exc:  # pragma: no cover - defensive
             self.append_event("Render error: %r" % exc)
@@ -959,7 +1271,95 @@ class Dashboard(QMainWindow):
         self.tile_lat.set_level("normal" if packet.has_fix else "warn")
         self.tile_lon.set_level("normal" if packet.has_fix else "warn")
 
+        self._update_payload_readouts(packet)
         self._style_fsm(packet.fsm_state)
+
+    def _apply_payload_panel(self) -> None:
+        """Show the panel for the selected (or auto-detected) vehicle type."""
+        choice = self.vehicle_combo.currentText()
+        if choice == "CanSat":
+            payload = PAYLOAD_CANSAT
+            source = "manual"
+        elif choice == "Rocket":
+            payload = PAYLOAD_ROCKET
+            source = "manual"
+        else:
+            payload = self._detected_payload or ""
+            source = "auto"
+
+        if payload == PAYLOAD_CANSAT:
+            self.payload_stack.setCurrentIndex(1)
+            title = "PAYLOAD — CANSAT (SPS30 + REACTION WHEEL)"
+        elif payload == PAYLOAD_ROCKET:
+            self.payload_stack.setCurrentIndex(2)
+            title = "PAYLOAD — ROCKET (DUAL-STAGE RECOVERY)"
+        elif payload == PAYLOAD_GENERIC:
+            self.payload_stack.setCurrentIndex(0)
+            title = "PAYLOAD — GENERIC (LEGACY v1 STREAM)"
+        else:
+            self.payload_stack.setCurrentIndex(0)
+            title = "PAYLOAD — waiting for telemetry"
+        if source == "manual":
+            title += "  [PINNED]"
+        self.payload_box.setTitle(title)
+
+        # Re-floor the stack to the visible page so a short page (rocket) does
+        # not leave dead space and a tall one (CanSat) is not squeezed away.
+        current = self.payload_stack.currentWidget()
+        if current is not None:
+            self.payload_stack.setMinimumHeight(current.minimumHeight())
+
+    def _update_payload_readouts(self, packet: TelemetryPacket) -> None:
+        """Refresh the vehicle-specific tiles from the latest packet."""
+        if packet.is_cansat:
+            self.tile_pm1.set_value(self._fmt(packet.pm1_0, 1))
+            self.tile_pm25.set_value(self._fmt(packet.pm2_5, 1))
+            self.tile_pm10.set_value(self._fmt(packet.pm10, 1))
+
+            # WHO 24-hour guideline for PM2.5 is 15 µg/m³; well above that is
+            # exactly the plume the SPS30 is flown to measure, so a high value
+            # is a successful measurement, not a fault. Colour it as
+            # "elevated"/"high" rather than warn/alert.
+            pm25 = packet.pm2_5
+            if not math.isfinite(pm25):
+                self.tile_pm25.set_level("normal")
+            elif pm25 >= 55.0:
+                self.tile_pm25.set_level("alert")
+            elif pm25 >= 15.0:
+                self.tile_pm25.set_level("warn")
+            else:
+                self.tile_pm25.set_level("ok")
+
+            rpm = packet.reaction_wheel_rpm
+            self.tile_wheel.set_value("%+d" % rpm)
+            # Near saturation the wheel can no longer authority-control the
+            # spin, which is worth flagging to the operator.
+            self.tile_wheel.set_level("alert" if abs(rpm) >= 1050 else "normal")
+
+            stage = packet.recovery_stage
+            self.tile_recovery.set_value(
+                RECOVERY_STAGES.get(stage, "UNKNOWN(%s)" % stage)
+            )
+            color = RECOVERY_STAGE_COLORS.get(stage, COL_TEXT)
+            self.tile_recovery.value.setStyleSheet("color: %s;" % color)
+
+        elif packet.is_rocket:
+            self.light_solenoid.set_state(packet.solenoid_fired)
+            self.light_nichrome.set_state(packet.nichrome_fired)
+
+            if packet.nichrome_fired:
+                text = "Main deployed — nichrome cut at 400 m AGL"
+                style = "color:#0b1219; background:%s;" % COL_OK
+            elif packet.solenoid_fired:
+                text = "Drogue deployed — solenoid latch released at apogee"
+                style = "color:#0b1219; background:%s;" % COL_WARN
+            else:
+                text = "Recovery armed — no events fired"
+                style = "color:%s; background:#242c38;" % COL_TEXT_DIM
+            self.recovery_summary.setText(text)
+            self.recovery_summary.setStyleSheet(
+                style + " border-radius:4px; padding:5px;"
+            )
 
     def _style_fsm(self, state: Optional[int]) -> None:
         if state is None:
@@ -1062,13 +1462,17 @@ class Dashboard(QMainWindow):
         """Wipe the plots and the on-screen counters (does not touch the CSV)."""
         for chart in self.charts:
             chart.clear_data()
+        self.chart_wheel.clear_data()
         self.gps_plot.clear_data()
+        self.attitude.clear()
+        self.summary.clear()
         self.recv_times.clear()
         self.session_packets = 0
         self.first_mission_time = None
         self.session_start = time.time()
         self.serial_worker.reset_counters()
         self.total_frames = self.valid_packets = self.corrupt_packets = 0
+        self.resyncs = 0
         self.tile_total.set_value("0/0")
         self.tile_corrupt.set_value("0")
         self.append_event("Plots and counters cleared.")
@@ -1092,6 +1496,7 @@ class Dashboard(QMainWindow):
         try:
             self.render_timer.stop()
             self.status_timer.stop()
+            self.attitude_timer.stop()
 
             self.serial_worker.stop()
             if not self.serial_worker.wait(3000):

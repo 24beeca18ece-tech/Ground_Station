@@ -8,3 +8,9 @@ PyQt5>=5.15.9,<6
 pyqtgraph>=0.13.3
 pyserial>=3.5
 numpy>=1.23        # required by pyqtgraph for array handling
+PyOpenGL>=3.1.6    # 3D attitude view (pyqtgraph.opengl); see note below
+
+# The attitude panel degrades gracefully to a 2D artificial-horizon view drawn
+# with QPainter if PyOpenGL is missing or no OpenGL context is available (VMs,
+# RDP sessions, broken GPU drivers), so this dependency is strongly recommended
+# but not strictly required for the dashboard to start.

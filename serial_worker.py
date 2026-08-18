@@ -213,8 +213,11 @@ class SerialWorker(QThread):
     packet_received = pyqtSignal(object)
     #: ``(raw_frame_text, reason)`` for a corrupt or unparseable frame.
     bad_frame = pyqtSignal(str, str)
-    #: ``(total_frames, valid_packets, corrupt_packets)`` — throttled to ~5 Hz.
-    stats_updated = pyqtSignal(int, int, int)
+    #: ``(total_frames, valid_packets, corrupt_packets, resyncs)`` — throttled
+    #: to ~5 Hz.  ``resyncs`` counts frame-sync recoveries (truncated frames and
+    #: oversized junk), which the session-summary panel reports as a distinct
+    #: link-integrity category from checksum failures.
+    stats_updated = pyqtSignal(int, int, int, int)
     #: ``(is_connected, human_readable_message)``
     connection_changed = pyqtSignal(bool, str)
     #: Free-form line for the on-screen event log.
@@ -273,6 +276,7 @@ class SerialWorker(QThread):
         self.total_frames = 0
         self.valid_packets = 0
         self.corrupt_packets = 0
+        self._splitter.resyncs = 0
         self._emit_stats(force=True)
 
     # ------------------------------------------------------------------
@@ -461,5 +465,6 @@ class SerialWorker(QThread):
             return
         self._last_stats_emit = now
         self.stats_updated.emit(
-            self.total_frames, self.valid_packets, self.corrupt_packets
+            self.total_frames, self.valid_packets, self.corrupt_packets,
+            self._splitter.resyncs,
         )

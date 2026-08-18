@@ -177,6 +177,9 @@ class CsvLoggerThread(QThread):
             self._open_csv(packet.team_id)
         if self._csv_writer is None:
             return  # open failed; error already reported
+        # to_csv_row() is polymorphic: CanSatPacket and RocketPacket fill in
+        # their own sensor columns and leave the other vehicle's columns blank,
+        # so one CSV can hold a mixed session and the row width never varies.
         row: List[Any] = packet.to_csv_row()
         self._csv_writer.writerow(row)
         self.rows_written += 1
@@ -203,17 +206,61 @@ class CsvLoggerThread(QThread):
             self.error_occurred.emit("Cannot create %s: %s" % (self.log_dir, exc))
             return False
 
+    def _existing_header_matches(self, path: str) -> bool:
+        """True when *path* already starts with the current CSV schema.
+
+        A packet-format change (v1 -> v2) widens ``CSV_HEADER``.  Appending new
+        rows to a file written under the old schema would silently produce a CSV
+        whose columns stop lining up part-way down -- the kind of corruption
+        nobody notices until they try to analyse the flight.
+        """
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as handle:
+                first = next(csv.reader(handle), None)
+        except (OSError, StopIteration, UnicodeDecodeError):
+            return False
+        return first == CSV_HEADER
+
+    def _rotate_stale_log(self, path: str) -> Optional[str]:
+        """Rename a log written under an older schema so a fresh one can start.
+
+        The old data is preserved under a timestamped name rather than
+        overwritten -- previous flights are not ours to delete.
+        """
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base, ext = os.path.splitext(path)
+        archived = "%s_pre-v2_%s%s" % (base, stamp, ext)
+        try:
+            os.replace(path, archived)
+        except OSError as exc:
+            self.error_occurred.emit("Cannot archive %s: %s" % (path, exc))
+            return None
+        return archived
+
     def _open_csv(self, team_id: str) -> None:
         if not self._ensure_dir():
             return
         path = os.path.join(self.log_dir, "Flight_%s.csv" % safe_filename(team_id))
         try:
             # Append rather than truncate: a mid-competition restart must never
-            # destroy the earlier part of the flight.
-            is_new = (not os.path.exists(path)) or os.path.getsize(path) == 0
+            # destroy the earlier part of the flight.  The exception is a file
+            # written under a different schema, which is archived instead.
+            exists = os.path.exists(path) and os.path.getsize(path) > 0
+            if exists and not self._existing_header_matches(path):
+                archived = self._rotate_stale_log(path)
+                if archived is not None:
+                    self.error_occurred.emit(
+                        "Existing %s used an older column layout; archived it as "
+                        "%s and started a fresh log."
+                        % (os.path.basename(path), os.path.basename(archived))
+                    )
+                    exists = False
+                else:
+                    return  # could not archive; do not corrupt the old file
+
             handle = open(path, "a", newline="", encoding="utf-8")
             writer = csv.writer(handle)
-            if is_new:
+            if not exists:
                 writer.writerow(CSV_HEADER)
                 handle.flush()
         except OSError as exc:

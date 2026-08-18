@@ -29,6 +29,9 @@ USAGE
 -----
     python packet_sim.py                        # TCP server on 127.0.0.1:5555
     python packet_sim.py --rate 20              # 20 Hz (competition nominal)
+    python packet_sim.py --payload-type cansat  # SPS30 + reaction wheel (default)
+    python packet_sim.py --payload-type rocket  # solenoid + nichrome flags
+    python packet_sim.py --payload-type generic # legacy 19-field v1 frames
     python packet_sim.py --serial COM11         # write to a real/virtual COM port
     python packet_sim.py --stdout               # just print frames to the console
 
@@ -59,7 +62,16 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from telemetry_packet import build_frame  # noqa: E402
+from telemetry_packet import (  # noqa: E402
+    FIELD_COUNT_CANSAT,
+    FIELD_COUNT_ROCKET,
+    FIELD_COUNT_V1,
+    PAYLOAD_CANSAT,
+    PAYLOAD_GENERIC,
+    PAYLOAD_ROCKET,
+    SPS30_MAX_UGM3,
+    build_frame,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
@@ -80,30 +92,62 @@ GARBAGE_ALPHABET = b"abcdefghijklmnopqrstuvwxyz0123456789 ,.;:!?#@%&/\\<>[]{}"
 class MissionSim:
     """A simple but physically plausible sounding-rocket / CanSat profile.
 
-    Timeline (seconds after start), chosen so a full mission runs in ~75 s:
-        0–3     BOOT               on the pad, altitude 0
-        3–6     TEST_MODE
-        6–12    LAUNCH_PAD
-        12–22   ASCENT             burn then coast to apogee (780 m AGL)
-        22–24   DEPLOY             drogue out at apogee, −20 m/s
-        24–55   DESCENT            drogue descent at −20 m/s → ~120 m
-        55–75   AEROBRAKE_RELEASE  main out, −6 m/s to touchdown
-        75+     IMPACT             on the ground, altitude flat at 0
+    Timeline (seconds after start).  The main/aerobrake event is triggered by
+    *altitude* (400 m AGL, per the CDR) rather than by a hard-coded time, so the
+    timeline below is derived from the descent rates rather than assumed::
+
+        0-3      BOOT               on the pad, altitude 0
+        3-6      TEST_MODE
+        6-12     LAUNCH_PAD
+        12-22    ASCENT             burn then coast to apogee (780 m AGL)
+        22-24    DEPLOY             drogue out at apogee, -20 m/s
+        24-41    DESCENT            drogue descent at -20 m/s -> 400 m AGL
+        41-91    AEROBRAKE_RELEASE  main out at 400 m AGL, -8 m/s to touchdown
+        91+      IMPACT             on the ground, altitude flat at 0
+
+    Vehicle-specific sensors are generated according to *payload_type*:
+
+    * ``CANSAT`` -- Sensirion SPS30 particulate channels, reaction-wheel RPM and
+      the recovery-stage sequencer.
+    * ``ROCKET`` -- solenoid latch and nichrome cutter status flags.
+    * ``GENERIC`` -- neither; emits the legacy 19-field v1 frame, which is what
+      the pre-v2 firmware and the older log files use.
     """
 
     APOGEE_M = 780.0
     T_LAUNCH = 12.0
     T_APOGEE = 22.0
-    T_DROGUE_END = 24.0     # end of the DEPLOY transient
-    T_MAIN = 55.0           # aerobrake / main release
+    T_DROGUE_END = 24.0        # end of the DEPLOY transient
     DROGUE_MPS = 20.0
-    MAIN_MPS = 6.0
+    MAIN_DEPLOY_AGL = 400.0    # nichrome cutter altitude, per the CDR
+    MAIN_MPS = 8.0
 
-    def __init__(self, team_id: str = DEFAULT_TEAM_ID) -> None:
+    #: Reaction wheel saturation, per the CanSat CDR.
+    WHEEL_MAX_RPM = 1124
+
+    def __init__(self, team_id: str = DEFAULT_TEAM_ID,
+                 payload_type: str = PAYLOAD_CANSAT) -> None:
         self.team_id = team_id
+        self.payload_type = payload_type
         self.packet_count = 0
         self.t0 = time.time()
-        self.landed_alt: Optional[float] = None
+
+        # Derived timeline.  Computed once so _profile() stays branch-cheap.
+        self.alt_drogue_start = self.APOGEE_M - self.DROGUE_MPS * (
+            self.T_DROGUE_END - self.T_APOGEE
+        )
+        self.t_main = self.T_DROGUE_END + (
+            self.alt_drogue_start - self.MAIN_DEPLOY_AGL
+        ) / self.DROGUE_MPS
+        self.t_touchdown = self.t_main + self.MAIN_DEPLOY_AGL / self.MAIN_MPS
+
+        # Latched event flags.  Pyrotechnics never un-fire, so these are held as
+        # state rather than recomputed from t -- that way a clock glitch in the
+        # simulator cannot make an already-fired charge report SAFE again.
+        self._solenoid_fired = False
+        self._nichrome_fired = False
+        self._recovery_stage = 0
+        self._wheel_rpm = 0.0
 
     # -- physics-ish helpers ------------------------------------------------
 
@@ -130,25 +174,95 @@ class MissionSim:
             frac = (t - self.T_LAUNCH) / (self.T_APOGEE - self.T_LAUNCH)
             return self.APOGEE_M * (2 * frac - frac * frac), 3
 
-        # Altitude at the moment the drogue transient ends.
-        alt_drogue_start = self.APOGEE_M - self.DROGUE_MPS * (
-            self.T_DROGUE_END - self.T_APOGEE
-        )
         if t < self.T_DROGUE_END:
             return self.APOGEE_M - self.DROGUE_MPS * (t - self.T_APOGEE), 4
 
-        # Altitude at main / aerobrake release.
-        alt_main = alt_drogue_start - self.DROGUE_MPS * (
-            self.T_MAIN - self.T_DROGUE_END
-        )
-        if t < self.T_MAIN:
-            alt = alt_drogue_start - self.DROGUE_MPS * (t - self.T_DROGUE_END)
+        if t < self.t_main:
+            alt = self.alt_drogue_start - self.DROGUE_MPS * (t - self.T_DROGUE_END)
             return max(alt, 0.0), 5
 
-        alt = alt_main - self.MAIN_MPS * (t - self.T_MAIN)
+        # Main / aerobrake released at MAIN_DEPLOY_AGL.
+        alt = self.MAIN_DEPLOY_AGL - self.MAIN_MPS * (t - self.t_main)
         if alt <= 0.0:
             return 0.0, 7          # IMPACT — on the ground and staying there
         return alt, 6
+
+    # -- vehicle-specific sensor models -------------------------------------
+
+    def _particulates(self, t: float, alt_agl: float, state: int):
+        """Sensirion SPS30 mass concentrations, micrograms/m^3.
+
+        The scientific case for flying the SPS30 is measuring the particulate
+        column on the way down, so the interesting signal is the descent: the
+        CanSat falls through the ejection-charge smoke, then through the dust
+        layer that sits near the ground.  Ambient air on a clear field day is
+        only a few micrograms/m^3, so the plume is what dominates.
+
+        SPS30 channels are *cumulative* mass concentrations, so the sensor can
+        never report PM1.0 > PM2.5 > PM10.  The model builds them additively to
+        guarantee that ordering holds for every sample.
+        """
+        # Clean-air baseline with slow drift.
+        base = 4.0 + 1.5 * math.sin(t / 23.0)
+
+        plume = 0.0
+        if state == 4:
+            # Ejection charge fires right beside the inlet.
+            plume = 190.0
+        elif state in (5, 6):
+            # Descending through smoke aloft plus ground dust below ~250 m.
+            plume = 420.0 * math.exp(-max(alt_agl, 0.0) / 250.0)
+        elif state == 7:
+            # Landing kicks up dust, which then settles over ~20 s.
+            plume = 70.0 * math.exp(-max(0.0, t - self.t_touchdown) / 20.0)
+
+        pm1 = base + 0.30 * plume + random.gauss(0.0, 0.4)
+        pm25 = pm1 + 3.5 + 0.30 * plume + abs(random.gauss(0.0, 0.5))
+        pm10 = pm25 + 5.0 + 0.40 * plume + abs(random.gauss(0.0, 0.8))
+
+        clamp = lambda v: max(0.0, min(SPS30_MAX_UGM3, v))  # noqa: E731
+        return clamp(pm1), clamp(pm25), clamp(pm10)
+
+    def _reaction_wheel(self, state: int, gyro_z: float) -> int:
+        """Reaction-wheel RPM for the CanSat active stabilisation system.
+
+        The wheel counter-spins against the body rate, so its RPM tracks the
+        negated yaw rate.  It is held at rest while the vehicle is on the pad
+        (states BOOT / TEST_MODE / LAUNCH_PAD) and after touchdown, and it
+        saturates at the CDR figure of ~1124 RPM.  A first-order lag keeps the
+        commanded value from stepping instantaneously, which is what a real
+        wheel with rotor inertia does.
+        """
+        if state in (0, 1, 2, 7):
+            target = 0.0
+        else:
+            target = -gyro_z * 7.5
+
+        target = max(-self.WHEEL_MAX_RPM, min(self.WHEEL_MAX_RPM, target))
+        # Lag towards the target: 35 % of the error per packet.
+        self._wheel_rpm += 0.35 * (target - self._wheel_rpm)
+        return int(round(self._wheel_rpm + random.gauss(0.0, 4.0)))
+
+    def _update_events(self, state: int) -> None:
+        """Latch the recovery events off FSM state transitions.
+
+        CanSat recovery stage and rocket pyro flags are driven by the same two
+        events, so they stay in step with the FSM banner on the dashboard:
+
+        * ``DEPLOY`` (state 4)            -> drogue out  / solenoid latch fires
+        * ``AEROBRAKE_RELEASE`` (state 6) -> parafoil out / nichrome cutter fires
+        """
+        if state >= 4 and state != 7:
+            self._solenoid_fired = True
+            self._recovery_stage = max(self._recovery_stage, 1)
+        if state >= 6 and state != 7:
+            self._nichrome_fired = True
+            self._recovery_stage = max(self._recovery_stage, 2)
+        if state == 7:
+            # Landed: both events are long since latched.
+            self._solenoid_fired = True
+            self._nichrome_fired = True
+            self._recovery_stage = 2
 
     # -- packet assembly -----------------------------------------------------
 
@@ -194,16 +308,50 @@ class MissionSim:
 
         nav_time = time.strftime("%H%M%S", time.gmtime()) + ".00"
 
-        return (
-            "%s,%.2f,%d,%.2f,%.2f,%.2f,%.2f,%s,"
+        self._update_events(state)
+
+        # Fields shared by every format, minus the leading TEAM_ID/PAYLOAD_TYPE.
+        common = (
+            "%.2f,%d,%.2f,%.2f,%.2f,%.2f,%s,"
             "%.6f,%.6f,%.2f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d"
             % (
-                self.team_id, t, self.packet_count,
+                t, self.packet_count,
                 altitude, pressure, temperature, voltage, nav_time,
                 lat, lon, nav_alt, sats,
                 acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, state,
             )
         )
+
+        if self.payload_type == PAYLOAD_CANSAT:
+            pm1, pm25, pm10 = self._particulates(t, alt_agl, state)
+            rpm = self._reaction_wheel(state, gyro_z)
+            body = "%s,%s,%s,%.2f,%.2f,%.2f,%d,%d" % (
+                self.team_id, PAYLOAD_CANSAT, common,
+                pm1, pm25, pm10, rpm, self._recovery_stage,
+            )
+            expected = FIELD_COUNT_CANSAT
+        elif self.payload_type == PAYLOAD_ROCKET:
+            body = "%s,%s,%s,%d,%d" % (
+                self.team_id, PAYLOAD_ROCKET, common,
+                1 if self._solenoid_fired else 0,
+                1 if self._nichrome_fired else 0,
+            )
+            expected = FIELD_COUNT_ROCKET
+        else:
+            # Legacy v1: no PAYLOAD_TYPE, no vehicle-specific tail.
+            body = "%s,%s" % (self.team_id, common)
+            expected = FIELD_COUNT_V1
+
+        # Guard against the generator and the parser drifting apart: a field
+        # count mismatch here is a bug in this file, not a link problem, and it
+        # would otherwise surface as a flood of "corrupt" packets in the GCS.
+        actual = body.count(",") + 1
+        if actual != expected:
+            raise AssertionError(
+                "packet_sim built a %s body with %d fields, expected %d"
+                % (self.payload_type, actual, expected)
+            )
+        return body
 
     def next_frame(self) -> str:
         """A complete, checksum-correct ``$...*XX`` frame."""
@@ -270,7 +418,7 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
 
     ``send(data: bytes) -> None`` may raise to signal that the peer went away.
     """
-    sim = MissionSim(args.team_id)
+    sim = MissionSim(args.team_id, payload_type=args.payload_type)
     faults = FaultInjector(args)
     period = 1.0 / max(args.rate, 0.1)
     next_due = time.monotonic()
@@ -428,6 +576,14 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     flight = parser.add_argument_group("flight")
     flight.add_argument("--team-id", default=DEFAULT_TEAM_ID)
+    flight.add_argument(
+        "--payload-type", default="cansat",
+        choices=["cansat", "rocket", "generic"],
+        help="Vehicle to simulate. 'cansat' adds the SPS30 particulate "
+             "channels, reaction-wheel RPM and recovery stage; 'rocket' adds "
+             "the solenoid and nichrome status flags; 'generic' emits the "
+             "legacy 19-field v1 frame (default: cansat).",
+    )
     flight.add_argument("--rate", type=float, default=10.0,
                         help="Packets per second (default 10; competition is 20).")
     flight.add_argument("--duration", type=float, default=0.0,
@@ -454,6 +610,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Preset: a realistically hostile link.")
 
     args = parser.parse_args(argv)
+
+    # Map the friendly CLI spelling onto the wire token.
+    args.payload_type = {
+        "cansat": PAYLOAD_CANSAT,
+        "rocket": PAYLOAD_ROCKET,
+        "generic": PAYLOAD_GENERIC,
+    }[args.payload_type]
 
     if args.chaos:
         args.corrupt_rate = max(args.corrupt_rate, 0.06)
