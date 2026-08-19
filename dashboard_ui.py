@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QStackedWidget,
+    QTabWidget,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -60,6 +61,7 @@ from PyQt5.QtWidgets import (
 
 from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
 from csv_logger import CsvLoggerThread
+from diagnostics_window import DiagnosticsWindow, RawPacketStrip
 from serial_worker import SerialWorker, list_serial_ports
 from session_summary_widget import SessionSummaryWidget
 from telemetry_packet import (
@@ -196,6 +198,25 @@ QScrollBar::handle:vertical {{
 QScrollBar::handle:vertical:hover {{ background: #3d4c5e; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QSplitter::handle {{ background: {COL_BORDER}; width: 3px; }}
+QTabWidget::pane {{
+    background: {COL_PANEL};
+    border: 1px solid {COL_BORDER};
+    border-radius: 6px;
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: {COL_BG};
+    color: {COL_TEXT_DIM};
+    border: 1px solid {COL_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    padding: 5px 14px;
+    margin-right: 2px;
+    font-weight: 600;
+}}
+QTabBar::tab:selected {{ background: {COL_PANEL}; color: {COL_ACCENT}; }}
+QTabBar::tab:hover {{ color: {COL_TEXT}; }}
 """
 
 
@@ -224,15 +245,15 @@ class ReadoutTile(QFrame):
         self._unit = unit
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 6, 9, 7)
-        layout.setSpacing(1)
+        layout.setContentsMargins(8, 4, 8, 5)
+        layout.setSpacing(0)
 
         self.caption = QLabel(caption.upper())
         caption_font = QFont()
         caption_font.setPointSize(8)
         caption_font.setBold(True)
         self.caption.setFont(caption_font)
-        self.caption.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_TEXT_DIM)
+        self.caption.setStyleSheet("color: %s;" % COL_TEXT_DIM)
 
         self.value = QLabel("--")
         value_font = QFont("Consolas")
@@ -241,6 +262,11 @@ class ReadoutTile(QFrame):
         self.value.setFont(value_font)
         self.value.setStyleSheet("color: %s;" % value_color)
 
+        # Ignored horizontal policy: a QLabel otherwise reports its full
+        # text width as a hard minimum, and eight of them side by side pin the
+        # sidebar to a width no 1366 px laptop can satisfy.
+        for label in (self.caption, self.value):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(self.caption)
         layout.addWidget(self.value)
 
@@ -282,7 +308,7 @@ class StatusLight(QFrame):
         caption_font.setPointSize(8)
         caption_font.setBold(True)
         caption_label.setFont(caption_font)
-        caption_label.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_TEXT_DIM)
+        caption_label.setStyleSheet("color: %s;" % COL_TEXT_DIM)
         layout.addWidget(caption_label)
 
         self.lamp = QLabel("NO DATA")
@@ -292,6 +318,8 @@ class StatusLight(QFrame):
         self.lamp.setFont(lamp_font)
         self.lamp.setAlignment(Qt.AlignCenter)
         self.lamp.setMinimumHeight(30)
+        for label in (caption_label, self.lamp):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(self.lamp)
 
         self.set_state(None)
@@ -323,7 +351,8 @@ class StripChart(pg.PlotWidget):
 
     def __init__(self, title: str, y_label: str,
                  series: Sequence[Tuple[str, str]],
-                 parent: Optional[QWidget] = None) -> None:
+                 parent: Optional[QWidget] = None,
+                 legend: bool = True) -> None:
         super().__init__(parent)
         self.setTitle(title, color=COL_TEXT, size="10pt")
         self.setLabel("left", y_label, color=COL_TEXT_DIM)
@@ -331,7 +360,7 @@ class StripChart(pg.PlotWidget):
         self.showGrid(x=True, y=True, alpha=0.22)
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=True, y=True)
-        self.setMinimumHeight(170)
+        self.setMinimumHeight(118)
         # A plot inside the scrollable left column must not take focus: Qt
         # responds by calling ensureWidgetVisible on the QScrollArea, which
         # silently scrolls the payload readouts out of view.
@@ -344,7 +373,7 @@ class StripChart(pg.PlotWidget):
         self._y: Dict[str, List[float]] = {name: [] for name, _ in series}
         self._curves: Dict[str, pg.PlotDataItem] = {}
 
-        if len(series) > 1:
+        if len(series) > 1 and legend:
             # Anchored top-left (clear of the Y tick labels): the right-hand
             # corner is where the newest samples arrive and would be covered.
             self.addLegend(
@@ -356,7 +385,7 @@ class StripChart(pg.PlotWidget):
             curve = self.plot(
                 [], [],
                 pen=pg.mkPen(color, width=2),
-                name=name if len(series) > 1 else None,
+                name=name if (len(series) > 1 and legend) else None,
                 autoDownsample=True,
                 clipToView=True,
             )
@@ -422,7 +451,7 @@ class GpsTrackPlot(pg.PlotWidget):
         self.setLabel("bottom", "longitude", units="°", color=COL_TEXT_DIM)
         self.showGrid(x=True, y=True, alpha=0.22)
         self.setMenuEnabled(False)
-        self.setMinimumHeight(165)
+        self.setMinimumHeight(118)
         self.setFocusPolicy(Qt.NoFocus)   # see StripChart: keeps the column put
 
         self._lats: List[float] = []
@@ -499,6 +528,11 @@ class Dashboard(QMainWindow):
         self.csv_logger = CsvLoggerThread(log_dir=log_dir, parent=self)
 
         self._build_ui()
+
+        # Non-modal diagnostics window, created hidden. Parented to the main
+        # window so it closes with it.
+        self.diagnostics = DiagnosticsWindow(self)
+
         self._wire_signals()
 
         # Logger runs for the whole session: the errors log is always active,
@@ -520,6 +554,10 @@ class Dashboard(QMainWindow):
         self.attitude_timer = QTimer(self)
         self.attitude_timer.timeout.connect(self.attitude.redraw)
         self.attitude_timer.start(int(1000 / ATTITUDE_RENDER_HZ))
+
+        # Resolve the initial vehicle choice so the panel titles and the 3D
+        # model agree before any telemetry arrives.
+        self._apply_payload_panel()
 
         # Once the first layout pass has run, park the left column at the top.
         QTimer.singleShot(0, lambda: self._left_scroll.verticalScrollBar().setValue(0))
@@ -562,8 +600,14 @@ class Dashboard(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([470, 1210])
+        splitter.setSizes([616, 1064])
         root_layout.addWidget(splitter, 1)
+
+        # Single-line raw frame readout, pinned to the bottom of the window and
+        # above the status bar. Shows what actually arrived on the wire, valid
+        # or not, which is the first thing you want during bring-up.
+        self.raw_strip = RawPacketStrip()
+        root_layout.addWidget(self.raw_strip)
 
         self.statusBar().setStyleSheet(
             "QStatusBar { background: %s; color: %s; border-top: 1px solid %s; }"
@@ -582,7 +626,7 @@ class Dashboard(QMainWindow):
         layout.addWidget(QLabel("Port:"))
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)  # lets you type a URL such as socket://…
-        self.port_combo.setMinimumWidth(300)
+        self.port_combo.setMinimumWidth(190)
         self.port_combo.setToolTip(
             "Serial device (COM7, /dev/ttyUSB0) or a pyserial URL such as\n"
             "socket://127.0.0.1:5555 for the synthetic packet generator."
@@ -616,8 +660,18 @@ class Dashboard(QMainWindow):
         self.log_btn.setFixedWidth(170)
         layout.addWidget(self.log_btn)
 
+        self.diag_btn = QPushButton("DIAGNOSTICS")
+        self.diag_btn.setFixedWidth(148)
+        self.diag_btn.setToolTip(
+            "Open the raw telemetry diagnostics table in a separate window. "
+            "Shows every field of the most recent packet plus link statistics."
+        )
+        layout.addWidget(self.diag_btn)
+
         self.log_path_label = QLabel("CSV: not started")
         self.log_path_label.setStyleSheet("color: %s;" % COL_TEXT_DIM)
+        self.log_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.log_path_label.setMinimumWidth(0)
         layout.addWidget(self.log_path_label, 1)
 
         self.conn_state_label = QLabel("● DISCONNECTED")
@@ -629,45 +683,63 @@ class Dashboard(QMainWindow):
     # -- left column -----------------------------------------------------
 
     def _build_left_column(self) -> QWidget:
-        """Left column: a pinned header plus a scrollable remainder.
+        """Left sidebar, laid out as TWO sub-columns so nothing needs scrolling.
 
-        The flight-state banner and the primary readouts are deliberately kept
-        *outside* the scroll area — on a short laptop screen the operator must
-        never be able to scroll the mission-critical state out of view.
+        A single vertical stack of every panel came to roughly 1460 px, against
+        about 680 px of usable height on a 1366x768 laptop — a 2:1 overshoot
+        that no amount of padding trimming can close.  Splitting the sidebar
+        into two side-by-side sub-columns halves the required height, and the
+        two lowest-priority panels (display settings, event log) move out to the
+        bottom-right tab strip entirely:
+
+            sub-column A            sub-column B
+            ------------            ------------
+            Flight state            GPS / NavIC + ground track
+            Live telemetry          Link status
+            Payload
+
+        Both sub-columns fit inside one screenful at 768 px, which is what the
+        operator needs: flight state, telemetry, GPS, ground track and link
+        status all visible at once, with no scrolling.
         """
         panel = QWidget()
-        # Wide enough for three SPS30 tiles side by side plus the scrollbar.
-        panel.setMinimumWidth(452)
-        outer = QVBoxLayout(panel)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
+        panel.setMinimumWidth(548)
+        row = QHBoxLayout(panel)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(7)
 
-        outer.addWidget(self._build_fsm_banner())
-        outer.addWidget(self._build_readouts())
-        # Pinned too: recovery status and the scored SPS30 payload are exactly
-        # the readouts an operator must not be able to scroll out of view.
-        outer.addWidget(self._build_payload_panel())
+        col_a = QWidget()
+        left = QVBoxLayout(col_a)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(6)
+        left.addWidget(self._build_fsm_banner())
+        left.addWidget(self._build_readouts())
+        left.addWidget(self._build_payload_panel())
+        left.addStretch(1)
 
-        scroll_content = QWidget()
-        inner = QVBoxLayout(scroll_content)
-        inner.setContentsMargins(0, 0, 4, 0)
-        inner.setSpacing(8)
-        inner.addWidget(self._build_gps_panel(), 1)
-        inner.addWidget(self._build_link_panel())
-        inner.addWidget(self._build_settings_panel())
-        inner.addWidget(self._build_event_log())
+        col_b = QWidget()
+        right = QVBoxLayout(col_b)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)
+        right.addWidget(self._build_gps_panel())
+        right.addWidget(self._build_link_panel())
+        right.addStretch(1)
 
+        col_a.setMinimumWidth(286)
+        col_b.setMinimumWidth(254)
+        row.addWidget(col_a, 6)
+        row.addWidget(col_b, 5)
+
+        # Safety net only: at heights below ~730 px the sidebar scrolls rather
+        # than clipping.  At 768 and above no scrollbar appears at all.
         scroll = QScrollArea()
-        scroll.setWidget(scroll_content)
+        scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll, 1)
-        # Kept so the dashboard can force the column back to the top once the
-        # layout settles — the payload panel is the first thing the operator
-        # should see, not whatever Qt last decided to scroll to.
+        scroll.setMinimumWidth(560)
         self._left_scroll = scroll
-        return panel
+        return scroll
 
     def _build_fsm_banner(self) -> QWidget:
         box = QGroupBox("FLIGHT STATE")
@@ -680,7 +752,7 @@ class Dashboard(QMainWindow):
         fsm_font.setBold(True)
         self.fsm_label.setFont(fsm_font)
         self.fsm_label.setAlignment(Qt.AlignCenter)
-        self.fsm_label.setMinimumHeight(66)
+        self.fsm_label.setMinimumHeight(52)
         self._style_fsm(None)
         layout.addWidget(self.fsm_label)
         return box
@@ -735,6 +807,19 @@ class Dashboard(QMainWindow):
         # height and _apply_payload_panel() applies the active one.
         self.payload_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         outer.addWidget(self.payload_stack)
+
+        # Sensor reset lives here rather than only in the Settings tab: between
+        # bench runs the operator wants the payload traces cleared without
+        # hunting for it, and it applies to both vehicle types.
+        self.reset_sensors_btn = QPushButton("RESET SENSOR DATA")
+        self.reset_sensors_btn.setToolTip(
+            "Clear the payload sensor history for this session:\n"
+            "particulate and reaction-wheel traces, all strip charts, the ground\n"
+            "track, the attitude estimate and the link counters.\n"
+            "The CSV log is NOT touched and keeps recording."
+        )
+        self.reset_sensors_btn.clicked.connect(self.reset_sensor_data)
+        outer.addWidget(self.reset_sensors_btn)
         return self.payload_box
 
     def _build_generic_page(self) -> QWidget:
@@ -761,12 +846,13 @@ class Dashboard(QMainWindow):
         layout.setSpacing(6)
 
         # --- SPS30 particulate trio ----------------------------------------
-        air_label = QLabel("AIR QUALITY — SENSIRION SPS30 (µg/m³)")
+        air_label = QLabel("AIR QUALITY — SPS30 (µg/m³)")
         air_font = QFont()
         air_font.setPointSize(8)
         air_font.setBold(True)
         air_label.setFont(air_font)
         air_label.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_ACCENT)
+        air_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(air_label)
 
         air_row = QHBoxLayout()
@@ -777,9 +863,22 @@ class Dashboard(QMainWindow):
         for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm10):
             # Equal stretch and a small floor: three tiles must share the
             # column width evenly without the last one being clipped.
-            tile.setMinimumWidth(84)
+            tile.setMinimumWidth(56)
             air_row.addWidget(tile, 1)
         layout.addLayout(air_row)
+
+        # Particulate time series.  The SPS30 is the scored science payload, so
+        # its history matters as much as its instantaneous value -- the whole
+        # point of flying it is the concentration profile through the descent.
+        self.chart_pm = StripChart(
+            "Particulates", "µg/m³",
+            [("PM1.0", COL_PM1), ("PM2.5", COL_PM25), ("PM10", COL_PM10)],
+            legend=False,   # the colour-matched tiles above are the legend
+        )
+        self.chart_pm.setMinimumHeight(86)
+        self.chart_pm.setMaximumHeight(104)
+        self.chart_pm.setTitle(None)
+        layout.addWidget(self.chart_pm)
 
         # --- reaction wheel -------------------------------------------------
         wheel_row = QHBoxLayout()
@@ -809,7 +908,7 @@ class Dashboard(QMainWindow):
         self.chart_wheel.setMaximumHeight(96)
         self.chart_wheel.setTitle(None)
         layout.addWidget(self.chart_wheel)
-        page.setMinimumHeight(244)
+        page.setMinimumHeight(336)
         return page
 
     def _build_rocket_page(self) -> QWidget:
@@ -825,15 +924,16 @@ class Dashboard(QMainWindow):
         caption_font.setBold(True)
         caption.setFont(caption_font)
         caption.setStyleSheet("color: %s; letter-spacing: 1px;" % COL_ACCENT)
+        caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(caption)
 
         lights = QHBoxLayout()
         lights.setSpacing(6)
-        self.light_solenoid = StatusLight("Solenoid (apogee)")
+        self.light_solenoid = StatusLight("Solenoid")
         self.light_solenoid.setToolTip(
             "6 V solenoid latch, released at apogee to deploy the drogue."
         )
-        self.light_nichrome = StatusLight("Nichrome (400 m)")
+        self.light_nichrome = StatusLight("Nichrome")
         self.light_nichrome.setToolTip(
             "Nichrome line cutter, fired at 400 m AGL to deploy the main."
         )
@@ -843,6 +943,7 @@ class Dashboard(QMainWindow):
 
         self.recovery_summary = QLabel("Recovery sequence not started")
         self.recovery_summary.setAlignment(Qt.AlignCenter)
+        self.recovery_summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.recovery_summary.setStyleSheet(
             "color: %s; background:#242c38; border-radius:4px; padding:5px;"
             % COL_TEXT_DIM
@@ -872,8 +973,12 @@ class Dashboard(QMainWindow):
         grid.addWidget(self.tile_nav_time, 1, 1)
         layout.addLayout(grid)
 
+        # Kept close to square: a ground track stretched vertically
+        # misrepresents the shape of the trajectory at a glance.
         self.gps_plot = GpsTrackPlot()
-        layout.addWidget(self.gps_plot, 1)
+        self.gps_plot.setMinimumHeight(180)
+        self.gps_plot.setMaximumHeight(250)
+        layout.addWidget(self.gps_plot)
         return box
 
     def _build_link_panel(self) -> QWidget:
@@ -883,9 +988,9 @@ class Dashboard(QMainWindow):
         grid.setSpacing(6)
 
         self.tile_rate = ReadoutTile("Packet rate", "pkt/s", COL_ACCENT, value_pt=15)
-        self.tile_age = ReadoutTile("Last packet age", "s", COL_TEXT, value_pt=15)
-        self.tile_total = ReadoutTile("Valid / total pkts", "", COL_TEXT, value_pt=15)
-        self.tile_corrupt = ReadoutTile("Corrupt packets", "", COL_TEXT, value_pt=15)
+        self.tile_age = ReadoutTile("Packet age", "s", COL_TEXT, value_pt=15)
+        self.tile_total = ReadoutTile("Valid/Total", "", COL_TEXT, value_pt=15)
+        self.tile_corrupt = ReadoutTile("Corrupt", "", COL_TEXT, value_pt=15)
 
         grid.addWidget(self.tile_rate, 0, 0)
         grid.addWidget(self.tile_age, 0, 1)
@@ -908,19 +1013,19 @@ class Dashboard(QMainWindow):
         return box
 
     def _build_settings_panel(self) -> QWidget:
-        box = QGroupBox("DISPLAY SETTINGS")
+        box = QWidget()
         grid = QGridLayout(box)
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setSpacing(6)
 
-        grid.addWidget(QLabel("Chart window (s):"), 0, 0)
+        grid.addWidget(QLabel("Chart window (s)"), 0, 0)
         self.window_spin = QSpinBox()
         self.window_spin.setRange(5, 1800)
         self.window_spin.setValue(DEFAULT_WINDOW_S)
         self.window_spin.setSingleStep(5)
         grid.addWidget(self.window_spin, 0, 1)
 
-        grid.addWidget(QLabel("Battery warning (V):"), 1, 0)
+        grid.addWidget(QLabel("Batt. warn (V)"), 1, 0)
         self.volt_spin = QDoubleSpinBox()
         self.volt_spin.setRange(0.0, 60.0)
         self.volt_spin.setDecimals(2)
@@ -928,7 +1033,7 @@ class Dashboard(QMainWindow):
         self.volt_spin.setValue(DEFAULT_VOLTAGE_WARN)
         grid.addWidget(self.volt_spin, 1, 1)
 
-        grid.addWidget(QLabel("Vehicle panel:"), 2, 0)
+        grid.addWidget(QLabel("Vehicle panel"), 2, 0)
         self.vehicle_combo = QComboBox()
         self.vehicle_combo.addItems(["Auto-detect", "CanSat", "Rocket"])
         self.vehicle_combo.setToolTip(
@@ -950,13 +1055,13 @@ class Dashboard(QMainWindow):
         return box
 
     def _build_event_log(self) -> QWidget:
-        box = QGroupBox("EVENT LOG")
+        box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(8, 8, 8, 8)
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
         self.event_log.setMaximumBlockCount(EVENT_LOG_LINES)
-        self.event_log.setFixedHeight(112)
+        self.event_log.setMinimumHeight(96)
         layout.addWidget(self.event_log)
         return box
 
@@ -1003,25 +1108,42 @@ class Dashboard(QMainWindow):
     def _build_analysis_row(self) -> QWidget:
         """Bottom-right row: live attitude model beside the session donut."""
         container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        row = QSplitter(Qt.Horizontal)
+        row.setChildrenCollapsible(False)
+        outer.addWidget(row)
 
         attitude_box = QGroupBox("VEHICLE ATTITUDE")
+        self.attitude_box = attitude_box
         attitude_layout = QVBoxLayout(attitude_box)
         attitude_layout.setContentsMargins(8, 8, 8, 8)
         self.attitude = AttitudeWidget()
         attitude_layout.addWidget(self.attitude)
-        row.addWidget(attitude_box, 1)
+        attitude_box.setMinimumWidth(248)
+        row.addWidget(attitude_box)
 
         summary_box = QGroupBox("SESSION SUMMARY")
         summary_layout = QVBoxLayout(summary_box)
         summary_layout.setContentsMargins(8, 8, 8, 8)
         self.summary = SessionSummaryWidget()
         summary_layout.addWidget(self.summary)
-        row.addWidget(summary_box, 1)
+        summary_box.setMinimumWidth(248)
+        row.addWidget(summary_box)
 
-        container.setMinimumHeight(230)
+        # Display settings and the event log live here rather than in the left
+        # sidebar: they are the two panels an operator consults occasionally
+        # rather than watching continuously, so they are the right things to
+        # cost a tab click in exchange for GPS and link status never scrolling.
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self._build_event_log(), "Event log")
+        tabs.addTab(self._build_settings_panel(), "Settings")
+        tabs.setMinimumWidth(240)
+        row.addWidget(tabs)
+        row.setSizes([340, 340, 300])
+
+        container.setMinimumHeight(186)
         return container
 
     # ==================================================================
@@ -1045,6 +1167,7 @@ class Dashboard(QMainWindow):
         self.connect_btn.clicked.connect(self.toggle_connection)
         self.log_btn.clicked.connect(self.toggle_logging)
         self.clear_btn.clicked.connect(self.clear_session)
+        self.diag_btn.clicked.connect(self.toggle_diagnostics)
 
     # ==================================================================
     # Slots — connection control
@@ -1136,6 +1259,15 @@ class Dashboard(QMainWindow):
         try:
             self.latest = packet
             self.session_packets += 1
+
+            # Raw wire view and the diagnostics table. Both are plain setText
+            # work; the table is skipped entirely while its window is hidden so
+            # a closed diagnostics view costs nothing here.
+            self.raw_strip.show_packet(packet.raw_frame)
+            if self.diagnostics.isVisible():
+                self.diagnostics.update_packet(
+                    packet, voltage_warn=float(self.volt_spin.value())
+                )
             self.last_packet_epoch = packet.gs_recv_epoch
             self.recv_times.append(packet.gs_recv_epoch)
 
@@ -1168,6 +1300,11 @@ class Dashboard(QMainWindow):
                 self.chart_wheel.add_point(
                     x, {"rpm": float(packet.reaction_wheel_rpm)}
                 )
+                self.chart_pm.add_point(x, {
+                    "PM1.0": packet.pm1_0,
+                    "PM2.5": packet.pm2_5,
+                    "PM10": packet.pm10,
+                })
 
             # Attitude estimator and session summary get every packet; both are
             # cheap accumulate-only slots that repaint on their own timers.
@@ -1194,6 +1331,9 @@ class Dashboard(QMainWindow):
 
     def on_bad_frame(self, raw: str, reason: str) -> None:
         """A frame failed checksum or parsing — always archived, never fatal."""
+        # Still show the bytes: during bring-up, seeing corrupt traffic is far
+        # more informative than seeing nothing.
+        self.raw_strip.show_corrupt(raw)
         # Errors are logged unconditionally so a corrupted-link investigation
         # still has data even if CSV logging was never switched on.
         self.csv_logger.log_error(raw, reason)
@@ -1230,6 +1370,7 @@ class Dashboard(QMainWindow):
                 # the main grid only) and only when that page is visible.
                 if self.payload_stack.currentIndex() == 1:
                     self.chart_wheel.redraw(window_s, autoscale)
+                    self.chart_pm.redraw(window_s, autoscale)
                 self.gps_plot.redraw()
         except Exception as exc:  # pragma: no cover - defensive
             self.append_event("Render error: %r" % exc)
@@ -1274,6 +1415,39 @@ class Dashboard(QMainWindow):
         self._update_payload_readouts(packet)
         self._style_fsm(packet.fsm_state)
 
+    def toggle_diagnostics(self) -> None:
+        """Show or hide the raw diagnostics table window."""
+        if self.diagnostics.isVisible():
+            self.diagnostics.hide()
+            self.append_event("Diagnostics window closed.")
+            return
+
+        self.diagnostics.show()
+        self.diagnostics.raise_()
+        self.diagnostics.activateWindow()
+        # Populate immediately rather than waiting for the next packet, so the
+        # window is never briefly blank on a stale or disconnected link.
+        if self.latest is not None:
+            self.diagnostics.update_packet(
+                self.latest, voltage_warn=float(self.volt_spin.value())
+            )
+        self._push_link_diagnostics()
+        self.append_event("Diagnostics window opened.")
+
+    def _push_link_diagnostics(self) -> None:
+        """Send the current link statistics to the diagnostics table."""
+        if not self.diagnostics.isVisible():
+            return
+        now = time.time()
+        age = (now - self.last_packet_epoch
+               if self.last_packet_epoch is not None else None)
+        rate = len(self.recv_times) / RATE_WINDOW_S if self.recv_times else 0.0
+        self.diagnostics.update_link(
+            rate=rate, age=age, valid=self.valid_packets,
+            total=self.total_frames, corrupt=self.corrupt_packets,
+            connected=self.is_connected, stale_after=STALE_AFTER_S,
+        )
+
     def _apply_payload_panel(self) -> None:
         """Show the panel for the selected (or auto-detected) vehicle type."""
         choice = self.vehicle_combo.currentText()
@@ -1289,13 +1463,13 @@ class Dashboard(QMainWindow):
 
         if payload == PAYLOAD_CANSAT:
             self.payload_stack.setCurrentIndex(1)
-            title = "PAYLOAD — CANSAT (SPS30 + REACTION WHEEL)"
+            title = "PAYLOAD — CANSAT"
         elif payload == PAYLOAD_ROCKET:
             self.payload_stack.setCurrentIndex(2)
-            title = "PAYLOAD — ROCKET (DUAL-STAGE RECOVERY)"
+            title = "PAYLOAD — ROCKET"
         elif payload == PAYLOAD_GENERIC:
             self.payload_stack.setCurrentIndex(0)
-            title = "PAYLOAD — GENERIC (LEGACY v1 STREAM)"
+            title = "PAYLOAD — GENERIC (v1)"
         else:
             self.payload_stack.setCurrentIndex(0)
             title = "PAYLOAD — waiting for telemetry"
@@ -1303,11 +1477,25 @@ class Dashboard(QMainWindow):
             title += "  [PINNED]"
         self.payload_box.setTitle(title)
 
+        # The 3D model follows the same resolved choice, so a pinned vehicle is
+        # no longer silently overridden by whatever the stream announces.
+        if hasattr(self, "attitude"):
+            self.attitude.set_vehicle(payload or PAYLOAD_ROCKET)
+            if source == "manual":
+                suffix = "%s  [PINNED]" % (payload or PAYLOAD_ROCKET)
+            elif payload:
+                suffix = "%s  (auto-detected)" % payload
+            else:
+                suffix = "awaiting telemetry"
+            self.attitude_box.setTitle("VEHICLE ATTITUDE — %s" % suffix)
+
         # Re-floor the stack to the visible page so a short page (rocket) does
         # not leave dead space and a tall one (CanSat) is not squeezed away.
         current = self.payload_stack.currentWidget()
         if current is not None:
-            self.payload_stack.setMinimumHeight(current.minimumHeight())
+            height = current.minimumHeight()
+            self.payload_stack.setMinimumHeight(height)
+            self.payload_stack.setMaximumHeight(height)
 
     def _update_payload_readouts(self, packet: TelemetryPacket) -> None:
         """Refresh the vehicle-specific tiles from the latest packet."""
@@ -1348,10 +1536,10 @@ class Dashboard(QMainWindow):
             self.light_nichrome.set_state(packet.nichrome_fired)
 
             if packet.nichrome_fired:
-                text = "Main deployed — nichrome cut at 400 m AGL"
+                text = "Main deployed (400 m AGL)"
                 style = "color:#0b1219; background:%s;" % COL_OK
             elif packet.solenoid_fired:
-                text = "Drogue deployed — solenoid latch released at apogee"
+                text = "Drogue deployed (apogee)"
                 style = "color:#0b1219; background:%s;" % COL_WARN
             else:
                 text = "Recovery armed — no events fired"
@@ -1387,6 +1575,8 @@ class Dashboard(QMainWindow):
         self.tile_total.set_value("%d/%d" % (self.valid_packets, self.total_frames))
         self.tile_corrupt.set_value(str(self.corrupt_packets))
         self.tile_corrupt.set_level("alert" if self.corrupt_packets else "normal")
+
+        self._push_link_diagnostics()
 
         if self.last_packet_epoch is None:
             self.tile_age.set_value("--")
@@ -1458,11 +1648,40 @@ class Dashboard(QMainWindow):
             self.append_event("CSV logging OFF (file flushed and left open).")
             self.csv_logger.log_note("CSV logging stopped")
 
+    def reset_sensor_data(self) -> None:
+        """Clear the session's sensor history, readouts and counters.
+
+        Deliberately does not stop or truncate the CSV: resetting the display
+        between bench runs must never cost recorded telemetry.
+        """
+        self.clear_session()
+        self.latest = None
+        self._last_fsm = None
+
+        # Blank the payload readouts so stale values are not mistaken for live
+        # ones while waiting for the next packet.
+        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm10,
+                     self.tile_wheel, self.tile_recovery):
+            tile.set_value("--")
+            tile.set_level("normal")
+        self.light_solenoid.set_state(None)
+        self.light_nichrome.set_state(None)
+        self.recovery_summary.setText("Recovery sequence not started")
+        self.recovery_summary.setStyleSheet(
+            "color:%s; background:#242c38; border-radius:4px; padding:5px;"
+            % COL_TEXT_DIM
+        )
+        self._style_fsm(None)
+        self.diagnostics.clear()
+        self.raw_strip.clear()
+        self.append_event("Sensor data reset (CSV logging unaffected).")
+
     def clear_session(self) -> None:
         """Wipe the plots and the on-screen counters (does not touch the CSV)."""
         for chart in self.charts:
             chart.clear_data()
         self.chart_wheel.clear_data()
+        self.chart_pm.clear_data()
         self.gps_plot.clear_data()
         self.attitude.clear()
         self.summary.clear()
@@ -1497,6 +1716,7 @@ class Dashboard(QMainWindow):
             self.render_timer.stop()
             self.status_timer.stop()
             self.attitude_timer.stop()
+            self.diagnostics.close()
 
             self.serial_worker.stop()
             if not self.serial_worker.wait(3000):

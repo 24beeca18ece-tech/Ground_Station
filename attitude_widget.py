@@ -56,7 +56,7 @@ fail to start because a 3D toy could not initialise.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt5.QtCore import Qt, QPointF, QRectF
@@ -73,12 +73,118 @@ from PyQt5.QtWidgets import (
 # 3D rendering is optional -- see GRACEFUL DEGRADATION above.
 try:
     import pyqtgraph.opengl as gl
+    from pyqtgraph.opengl.shaders import (
+        FragmentShader,
+        ShaderProgram,
+        VertexShader,
+    )
     _GL_IMPORT_OK = True
     _GL_IMPORT_ERROR = ""
 except Exception as exc:  # pragma: no cover - depends on the host machine
     gl = None
     _GL_IMPORT_OK = False
     _GL_IMPORT_ERROR = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Lighting
+# ---------------------------------------------------------------------------
+
+def _build_two_sided_shader():
+    """A camera-relative, two-sided shader with a high ambient floor.
+
+    pyqtgraph's stock ``shaded`` shader is unusable for a rotating model on a
+    dark background.  Its fragment stage is::
+
+        float p = dot(v_normal, normalize(vec3(1.0, -1.0, -1.0)));
+        p = p < 0. ? 0. : p * 0.8;
+        vec3 rgb = v_color.rgb * (0.2 + p);
+
+    That is a *single fixed light direction* with no two-sided term, and every
+    face pointing away from it is multiplied by 0.2.  As the vehicle rotates,
+    whichever faces swing away from that one light drop to 20 % brightness --
+    which against the #161d27 panel is indistinguishable from the background.
+    Small parts (nose cone, thin fins) vanish first, which is precisely the
+    "visible at rest, gone once it starts moving" symptom.
+
+    This replacement lights from the camera instead (``abs(normal.z)`` in eye
+    space), so a face is bright whenever it faces the viewer regardless of the
+    model's orientation, and never falls below ``_AMBIENT``.  Using ``abs()``
+    also makes it two-sided, so an inward-wound triangle renders identically to
+    an outward-wound one -- geometry winding mistakes can no longer make a part
+    invisible.
+    """
+    ambient, diffuse = 0.55, 0.45
+
+    # pyqtgraph switched its GLSL from the legacy fixed-pipeline style to
+    # explicit uniforms/attributes.  Match whichever this install uses, or the
+    # program will not link.
+    modern = "u_mvp" in getattr(gl.shaders.getShaderProgram("shaded").shaders[0],
+                                "code", "")
+
+    if modern:
+        vertex = """
+            uniform mat4 u_mvp;
+            uniform mat3 u_normal;
+            attribute vec4 a_position;
+            attribute vec3 a_normal;
+            attribute vec4 a_color;
+            varying vec4 v_color;
+            varying vec3 v_normal;
+            void main() {
+                v_normal = normalize(u_normal * a_normal);
+                v_color = a_color;
+                gl_Position = u_mvp * a_position;
+            }
+        """
+        fragment = """
+            #ifdef GL_ES
+            precision mediump float;
+            #endif
+            varying vec4 v_color;
+            varying vec3 v_normal;
+            void main() {
+                float d = abs(normalize(v_normal).z);
+                float shade = %.3f + %.3f * d;
+                gl_FragColor = vec4(v_color.rgb * shade, v_color.a);
+            }
+        """ % (ambient, diffuse)
+    else:  # pragma: no cover - older pyqtgraph
+        vertex = """
+            varying vec3 normal;
+            void main() {
+                normal = normalize(gl_NormalMatrix * gl_Normal);
+                gl_FrontColor = gl_Color;
+                gl_BackColor = gl_Color;
+                gl_Position = ftransform();
+            }
+        """
+        fragment = """
+            varying vec3 normal;
+            void main() {
+                float d = abs(normalize(normal).z);
+                float shade = %.3f + %.3f * d;
+                gl_FragColor = vec4(gl_Color.rgb * shade, gl_Color.a);
+            }
+        """ % (ambient, diffuse)
+
+    return ShaderProgram("gcsTwoSided",
+                         [VertexShader(vertex), FragmentShader(fragment)])
+
+
+#: Resolved lazily so an import-time GLSL problem cannot stop the app starting.
+_MODEL_SHADER = None
+
+
+def _model_shader():
+    """Return the custom shader, falling back to the stock one on any error."""
+    global _MODEL_SHADER
+    if _MODEL_SHADER is None:
+        try:
+            _MODEL_SHADER = _build_two_sided_shader()
+        except Exception:
+            _MODEL_SHADER = "shaded"
+    return _MODEL_SHADER
 
 
 # ---------------------------------------------------------------------------
@@ -270,113 +376,206 @@ class AttitudeEstimator:
 # Mesh construction
 # ---------------------------------------------------------------------------
 
-def _cylinder(radius: float, z0: float, z1: float, segments: int = 24):
-    """Closed cylinder along +Z.  Returns ``(vertices, faces)``."""
+def _lathe(profile: Sequence[Tuple[float, float]], segments: int = 28,
+           cap_start: bool = True, cap_end: bool = True):
+    """Surface of revolution about +Z from a ``(radius, z)`` profile.
+
+    One primitive covers the cylindrical body, the ogive nose and the CanSat
+    can, so there is a single piece of winding logic to get right rather than
+    three.  Returns ``(vertices, faces)``.
+    """
     verts: List[List[float]] = []
     faces: List[List[int]] = []
-    for i in range(segments):
-        a = 2.0 * math.pi * i / segments
-        x, y = radius * math.cos(a), radius * math.sin(a)
-        verts.append([x, y, z0])
-        verts.append([x, y, z1])
-    for i in range(segments):
-        b0, b1 = 2 * i, 2 * ((i + 1) % segments)
-        faces.append([b0, b1, b0 + 1])
-        faces.append([b1, b1 + 1, b0 + 1])
-    # End caps.
-    base_c = len(verts)
-    verts.append([0.0, 0.0, z0])
-    verts.append([0.0, 0.0, z1])
-    for i in range(segments):
-        b0, b1 = 2 * i, 2 * ((i + 1) % segments)
-        faces.append([base_c, b1, b0])
-        faces.append([base_c + 1, b0 + 1, b1 + 1])
-    return np.array(verts), np.array(faces)
+    rings: List[int] = []
+
+    for radius, z in profile:
+        rings.append(len(verts))
+        if radius <= 1e-9:
+            verts.append([0.0, 0.0, z])          # degenerate ring = a point
+        else:
+            for i in range(segments):
+                a = 2.0 * math.pi * i / segments
+                verts.append([radius * math.cos(a), radius * math.sin(a), z])
+
+    for k in range(len(profile) - 1):
+        r0, _ = profile[k]
+        r1, _ = profile[k + 1]
+        base0, base1 = rings[k], rings[k + 1]
+        for i in range(segments):
+            j = (i + 1) % segments
+            if r0 <= 1e-9:                        # point -> ring (tip fan)
+                faces.append([base0, base1 + i, base1 + j])
+            elif r1 <= 1e-9:                      # ring -> point
+                faces.append([base0 + i, base0 + j, base1])
+            else:
+                faces.append([base0 + i, base0 + j, base1 + i])
+                faces.append([base0 + j, base1 + j, base1 + i])
+
+    # End caps, so the solid is closed and never shows a hollow interior.
+    if cap_start and profile[0][0] > 1e-9:
+        centre = len(verts)
+        verts.append([0.0, 0.0, profile[0][1]])
+        for i in range(segments):
+            j = (i + 1) % segments
+            faces.append([centre, rings[0] + j, rings[0] + i])
+    if cap_end and profile[-1][0] > 1e-9:
+        centre = len(verts)
+        verts.append([0.0, 0.0, profile[-1][1]])
+        for i in range(segments):
+            j = (i + 1) % segments
+            faces.append([centre, rings[-1] + i, rings[-1] + j])
+
+    return np.array(verts, dtype=float), np.array(faces, dtype=int)
 
 
-def _cone(radius: float, z0: float, z1: float, segments: int = 24):
-    """Cone with its base at *z0* and apex at *z1*."""
-    verts: List[List[float]] = [[0.0, 0.0, z1]]          # apex
-    for i in range(segments):
-        a = 2.0 * math.pi * i / segments
-        verts.append([radius * math.cos(a), radius * math.sin(a), z0])
-    faces: List[List[int]] = []
-    for i in range(segments):
-        faces.append([0, 1 + i, 1 + (i + 1) % segments])
-    base_c = len(verts)
-    verts.append([0.0, 0.0, z0])
-    for i in range(segments):
-        faces.append([base_c, 1 + (i + 1) % segments, 1 + i])
-    return np.array(verts), np.array(faces)
+def _ogive_profile(radius: float, z_base: float, z_tip: float,
+                   steps: int = 14) -> List[Tuple[float, float]]:
+    """Tangent-ogive nose profile, base first, tip last.
+
+    A tangent ogive is the curved (not straight-sided) nose the reference
+    airframe uses; the radius follows a circular arc of radius ``rho`` that
+    meets the body tube tangentially, so there is no crease at the joint.
+    """
+    length = z_tip - z_base
+    rho = (radius * radius + length * length) / (2.0 * radius)
+    points: List[Tuple[float, float]] = []
+    for i in range(steps + 1):
+        # x measured from the tip back towards the base.
+        x = length * (1.0 - i / steps)
+        y = math.sqrt(max(rho * rho - (length - x) ** 2, 0.0)) + radius - rho
+        points.append((max(y, 0.0), z_tip - x))
+    return points
 
 
-def _fin(inner_r: float, span: float, z_root0: float, z_root1: float,
-         z_tip: float, angle_rad: float, thickness: float = 0.02):
-    """One flat trapezoidal fin, rotated *angle_rad* about +Z."""
-    outer_r = inner_r + span
+def _fin(inner_r: float, outer_r: float,
+         root_fwd_z: float, root_aft_z: float,
+         tip_fwd_z: float, tip_aft_z: float,
+         angle_rad: float, thickness: float):
+    """One swept trapezoidal fin as a closed slab, rotated about +Z.
+
+    Built as a solid rather than a zero-thickness plate: a thin plate seen
+    edge-on covers almost no pixels, which is the other half of why the fins
+    read as "missing" while the model turns.
+    """
+    half = thickness / 2.0
     plate = [
-        [inner_r, 0.0, z_root0], [outer_r, 0.0, z_tip],
-        [outer_r, 0.0, z_root1], [inner_r, 0.0, z_root1],
+        (inner_r, root_fwd_z),   # 0 root leading edge
+        (outer_r, tip_fwd_z),    # 1 tip  leading edge (swept aft)
+        (outer_r, tip_aft_z),    # 2 tip  trailing edge
+        (inner_r, root_aft_z),   # 3 root trailing edge
     ]
     verts: List[List[float]] = []
     for sign in (-1.0, 1.0):
-        for px, _, pz in plate:
-            verts.append([px, sign * thickness, pz])
+        for radius, z in plate:
+            verts.append([radius, sign * half, z])
+
     faces = [
-        [0, 1, 2], [0, 2, 3],          # one face
-        [4, 6, 5], [4, 7, 6],          # the other
-        [0, 4, 5], [0, 5, 1],          # edges
-        [1, 5, 6], [1, 6, 2],
-        [2, 6, 7], [2, 7, 3],
-        [3, 7, 4], [3, 4, 0],
+        [0, 1, 2], [0, 2, 3],      # -y face
+        [4, 6, 5], [4, 7, 6],      # +y face
+        [0, 4, 5], [0, 5, 1],      # leading edge
+        [1, 5, 6], [1, 6, 2],      # tip edge
+        [2, 6, 7], [2, 7, 3],      # trailing edge
+        [3, 7, 4], [3, 4, 0],      # root edge
     ]
+
     ca, sa = math.cos(angle_rad), math.sin(angle_rad)
     rotated = [[x * ca - y * sa, x * sa + y * ca, z] for x, y, z in verts]
-    return np.array(rotated), np.array(faces)
+    return np.array(rotated, dtype=float), np.array(faces, dtype=int)
 
 
 def _merge(parts):
-    """Concatenate ``(verts, faces, rgba)`` parts into one coloured mesh.
-
-    Per-face colours rather than one flat colour, because the whole point of
-    the model is showing which way the vehicle points: a uniformly grey body is
-    indistinguishable from itself rotated 180 degrees.  Colouring the nose lets
-    the viewer read the attitude instantly.
-    """
-    all_v, all_f, all_c, offset = [], [], [], 0
-    for verts, faces, rgba in parts:
+    """Concatenate ``(verts, faces)`` pairs into one mesh."""
+    all_v, all_f, offset = [], [], 0
+    for verts, faces in parts:
         all_v.append(verts)
         all_f.append(faces + offset)
-        all_c.append(np.tile(np.array(rgba, dtype=float), (len(faces), 1)))
         offset += len(verts)
-    return np.vstack(all_v), np.vstack(all_f), np.vstack(all_c)
+    return np.vstack(all_v), np.vstack(all_f)
 
 
-# Model palette.
-_C_BODY = (0.72, 0.76, 0.83, 1.0)   # airframe grey
-_C_NOSE = (0.91, 0.22, 0.31, 1.0)   # nose / +Z end, red
-_C_FIN = (0.29, 0.66, 1.0, 1.0)     # fins, blue
-_C_BASE = (0.24, 0.29, 0.36, 1.0)   # tail / -Z end, dark
+# ---------------------------------------------------------------------------
+# Vehicle geometry
+#
+# Proportions follow the reference airframe (CU Jammu Astro Rocketry-069):
+# orange body tube, black ogive nose cone about a quarter of the overall
+# length, and four swept black fins at the base.  Overall length is 4.0 units
+# centred on the origin, so nose : body = 1 : 3 exactly.
+# ---------------------------------------------------------------------------
+
+ROCKET_RADIUS = 0.30
+ROCKET_BODY_Z0 = -2.00          # tail
+ROCKET_BODY_Z1 = 1.00           # body/nose joint  -> body length 3.0
+ROCKET_NOSE_Z1 = 2.00           # tip              -> nose length 1.0
+ROCKET_FIN_COUNT = 4
+
+#: World ground-plane height, just below the fin trailing edge.
+GROUND_Z = -2.15
+
+# Model palette.  The reference airframe's nose and fins are black, but pure
+# black on the #161d27 panel is unreadable, so they are rendered as a graphite
+# that still reads as "black hardware" against the orange tube.
+_C_BODY_ORANGE = (0.91, 0.38, 0.10, 1.0)
+_C_GRAPHITE = (0.34, 0.35, 0.39, 1.0)
+_C_CANSAT_BODY = (0.72, 0.76, 0.83, 1.0)
+_C_CANSAT_CAP = (0.91, 0.22, 0.31, 1.0)
+_C_CANSAT_BASE = (0.24, 0.29, 0.36, 1.0)
 
 
-def build_rocket_mesh():
-    """Rocket silhouette: body tube, red nose cone and three fins, axis +Z."""
-    return _merge([
-        (*_cylinder(0.22, -1.0, 0.55), _C_BODY),
-        (*_cone(0.22, 0.55, 1.25), _C_NOSE),
-        (*_fin(0.20, 0.42, -1.0, -0.45, -0.85, 0.0), _C_FIN),
-        (*_fin(0.20, 0.42, -1.0, -0.45, -0.85, 2.0 * math.pi / 3.0), _C_FIN),
-        (*_fin(0.20, 0.42, -1.0, -0.45, -0.85, 4.0 * math.pi / 3.0), _C_FIN),
+def build_rocket_parts():
+    """Return ``{part_name: (vertices, faces)}`` for the rocket.
+
+    Parts are kept separate so each becomes its own persistent ``GLMeshItem``
+    with its own colour.  Local placement is baked into the vertices, so every
+    part shares one orientation matrix and they can never drift out of sync.
+    """
+    body = _lathe([
+        (ROCKET_RADIUS, ROCKET_BODY_Z0),
+        (ROCKET_RADIUS, ROCKET_BODY_Z1),
     ])
+    nose = _lathe(_ogive_profile(ROCKET_RADIUS, ROCKET_BODY_Z1, ROCKET_NOSE_Z1),
+                  cap_start=True, cap_end=False)
+
+    # Swept trapezoidal fins flaring outward at the base, 90 degrees apart.
+    fin_parts = []
+    for k in range(ROCKET_FIN_COUNT):
+        fin_parts.append(_fin(
+            inner_r=ROCKET_RADIUS * 0.96,
+            outer_r=ROCKET_RADIUS + 0.58,
+            root_fwd_z=ROCKET_BODY_Z0 + 1.05,
+            root_aft_z=ROCKET_BODY_Z0,
+            tip_fwd_z=ROCKET_BODY_Z0 + 0.46,
+            tip_aft_z=ROCKET_BODY_Z0 - 0.06,
+            angle_rad=2.0 * math.pi * k / ROCKET_FIN_COUNT,
+            thickness=0.055,
+        ))
+
+    return {"body": body, "nose": nose, "fins": _merge(fin_parts)}
 
 
-def build_cansat_mesh():
-    """CanSat: soda-can body with a red top cap so its +Z end is identifiable."""
-    return _merge([
-        (*_cylinder(0.42, -0.75, 0.62, segments=26), _C_BODY),
-        (*_cylinder(0.42, 0.62, 0.75, segments=26), _C_NOSE),   # top cap
-        (*_cylinder(0.30, -0.84, -0.75, segments=26), _C_BASE),  # base plate
-    ])
+def build_cansat_parts():
+    """Return ``{part_name: (vertices, faces)}`` for the CanSat.
+
+    Deliberately left as the plain can from the earlier work -- only the rocket
+    model gains the cone-and-fin assembly.
+    """
+    return {
+        "body": _lathe([(0.42, -0.75), (0.42, 0.62)], segments=26),
+        "cap": _lathe([(0.42, 0.62), (0.42, 0.75)], segments=26),
+        "base": _lathe([(0.30, -0.84), (0.30, -0.75)], segments=26),
+    }
+
+
+#: Which colour each part is drawn in.
+ROCKET_PART_COLORS = {
+    "body": _C_BODY_ORANGE,
+    "nose": _C_GRAPHITE,
+    "fins": _C_GRAPHITE,
+}
+CANSAT_PART_COLORS = {
+    "body": _C_CANSAT_BODY,
+    "cap": _C_CANSAT_CAP,
+    "base": _C_CANSAT_BASE,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +685,9 @@ class AttitudeWidget(QWidget):
 
         self.view = None            # GLViewWidget, when available
         self.fallback = None        # _AttitudeFallbackView otherwise
-        self._model = None
+        #: {"ROCKET": {part: GLMeshItem}, "CANSAT": {...}} -- built once, never
+        #: removed. See _build_models().
+        self._parts = {"ROCKET": {}, "CANSAT": {}}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -502,7 +703,7 @@ class AttitudeWidget(QWidget):
         if _GL_IMPORT_OK:
             try:
                 view = gl.GLViewWidget()
-                view.setCameraPosition(distance=3.5, elevation=16, azimuth=45)
+                view.setCameraPosition(distance=5.8, elevation=14, azimuth=45)
                 view.setMinimumHeight(190)
                 view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 view.setBackgroundColor(QColor(COL_PANEL))
@@ -511,25 +712,28 @@ class AttitudeWidget(QWidget):
                 # moves and the model does, the grid *is* the horizon reference
                 # -- the viewer can always see which way is down.
                 grid = gl.GLGridItem()
-                grid.setSize(6, 6)
+                grid.setSize(5, 5)
                 grid.setSpacing(0.5, 0.5)
-                grid.translate(0, 0, -1.6)
+                # Sits just under the fin trailing edge so the vehicle stands
+                # on the ground plane instead of sinking through it.
+                grid.translate(0, 0, GROUND_Z)
                 grid.setColor(QColor(60, 76, 96, 190))
                 view.addItem(grid)
 
                 # World axes at the origin: X red, Y green, Z blue (up).
                 for index, color in enumerate(AXIS_COLORS):
                     end = [0.0, 0.0, 0.0]
-                    end[index] = 1.9 if index == 2 else 1.5
+                    end[index] = 2.0 if index == 2 else 1.6
                     line = gl.GLLinePlotItem(
-                        pos=np.array([[0.0, 0.0, -1.6],
-                                      [end[0], end[1], end[2] - 1.6]]),
+                        pos=np.array([[0.0, 0.0, GROUND_Z],
+                                      [end[0], end[1], end[2] + GROUND_Z]]),
                         color=color, width=2.0, antialias=True,
                     )
                     view.addItem(line)
 
                 self.view = view
                 self.gl_available = True
+                self._build_models()
                 self._set_mesh("ROCKET")
                 return view
             except Exception as exc:  # pragma: no cover - driver dependent
@@ -542,7 +746,9 @@ class AttitudeWidget(QWidget):
         self.gl_available = False
         return self.fallback
 
-    def _build_readouts(self) -> QHBoxLayout:
+    def _build_readouts(self) -> QVBoxLayout:
+        stack = QVBoxLayout()
+        stack.setSpacing(4)
         row = QHBoxLayout()
         row.setSpacing(6)
 
@@ -552,7 +758,11 @@ class AttitudeWidget(QWidget):
         rpy_font.setBold(True)
         self.rpy_label.setFont(rpy_font)
         self.rpy_label.setStyleSheet("color: %s;" % COL_TEXT)
-        row.addWidget(self.rpy_label, 1)
+        # Must be allowed to shrink: its natural width would otherwise set a
+        # floor on the whole bottom row of the dashboard.
+        self.rpy_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.rpy_label.setAlignment(Qt.AlignCenter)
+        stack.addWidget(self.rpy_label)
 
         self.ref_label = QLabel("GYRO")
         ref_font = QFont()
@@ -581,35 +791,69 @@ class AttitudeWidget(QWidget):
         )
         self.reset_btn.clicked.connect(self.reset_orientation)
         row.addWidget(self.reset_btn)
-        return row
+        row.addStretch(1)
+        stack.addLayout(row)
+        return stack
+
+    def _build_models(self) -> None:
+        """Create every mesh item **once** and add it to the view for good.
+
+        Both vehicles' parts are built up front and added to the GLViewWidget
+        here.  Nothing is ever removed, rebuilt or re-added afterwards --
+        switching vehicle only toggles ``setVisible`` and the per-frame update
+        only calls ``setTransform``.  That removes the whole class of "an item
+        got dropped from the scene during an update" failure.
+        """
+        self._parts = {"ROCKET": {}, "CANSAT": {}}
+
+        for kind, builder, palette in (
+            ("ROCKET", build_rocket_parts, ROCKET_PART_COLORS),
+            ("CANSAT", build_cansat_parts, CANSAT_PART_COLORS),
+        ):
+            for name, (verts, faces) in builder().items():
+                # drawEdges stays off: on a lathe surface it renders every
+                # triangle diagonal and the model reads as a hairy barrel.
+                # Shading plus the part colours carry the form instead.
+                item = gl.GLMeshItem(
+                    vertexes=verts, faces=faces,
+                    color=palette[name],
+                    smooth=False, drawEdges=False,
+                    shader=_model_shader(), glOptions="opaque",
+                )
+                item.setVisible(False)
+                self.view.addItem(item)
+                self._parts[kind][name] = item
+
+    def set_vehicle(self, payload_type: str) -> None:
+        """Choose which vehicle model is displayed.
+
+        Called by the dashboard, which resolves auto-detection against the
+        operator's manual override.  The widget deliberately does not decide
+        this for itself from the packet stream.
+        """
+        self._payload_type = payload_type or ""
+        self._set_mesh(self._payload_type)
 
     def _set_mesh(self, payload_type: str) -> None:
-        """Swap the displayed model between the rocket and the CanSat shape."""
+        """Show the model for this vehicle by toggling visibility only."""
         kind = "CANSAT" if payload_type == "CANSAT" else "ROCKET"
-        if kind == self._mesh_kind or not self.gl_available:
-            self._mesh_kind = kind
-            return
         self._mesh_kind = kind
+        if not self.gl_available:
+            return
+        for group, items in self._parts.items():
+            visible = (group == kind)
+            for item in items.values():
+                item.setVisible(visible)
+        # Re-apply the current orientation so a freshly shown part is not left
+        # at identity for a frame.
+        self.redraw(force=True)
 
-        if self._model is not None:
-            try:
-                self.view.removeItem(self._model)
-            except Exception:
-                pass
-            self._model = None
-
-        verts, faces, face_colors = (build_cansat_mesh() if kind == "CANSAT"
-                                     else build_rocket_mesh())
-        # drawEdges is deliberately off: on a 26-segment cylinder it renders
-        # every triangle diagonal and the model reads as a hairy barrel rather
-        # than a vehicle.  Shading plus the coloured nose carries the form.
-        mesh = gl.GLMeshItem(
-            vertexes=verts, faces=faces, faceColors=face_colors,
-            smooth=False, drawEdges=False,
-            shader="shaded", glOptions="opaque",
-        )
-        self.view.addItem(mesh)
-        self._model = mesh
+    @property
+    def _active_items(self):
+        """The mesh items currently on screen."""
+        if not self.gl_available:
+            return []
+        return list(self._parts.get(self._mesh_kind, {}).values())
 
     # -- telemetry slot (hot path: keep cheap) -----------------------------
 
@@ -620,11 +864,6 @@ class AttitudeWidget(QWidget):
         dashboard uses.  Does arithmetic only -- no repaint here.
         """
         try:
-            payload = getattr(packet, "payload_type", "") or ""
-            if payload != self._payload_type:
-                self._payload_type = payload
-                self._set_mesh(payload)
-
             timestamp = packet.mission_time_s
             if not math.isfinite(timestamp):
                 timestamp = packet.gs_recv_epoch
@@ -663,12 +902,15 @@ class AttitudeWidget(QWidget):
             )
             self._style_ref(self.estimator.accel_valid)
 
-            if self.gl_available and self._model is not None:
+            if self.gl_available:
                 transform = np.eye(4)
                 transform[:3, :3] = self.estimator.matrix
-                # GLMeshItem wants a row-major 4x4 in flat form.
-                self._model.resetTransform()
-                self._model.applyTransform(_as_qmatrix(transform), local=False)
+                matrix = _as_qmatrix(transform)
+                # Every part gets the *same* matrix, so the assembly can never
+                # come apart or rotate at different rates.  setTransform only:
+                # the geometry itself is never touched after construction.
+                for item in self._active_items:
+                    item.setTransform(matrix)
             elif self.fallback is not None:
                 self.fallback.set_attitude(roll, pitch, yaw)
         except Exception:
