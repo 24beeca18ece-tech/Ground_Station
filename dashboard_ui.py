@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
 import time
 from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -99,6 +100,13 @@ BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 #: Convenience entry so the dashboard can talk to ``packet_sim.py`` over TCP
 #: without any virtual-COM-port driver installed (pyserial URL handler).
 SIM_PORT_URL = "socket://127.0.0.1:5555"
+
+#: Header logos live here, resolved relative to this file so the app can be
+#: launched from any working directory.
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+#: Header logo height. Chosen to sit inside the existing connection bar
+#: without increasing its height, so the no-scroll layout is unaffected.
+LOGO_HEIGHT_PX = 40
 
 # ---------------------------------------------------------------------------
 # Dark theme
@@ -251,7 +259,7 @@ class ReadoutTile(QFrame):
         self._unit = unit
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 5)
+        layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(0)
 
         self.caption = QLabel(caption.upper())
@@ -693,11 +701,46 @@ class Dashboard(QMainWindow):
 
     # -- top bar ---------------------------------------------------------
 
+    def _build_logo(self, filename: str, tooltip: str) -> Optional[QLabel]:
+        """Load a header logo, scaled to :data:`LOGO_HEIGHT_PX` by height.
+
+        Returns ``None`` if the asset is missing, so a checkout without the
+        image files still starts normally rather than crashing on the header.
+
+        The path is resolved relative to this file, not the working directory,
+        because ``main.py`` can be launched from anywhere.
+        """
+        path = os.path.join(ASSETS_DIR, filename)
+        if not os.path.isfile(path):
+            return None
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return None
+        # scaledToHeight preserves the aspect ratio; the logos are never stretched.
+        pixmap = pixmap.scaledToHeight(LOGO_HEIGHT_PX, Qt.SmoothTransformation)
+
+        label = QLabel()
+        label.setPixmap(pixmap)
+        label.setFixedSize(pixmap.size())
+        label.setToolTip(tooltip)
+        # Transparent so the PNG alpha shows the panel behind it, not a white box.
+        label.setStyleSheet("background: transparent; border: none;")
+        return label
+
     def _build_connection_bar(self) -> QWidget:
         box = QGroupBox("CONNECTION")
         layout = QHBoxLayout(box)
-        layout.setContentsMargins(10, 6, 10, 8)
+        # Tightened from (10, 6, 10, 8) so the logos fit inside the existing bar
+        # height instead of growing it and eating the sidebar's headroom.
+        layout.setContentsMargins(10, 3, 10, 5)
         layout.setSpacing(8)
+
+        # Team logo pins the far left of the header row.
+        self.team_logo = self._build_logo(
+            "team_logo.png", "CU Jammu Astro — team logo")
+        if self.team_logo is not None:
+            layout.addWidget(self.team_logo)
+            layout.addSpacing(10)
 
         layout.addWidget(QLabel("Port:"))
         self.port_combo = QComboBox()
@@ -754,6 +797,13 @@ class Dashboard(QMainWindow):
         self.conn_state_label.setStyleSheet("color: %s; font-weight: 700;" % COL_ALERT)
         layout.addWidget(self.conn_state_label)
 
+        # College logo pins the far right of the same header row.
+        self.college_logo = self._build_logo(
+            "college_logo.png", "Central University of Jammu")
+        if self.college_logo is not None:
+            layout.addSpacing(10)
+            layout.addWidget(self.college_logo)
+
         return box
 
     # -- left column -----------------------------------------------------
@@ -787,7 +837,7 @@ class Dashboard(QMainWindow):
         col_a = QWidget()
         left = QVBoxLayout(col_a)
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(6)
+        left.setSpacing(4)
         left.addWidget(self._build_fsm_banner())
         left.addWidget(self._build_readouts())
         left.addWidget(self._build_payload_panel())
@@ -828,7 +878,7 @@ class Dashboard(QMainWindow):
         fsm_font.setBold(True)
         self.fsm_label.setFont(fsm_font)
         self.fsm_label.setAlignment(Qt.AlignCenter)
-        self.fsm_label.setMinimumHeight(52)
+        self.fsm_label.setMinimumHeight(44)
         self._style_fsm(None)
         layout.addWidget(self.fsm_label)
         return box
@@ -888,6 +938,7 @@ class Dashboard(QMainWindow):
         # bench runs the operator wants the payload traces cleared without
         # hunting for it, and it applies to both vehicle types.
         self.reset_sensors_btn = QPushButton("RESET SENSOR DATA")
+        self.reset_sensors_btn.setFixedHeight(26)
         self.reset_sensors_btn.setToolTip(
             "Clear the payload sensor history for this session:\n"
             "particulate and reaction-wheel traces, all strip charts, the ground\n"
@@ -1030,7 +1081,7 @@ class Dashboard(QMainWindow):
         # The stack reserves the tallest page's height (CanSat), so send the
         # slack to the bottom rather than letting it open gaps between rows.
         layout.addStretch(1)
-        page.setMinimumHeight(152)
+        page.setMinimumHeight(138)
         return page
 
     def _build_gps_panel(self) -> QWidget:
@@ -1054,7 +1105,7 @@ class Dashboard(QMainWindow):
         # Kept close to square: a ground track stretched vertically
         # misrepresents the shape of the trajectory at a glance.
         self.gps_plot = GpsTrackPlot()
-        self.gps_plot.setMinimumHeight(180)
+        self.gps_plot.setMinimumHeight(150)
         self.gps_plot.setMaximumHeight(250)
         layout.addWidget(self.gps_plot)
         return box
@@ -1475,7 +1526,10 @@ class Dashboard(QMainWindow):
         self.summary.set_link_stats(valid, corrupt, resyncs)
 
     def on_log_file_opened(self, path: str) -> None:
-        self.log_path_label.setText("CSV: %s" % path)
+        # File name only: the full path does not fit the header at 1366 px and
+        # clips to a meaningless fragment. It stays available as the tooltip.
+        self.log_path_label.setText("CSV: %s" % os.path.basename(path))
+        self.log_path_label.setToolTip(path)
         self.append_event("Logging to %s" % path)
 
     # ==================================================================

@@ -47,6 +47,13 @@ logs/*.txt
 *.ilg
 *.ind
 
+# --- Project assets (MUST stay tracked) --------------------------------------
+# The header logos in assets/ are source, not generated output. Nothing above
+# excludes them today; this negation is here so that adding a broad rule such
+# as "*.png" later cannot silently drop them and leave the header blank.
+!assets/
+!assets/**
+
 # --- Editor / IDE ------------------------------------------------------------
 .vscode/
 .idea/
