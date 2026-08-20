@@ -86,6 +86,12 @@ RATE_WINDOW_S = 3.0            # averaging window for packets/sec
 MAX_PLOT_POINTS = 40000        # hard cap per series (~33 min at 20 Hz)
 DEFAULT_WINDOW_S = 60          # visible strip-chart width in seconds
 DEFAULT_VOLTAGE_WARN = 7.0     # battery warning threshold, volts
+#: A mission time this much lower than the previous sample is treated as a
+#: time-base restart (flight-computer reboot, restarted transmitter, or a
+#: different vehicle on the link) rather than jitter.
+TIME_RESET_TOLERANCE_S = 0.5
+#: Gap inserted in the plot clock across a detected restart.
+PLOT_TIME_GAP_S = 0.01
 EVENT_LOG_LINES = 400
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
@@ -369,6 +375,9 @@ class StripChart(pg.PlotWidget):
         self.getPlotItem().setContentsMargins(4, 4, 10, 4)
 
         self._x: List[float] = []
+        #: Count of samples whose x had to be clamped to keep the series
+        #: non-decreasing. Non-zero means a caller passed an unordered clock.
+        self.bad_x = 0
         self._series_names: List[str] = [name for name, _ in series]
         self._y: Dict[str, List[float]] = {name: [] for name, _ in series}
         self._curves: Dict[str, pg.PlotDataItem] = {}
@@ -394,7 +403,21 @@ class StripChart(pg.PlotWidget):
     # -- data ---------------------------------------------------------------
 
     def add_point(self, x: float, values: Dict[str, float]) -> None:
-        """Append one sample.  Non-finite values are stored as NaN (gap in line)."""
+        """Append one sample.  Non-finite values are stored as NaN (gap in line).
+
+        The x series is kept non-decreasing. Callers are expected to pass the
+        dashboard's shared monotonic plot clock, but a chart must not be able to
+        render garbage if one ever does not: a single backward x makes the
+        polyline double back across the plot and breaks both the bisect window
+        search here and pyqtgraph's clipToView, which is exactly the "scattered
+        and disordered" failure this guard exists to prevent.
+        """
+        if not math.isfinite(x):
+            self.bad_x += 1
+            x = self._x[-1] if self._x else 0.0
+        elif self._x and x < self._x[-1]:
+            self.bad_x += 1
+            x = self._x[-1]
         self._x.append(x)
         for name in self._series_names:
             value = values.get(name, float("nan"))
@@ -410,6 +433,7 @@ class StripChart(pg.PlotWidget):
 
     def clear_data(self) -> None:
         self._x.clear()
+        self.bad_x = 0
         for name in self._series_names:
             self._y[name].clear()
             self._curves[name].setData([], [])
@@ -424,8 +448,10 @@ class StripChart(pg.PlotWidget):
         # Before the buffer holds a full window, show everything from the first
         # sample rather than padding the view with empty pre-launch time.
         cutoff = max(latest - float(window_s), self._x[0])
-        # bisect works because mission time is monotonic for a healthy link; a
-        # non-monotonic timestamp only costs a slightly wrong window, never a crash.
+        # bisect is valid because add_point guarantees _x is non-decreasing.
+        # Without that guarantee this search returns a meaningless index and
+        # pyqtgraph's clipToView (which also assumes sorted x) mis-slices the
+        # series, scattering the trace.
         start = bisect.bisect_left(self._x, cutoff)
         if start >= len(self._x):
             start = max(0, len(self._x) - 1)
@@ -507,6 +533,11 @@ class Dashboard(QMainWindow):
         # --- live state (GUI thread only) ----------------------------------
         self.latest: Optional[TelemetryPacket] = None
         self.first_mission_time: Optional[float] = None
+        # Shared monotonic plot clock -- see _plot_time().
+        self._last_mission_time: Optional[float] = None
+        self._last_plot_time: float = 0.0
+        self._plot_time_offset: float = 0.0
+        self._time_resets: int = 0
         self.session_start = time.time()
         self.last_packet_epoch: Optional[float] = None
         self.recv_times: deque = deque(maxlen=1000)   # for packets/sec
@@ -1271,13 +1302,8 @@ class Dashboard(QMainWindow):
             self.last_packet_epoch = packet.gs_recv_epoch
             self.recv_times.append(packet.gs_recv_epoch)
 
-            # Plot X axis: mission time, normalised so the session starts near 0.
-            mission = packet.mission_time_s
-            if not math.isfinite(mission):
-                mission = packet.gs_recv_epoch - self.session_start
-            if self.first_mission_time is None:
-                self.first_mission_time = mission
-            x = mission
+            # One shared x-axis value for every chart on this packet.
+            x = self._plot_time(packet)
 
             self.chart_alt.add_point(x, {"alt": packet.altitude_m})
             self.chart_press.add_point(x, {"press": packet.pressure_hpa})
@@ -1328,6 +1354,55 @@ class Dashboard(QMainWindow):
             self._readouts_dirty = True
         except Exception as exc:  # a display bug must never stop ingestion
             self.append_event("Packet handling error: %r" % exc)
+
+    def _plot_time(self, packet: TelemetryPacket) -> float:
+        """Return the shared x-axis value for this packet, in seconds.
+
+        Every strip chart plots against this one number, so the charts can
+        never disagree about the time base and a bug here cannot affect one
+        chart differently from another.
+
+        The value is derived from the raw ``MISSION_TIME_S`` float on the
+        packet.  It is never parsed back out of ``MISSION_TIME_HMS`` or any
+        other formatted string -- those are display-only, and re-deriving a
+        coordinate from ``HH:MM:SS`` is precisely how an x-axis ends up
+        wrapping every 60 seconds.
+
+        The result is guaranteed non-decreasing.  If the source time base jumps
+        backwards -- a flight-computer reboot, a restarted transmitter, or a
+        different vehicle appearing on the link -- the plot clock carries on
+        forward from where it was instead of drawing back across the chart.
+        """
+        mission = packet.mission_time_s
+        if not math.isfinite(mission):
+            # No usable mission time: fall back on ground-station elapsed time,
+            # which is monotonic by construction.
+            mission = packet.gs_recv_epoch - self.session_start
+
+        if self._last_mission_time is not None:
+            if mission < self._last_mission_time - TIME_RESET_TOLERANCE_S:
+                # Rebase so the next x continues just after the last one.
+                self._plot_time_offset = (
+                    self._last_plot_time + PLOT_TIME_GAP_S - mission
+                )
+                self._time_resets += 1
+                self.append_event(
+                    "Mission time jumped backwards (%.2fs → %.2fs); plot clock "
+                    "continues forward. Flight computer reset?"
+                    % (self._last_mission_time, mission)
+                )
+                self.csv_logger.log_note(
+                    "mission time reset: %.3f -> %.3f"
+                    % (self._last_mission_time, mission)
+                )
+
+        self._last_mission_time = mission
+        x = mission + self._plot_time_offset
+        self._last_plot_time = x
+
+        if self.first_mission_time is None:
+            self.first_mission_time = mission
+        return x
 
     def on_bad_frame(self, raw: str, reason: str) -> None:
         """A frame failed checksum or parsing — always archived, never fatal."""
@@ -1688,6 +1763,10 @@ class Dashboard(QMainWindow):
         self.recv_times.clear()
         self.session_packets = 0
         self.first_mission_time = None
+        self._last_mission_time = None
+        self._last_plot_time = 0.0
+        self._plot_time_offset = 0.0
+        self._time_resets = 0
         self.session_start = time.time()
         self.serial_worker.reset_counters()
         self.total_frames = self.valid_packets = self.corrupt_packets = 0
