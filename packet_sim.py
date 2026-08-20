@@ -294,10 +294,18 @@ class MissionSim:
             acc_z = 9.81 + random.gauss(0.0, 0.12)
             acc_x, acc_y = random.gauss(0, 0.1), random.gauss(0, 0.1)
 
-        spin = 0.0 if state in (0, 1, 2, 7) else 140.0 * math.exp(-(t - 12.0) / 25.0)
-        gyro_x = random.gauss(0, 6.0) + (spin * 0.15)
-        gyro_y = random.gauss(0, 6.0) - (spin * 0.10)
-        gyro_z = spin + random.gauss(0, 4.0)
+        # Gyro noise floor. A MEMS gyro on a vehicle that is physically
+        # stationary (on the pad, or landed) reads a few tenths of a degree per
+        # second, not several degrees -- the old flat 6 deg/s noise made the
+        # attitude display wander visibly while the rocket was sitting still,
+        # which looked like a bug in the estimator rather than the honest
+        # integral of the transmitted rates that it was.
+        stationary = state in (0, 1, 2, 7)
+        noise = 0.35 if stationary else 6.0
+        spin = 0.0 if stationary else 140.0 * math.exp(-(t - 12.0) / 25.0)
+        gyro_x = random.gauss(0, noise) + (spin * 0.15)
+        gyro_y = random.gauss(0, noise) - (spin * 0.10)
+        gyro_z = spin + random.gauss(0, noise * 0.7)
 
         # GPS/NavIC: drifts downrange with the wind once it leaves the pad.
         downrange = max(0.0, t - 12.0)

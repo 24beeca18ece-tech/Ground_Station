@@ -287,24 +287,43 @@ def quat_to_euler_deg(q: np.ndarray) -> Tuple[float, float, float]:
 # ---------------------------------------------------------------------------
 
 class AttitudeEstimator:
-    """Quaternion attitude estimate from gyro rates with a gravity reference.
+    """Quaternion attitude estimate driven by the telemetry gyro rates.
+
+    Two modes:
+
+    * **Pure gyro (default).**  Orientation is the integral of GYRO_X/Y/Z and
+      nothing else.  Zero on all three axes holds the orientation perfectly
+      still, and the rotation rate corresponds one to one with the transmitted
+      body rates.  Yaw, roll and pitch all drift over time -- that is inherent
+      to integrating a rate sensor, and the RESET button exists for it.
+    * **Accelerometer reference (opt-in).**  Adds a Mahony proportional
+      correction that pulls roll and pitch towards the measured gravity vector,
+      bounding their drift.  This term comes from the accelerometer, so while it
+      is enabled the model can move even with the gyro at zero.
 
     Pure computation, no Qt.  Kept separate from the widget so it can be unit
     tested and so a future firmware-side estimator could replace it without
     touching the rendering code.
     """
 
-    __slots__ = ("q", "_last_t", "accel_valid", "samples", "corrected")
+    __slots__ = ("q", "_last_t", "accel_valid", "samples", "corrected",
+                 "use_accel_reference")
 
-    def __init__(self) -> None:
+    def __init__(self, use_accel_reference: bool = False) -> None:
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self._last_t: Optional[float] = None
         self.accel_valid = False   # was the last sample inside the gravity gate
         self.samples = 0
         self.corrected = 0
+        #: When False the estimate is a pure integral of the telemetry gyro.
+        self.use_accel_reference = bool(use_accel_reference)
 
     def reset(self) -> None:
-        """Re-zero the estimate (clears accumulated yaw drift)."""
+        """Re-zero the estimate (clears accumulated drift).
+
+        Deliberately leaves :attr:`use_accel_reference` alone -- resetting the
+        orientation should not silently change the filter mode.
+        """
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self._last_t = None
         self.accel_valid = False
@@ -333,7 +352,10 @@ class AttitudeEstimator:
 
         self.samples += 1
 
-        # --- gravity reference (Mahony proportional correction) -------------
+        # Body rate straight from the telemetry, and nothing else.  In the
+        # default (pure gyro) mode this is the *only* term that reaches the
+        # integrator, so zero on all three axes means the orientation is held
+        # exactly still and the rotation rate tracks GYRO_X/Y/Z one to one.
         omega = np.array([math.radians(gx), math.radians(gy), math.radians(gz)])
 
         ax, ay, az = (v if math.isfinite(v) else 0.0 for v in accel_ms2)
@@ -341,7 +363,13 @@ class AttitudeEstimator:
         norm = float(np.linalg.norm(accel))
         self.accel_valid = False
 
-        if norm > 1e-6:
+        # --- optional gravity reference (Mahony proportional correction) -----
+        # Off by default.  This term is derived from the accelerometer, not the
+        # gyroscope, so while it is enabled the model can rotate even when the
+        # gyro reads zero -- that is the point of it (it pulls roll/pitch back
+        # towards the measured gravity vector) but it breaks the 1:1
+        # correspondence with GYRO_X/Y/Z, so the operator opts in.
+        if self.use_accel_reference and norm > 1e-6:
             g_ratio = norm / GRAVITY_MS2
             if ACCEL_GATE_LO <= g_ratio <= ACCEL_GATE_HI:
                 # Measured gravity direction in body frame.
@@ -764,23 +792,36 @@ class AttitudeWidget(QWidget):
         self.rpy_label.setAlignment(Qt.AlignCenter)
         stack.addWidget(self.rpy_label)
 
-        self.ref_label = QLabel("GYRO")
+        # Real toggle, not a status lamp: OFF means the orientation is a pure
+        # integral of GYRO_X/Y/Z, ON blends in the accelerometer gravity
+        # reference.  Defaults to OFF so the model tracks the transmitted body
+        # rates exactly and holds still when they are zero.
+        self.ref_btn = QPushButton("GYRO")
         ref_font = QFont()
         ref_font.setPointSize(8)
         ref_font.setBold(True)
-        self.ref_label.setFont(ref_font)
-        self.ref_label.setAlignment(Qt.AlignCenter)
-        # Fixed width so the lamp never squeezes the RESET button off the row.
-        self.ref_label.setFixedWidth(74)
-        self.ref_label.setToolTip(
-            "GRAVITY LOCK: the accelerometer reads close to 1 g, so it is being\n"
-            "used to correct gyro drift in roll and pitch.\n"
-            "GYRO ONLY: the vehicle is accelerating (boost, deployment shock), so\n"
-            "the accelerometer is not a valid gravity reference and the estimate\n"
-            "is coasting on the gyroscope."
+        self.ref_btn.setFont(ref_font)
+        self.ref_btn.setCheckable(True)
+        self.ref_btn.setChecked(False)
+        # Fixed width so the toggle never squeezes the RESET button off the row.
+        self.ref_btn.setFixedWidth(74)
+        self.ref_btn.setToolTip(
+            "Attitude source toggle.\n\n"
+            "GYRO (off, default): orientation is the integral of GYRO_X/Y/Z only.\n"
+            "  Rotation corresponds 1:1 with the transmitted body rates and the\n"
+            "  model holds perfectly still when they read zero. All axes drift\n"
+            "  slowly; use RESET between runs.\n\n"
+            "ACC REF (on): adds an accelerometer gravity reference that bounds\n"
+            "  roll and pitch drift. Because that correction comes from the\n"
+            "  accelerometer, the model can move slightly even at zero gyro.\n"
+            "  Shows G-LOCK while the accelerometer reads close to 1 g, and\n"
+            "  ACC REF while it is coasting on the gyro through boost or\n"
+            "  deployment shock, when the accelerometer is not a valid\n"
+            "  gravity reference."
         )
+        self.ref_btn.toggled.connect(self._on_ref_toggled)
         self._style_ref(False)
-        row.addWidget(self.ref_label)
+        row.addWidget(self.ref_btn)
 
         self.reset_btn = QPushButton("RESET")
         self.reset_btn.setFixedWidth(72)
@@ -916,17 +957,29 @@ class AttitudeWidget(QWidget):
         except Exception:
             pass
 
+    def _on_ref_toggled(self, checked: bool) -> None:
+        """Switch between pure gyro integration and the complementary filter."""
+        self.estimator.use_accel_reference = bool(checked)
+        self._style_ref(self.estimator.accel_valid)
+        self._dirty = True
+
     def _style_ref(self, locked: bool) -> None:
-        if locked:
-            self.ref_label.setText("G-LOCK")
-            self.ref_label.setStyleSheet(
-                "color:#0b1219; background:#35c46b; border-radius:3px; padding:2px 4px;"
-            )
+        """Colour the toggle for its three meaningful states."""
+        if not self.ref_btn.isChecked():
+            # Pure gyro: orientation is 1:1 with the telemetry body rates.
+            self.ref_btn.setText("GYRO")
+            style = "color:#0b1219; background:#8b9aad;"
+        elif locked:
+            # Filter on and the accelerometer is inside the 1 g gate.
+            self.ref_btn.setText("G-LOCK")
+            style = "color:#0b1219; background:#35c46b;"
         else:
-            self.ref_label.setText("GYRO")
-            self.ref_label.setStyleSheet(
-                "color:#0b1219; background:#e9c135; border-radius:3px; padding:2px 4px;"
-            )
+            # Filter on but coasting: accelerometer outside the gate.
+            self.ref_btn.setText("ACC REF")
+            style = "color:#0b1219; background:#e9c135;"
+        self.ref_btn.setStyleSheet(
+            style + " border-radius:3px; padding:2px 4px; font-weight:700;"
+        )
 
 
 def _as_qmatrix(transform: np.ndarray):
