@@ -358,7 +358,8 @@ class StripChart(pg.PlotWidget):
     def __init__(self, title: str, y_label: str,
                  series: Sequence[Tuple[str, str]],
                  parent: Optional[QWidget] = None,
-                 legend: bool = True) -> None:
+                 legend: bool = True,
+                 min_y_span: float = 1.0) -> None:
         super().__init__(parent)
         self.setTitle(title, color=COL_TEXT, size="10pt")
         self.setLabel("left", y_label, color=COL_TEXT_DIM)
@@ -374,6 +375,10 @@ class StripChart(pg.PlotWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.getPlotItem().setContentsMargins(4, 4, 10, 4)
 
+        #: Narrowest Y range the autoscale may zoom to, in this chart's units.
+        #: Stops the view collapsing onto sensor noise when the vehicle is
+        #: stationary -- see _autoscale_y().
+        self.min_y_span = float(min_y_span)
         self._x: List[float] = []
         #: Count of samples whose x had to be clamped to keep the series
         #: non-decreasing. Non-zero means a caller passed an unordered clock.
@@ -462,9 +467,49 @@ class StripChart(pg.PlotWidget):
 
         self.setXRange(cutoff, max(latest, cutoff + 1e-3), padding=0.01)
         if autoscale_y:
-            self.enableAutoRange(axis="y")
+            self._autoscale_y(start)
         else:
             self.disableAutoRange(axis="y")
+
+    def _autoscale_y(self, start: int) -> None:
+        """Fit Y to the visible data, but never below :attr:`min_y_span`.
+
+        pyqtgraph's own autorange has no lower bound, which is a problem for a
+        vehicle sitting still.  A stationary barometer produces a flat reading
+        plus a few tenths of a metre of noise; once any real variation (a
+        power-on settling transient, a hop, a pressure step) scrolls out of the
+        trailing window, unbounded autorange zooms into that noise until it
+        fills the full height of the plot.  The trace is unchanged and still
+        perfectly ordered, but it *looks* like a scattered, disordered mess --
+        and because the window is 60 s, it happens abruptly at the 60 s mark.
+
+        Clamping the span to a physically meaningful minimum keeps sensor noise
+        rendering as a small wiggle about the centre, which is what it is.
+        """
+        lo = None
+        hi = None
+        for name in self._series_names:
+            for value in self._y[name][start:]:
+                if not math.isfinite(value):
+                    continue
+                if lo is None or value < lo:
+                    lo = value
+                if hi is None or value > hi:
+                    hi = value
+
+        if lo is None:                      # nothing finite in view
+            self.enableAutoRange(axis="y")
+            return
+
+        span = hi - lo
+        if span < self.min_y_span:
+            centre = (hi + lo) / 2.0
+            half = self.min_y_span / 2.0
+            lo, hi = centre - half, centre + half
+        else:
+            pad = span * 0.08
+            lo, hi = lo - pad, hi + pad
+        self.setYRange(lo, hi, padding=0)
 
 
 class GpsTrackPlot(pg.PlotWidget):
@@ -905,6 +950,7 @@ class Dashboard(QMainWindow):
             "Particulates", "µg/m³",
             [("PM1.0", COL_PM1), ("PM2.5", COL_PM25), ("PM10", COL_PM10)],
             legend=False,   # the colour-matched tiles above are the legend
+            min_y_span=10.0,
         )
         self.chart_pm.setMinimumHeight(86)
         self.chart_pm.setMaximumHeight(104)
@@ -930,7 +976,8 @@ class Dashboard(QMainWindow):
 
         # --- reaction wheel history ----------------------------------------
         self.chart_wheel = StripChart(
-            "Reaction wheel RPM", "RPM", [("rpm", COL_WHEEL)]
+            "Reaction wheel RPM", "RPM", [("rpm", COL_WHEEL)],
+            min_y_span=100.0,
         )
         # Compact: this page is pinned, so every pixel it takes is a pixel the
         # scrollable panels below lose. The RPM value is the primary readout;
@@ -1104,17 +1151,23 @@ class Dashboard(QMainWindow):
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(6)
 
-        self.chart_alt = StripChart("Altitude", "m", [("alt", COL_ALT)])
-        self.chart_press = StripChart("Pressure", "hPa", [("press", COL_PRESS)])
-        self.chart_temp = StripChart("Temperature", "°C", [("temp", COL_TEMP)])
-        self.chart_volt = StripChart("Battery voltage", "V", [("volt", COL_VOLT)])
+        self.chart_alt = StripChart("Altitude", "m", [("alt", COL_ALT)],
+                                    min_y_span=10.0)
+        self.chart_press = StripChart("Pressure", "hPa", [("press", COL_PRESS)],
+                                      min_y_span=2.0)
+        self.chart_temp = StripChart("Temperature", "°C", [("temp", COL_TEMP)],
+                                     min_y_span=2.0)
+        self.chart_volt = StripChart("Battery voltage", "V", [("volt", COL_VOLT)],
+                                     min_y_span=0.5)
         self.chart_acc = StripChart(
             "Accelerometer", "m/s²",
             [("X", COL_XYZ[0]), ("Y", COL_XYZ[1]), ("Z", COL_XYZ[2])],
+            min_y_span=4.0,
         )
         self.chart_gyro = StripChart(
             "Gyroscope", "°/s",
             [("X", COL_XYZ[0]), ("Y", COL_XYZ[1]), ("Z", COL_XYZ[2])],
+            min_y_span=20.0,
         )
 
         self.charts = [
