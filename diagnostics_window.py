@@ -145,6 +145,17 @@ class RawPacketStrip(QFrame):
         self.text.setStyleSheet("color: %s; background: transparent;" % COL_WARN)
         self._apply_elision()
 
+    def show_rejected(self, raw: str) -> None:
+        """Display a frame that arrived intact but carries impossible values.
+
+        Tagged differently from CORRUPT on purpose: the bytes are fine, so the
+        link is healthy and the fault is upstream in a sensor.
+        """
+        self._raw = _sanitise_raw(raw)
+        self._set_tag("REJECTED", "#0b1219", COL_WARN)
+        self.text.setStyleSheet("color: %s; background: transparent;" % COL_WARN)
+        self._apply_elision()
+
     def clear(self) -> None:
         self._raw = ""
         self._set_tag("NO RX", COL_DIM, "#1b232e")
@@ -215,7 +226,8 @@ SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("rate", "PACKET RATE"),
         ("age", "PACKET AGE"),
         ("valid_total", "VALID/TOTAL"),
-        ("corrupt", "CORRUPT COUNT"),
+        ("corrupt", "CORRUPT (CHECKSUM)"),
+        ("rejected", "REJECTED (BOUNDS)"),
         ("conn", "CONNECTION STATE"),
     ]),
 ]
@@ -392,7 +404,7 @@ class DiagnosticsWindow(QDialog):
 
     def update_link(self, rate: float, age: Optional[float], valid: int,
                     total: int, corrupt: int, connected: bool,
-                    stale_after: float = 2.0) -> None:
+                    stale_after: float = 2.0, rejected: int = 0) -> None:
         """Refresh the link statistics rows."""
         try:
             self._set("rate", "%.1f pkt/s" % rate,
@@ -407,6 +419,10 @@ class DiagnosticsWindow(QDialog):
             self._set("valid_total", "%d / %d" % (valid, total), COL_NUM)
             self._set("corrupt", "%d" % corrupt,
                       COL_ALERT if corrupt else COL_OK)
+            # Distinct from CORRUPT: the link delivered these frames perfectly,
+            # a sensor produced impossible numbers inside them.
+            self._set("rejected", "%d" % rejected,
+                      COL_WARN if rejected else COL_OK)
             self._set("conn", "CONNECTED" if connected else "DISCONNECTED",
                       COL_OK if connected else COL_ALERT)
         except Exception:

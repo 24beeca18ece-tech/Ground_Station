@@ -152,6 +152,33 @@ _FRAME_RE = re.compile(r"^\$(?P<body>[^$*]*)\*(?P<cs>[0-9A-Fa-f]{2})$")
 SPS30_MIN_UGM3 = 0.0
 SPS30_MAX_UGM3 = 1000.0
 
+#: Standard gravity, for expressing accelerometer limits in g.
+G_MS2 = 9.80665
+
+#: Physical plausibility envelope, ``field -> (low, high, unit)``.
+#:
+#: The XOR checksum proves a frame arrived intact; it says nothing about
+#: whether the numbers inside it are physically possible.  A sensor read that
+#: fails on the vehicle -- a mis-clocked I2C transaction, a barometer returning
+#: its uninitialised register contents -- produces a frame that is perfectly
+#: valid on the wire and complete nonsense as telemetry.  Such a packet plotted
+#: straight onto a chart wrenches the Y axis to an absurd range and drags every
+#: subsequent redraw with it.
+#:
+#: These bounds are deliberately generous: they are a nonsense filter, not a
+#: flight-envelope check.  Anything inside them is passed through untouched
+#: even if it is unusual, because rejecting real data is far worse than
+#: admitting a slightly odd value.
+PHYSICAL_BOUNDS = {
+    "ALTITUDE":    (-500.0, 15000.0, "m"),
+    "PRESSURE":    (300.0, 1100.0, "hPa"),
+    "TEMPERATURE": (-80.0, 85.0, "C"),
+    "VOLTAGE":     (0.0, 20.0, "V"),
+    # +/-50 g, expressed in the m/s^2 the packet actually carries.
+    "ACCEL":       (-50.0 * G_MS2, 50.0 * G_MS2, "m/s2"),
+    "GYRO":        (-2000.0, 2000.0, "deg/s"),
+}
+
 
 class PacketError(Exception):
     """Base class for every recoverable frame problem."""
@@ -451,6 +478,46 @@ class TelemetryPacket:
     @property
     def is_rocket(self) -> bool:
         return self.payload_type == PAYLOAD_ROCKET
+
+    # -- physical validation ------------------------------------------------
+
+    def implausible_reasons(self) -> List[str]:
+        """Return every physical-bounds violation in this packet.
+
+        An empty list means the packet is plausible.  This is a *separate*
+        judgement from the checksum: the checksum says the bytes survived the
+        link, this says the numbers could have come from a working sensor.
+
+        ``NaN`` is never a violation.  Optional fields are legitimately absent
+        -- no GPS fix yet, no IMU fitted on this airframe -- and treating
+        "missing" as "impossible" would throw away good packets.
+        """
+        bad: List[str] = []
+
+        def check(name: str, value: float, key: str) -> None:
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                return                      # missing data is not implausible
+            low, high, unit = PHYSICAL_BOUNDS[key]
+            if value < low or value > high:
+                bad.append("%s=%.2f%s outside [%.1f, %.1f]"
+                           % (name, value, unit, low, high))
+
+        check("ALTITUDE", self.altitude_m, "ALTITUDE")
+        check("PRESSURE", self.pressure_hpa, "PRESSURE")
+        check("TEMP", self.temp_c, "TEMPERATURE")
+        check("VOLTAGE", self.voltage_v, "VOLTAGE")
+        check("ACC_X", self.acc_x, "ACCEL")
+        check("ACC_Y", self.acc_y, "ACCEL")
+        check("ACC_Z", self.acc_z, "ACCEL")
+        check("GYRO_X", self.gyro_x, "GYRO")
+        check("GYRO_Y", self.gyro_y, "GYRO")
+        check("GYRO_Z", self.gyro_z, "GYRO")
+        return bad
+
+    @property
+    def is_plausible(self) -> bool:
+        """True when every finite sensor value lies inside its physical bounds."""
+        return not self.implausible_reasons()
 
     # -- serialisation -----------------------------------------------------
 

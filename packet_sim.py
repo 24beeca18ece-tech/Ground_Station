@@ -126,9 +126,14 @@ class MissionSim:
     WHEEL_MAX_RPM = 1124
 
     def __init__(self, team_id: str = DEFAULT_TEAM_ID,
-                 payload_type: str = PAYLOAD_CANSAT) -> None:
+                 payload_type: str = PAYLOAD_CANSAT,
+                 gyro_bias: float = 0.0) -> None:
         self.team_id = team_id
         self.payload_type = payload_type
+        # Constant per-axis gyro offset, as a real uncalibrated MEMS gyro has.
+        # The default of 0 keeps the simulator ideal; set it to reproduce the
+        # turn-on bias that only shows up on real hardware.
+        self.gyro_bias = float(gyro_bias)
         self.packet_count = 0
         self.t0 = time.time()
 
@@ -303,9 +308,9 @@ class MissionSim:
         stationary = state in (0, 1, 2, 7)
         noise = 0.35 if stationary else 6.0
         spin = 0.0 if stationary else 140.0 * math.exp(-(t - 12.0) / 25.0)
-        gyro_x = random.gauss(0, noise) + (spin * 0.15)
-        gyro_y = random.gauss(0, noise) - (spin * 0.10)
-        gyro_z = spin + random.gauss(0, noise * 0.7)
+        gyro_x = random.gauss(0, noise) + (spin * 0.15) + self.gyro_bias
+        gyro_y = random.gauss(0, noise) - (spin * 0.10) + self.gyro_bias * 0.6
+        gyro_z = spin + random.gauss(0, noise * 0.7) - self.gyro_bias * 0.4
 
         # GPS/NavIC: drifts downrange with the wind once it leaves the pad.
         downrange = max(0.0, t - 12.0)
@@ -378,11 +383,25 @@ class FaultInjector:
         self.garbage_rate = args.garbage_rate
         self.truncate_rate = args.truncate_rate
         self.drop_rate = args.drop_rate
+        self.implausible_rate = getattr(args, "implausible_rate", 0.0)
+
+    #: Physically impossible values, modelled on a real MS5611 I2C read failure
+    #: that returned register garbage. These frames are re-checksummed so they
+    #: are valid on the wire -- the point is to exercise the GCS plausibility
+    #: filter, which sits *after* the checksum.
+    IMPLAUSIBLE_SUBS = (
+        (3, "-2768.46"),    # ALTITUDE, metres
+        (4, "1393.05"),     # PRESSURE, hPa
+        (5, "-575.10"),     # TEMP, C
+    )
 
     def apply(self, frame: str) -> Optional[bytes]:
         """Return the bytes to transmit, or ``None`` to drop the frame."""
         if random.random() < self.drop_rate:
             return None
+
+        if self.implausible_rate and random.random() < self.implausible_rate:
+            frame = _make_implausible_impl(frame)
 
         out = bytearray()
 
@@ -417,6 +436,22 @@ class FaultInjector:
         return bytes(out)
 
 
+def _make_implausible_impl(frame: str) -> str:
+    """Replace sensor fields with impossible values and re-checksum.
+
+    The frame stays perfectly valid on the wire; only the physics is wrong.
+    """
+    body, _, _ = frame[1:].rpartition("*")
+    fields = body.split(",")
+    # v2 frames carry PAYLOAD_TYPE at index 1, shifting every later field by one.
+    offset = 1 if len(fields) in (FIELD_COUNT_CANSAT, FIELD_COUNT_ROCKET) else 0
+    for index, value in FaultInjector.IMPLAUSIBLE_SUBS:
+        pos = index + offset
+        if pos < len(fields):
+            fields[pos] = value
+    return build_frame(",".join(fields))
+
+
 # ---------------------------------------------------------------------------
 # Transports
 # ---------------------------------------------------------------------------
@@ -426,7 +461,8 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
 
     ``send(data: bytes) -> None`` may raise to signal that the peer went away.
     """
-    sim = MissionSim(args.team_id, payload_type=args.payload_type)
+    sim = MissionSim(args.team_id, payload_type=args.payload_type,
+                     gyro_bias=args.gyro_bias)
     faults = FaultInjector(args)
     period = 1.0 / max(args.rate, 0.1)
     next_due = time.monotonic()
@@ -596,6 +632,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Packets per second (default 10; competition is 20).")
     flight.add_argument("--duration", type=float, default=0.0,
                         help="Stop after N seconds (0 = run forever).")
+    flight.add_argument("--gyro-bias", type=float, default=0.0,
+                        metavar="DPS",
+                        help="Constant gyro offset in deg/s, as an uncalibrated "
+                             "MEMS gyro has at turn-on. Reproduces the attitude "
+                             "drift that only appears on real hardware.")
     flight.add_argument("--seed", type=int, default=None,
                         help="Seed the RNG for a repeatable run.")
 
@@ -614,6 +655,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Seconds between bursts.")
     faults.add_argument("--burst-gap", type=float, default=3.0,
                         help="Seconds of silence before each burst.")
+    faults.add_argument("--implausible-rate", type=float, default=0.0,
+                        help="Fraction of frames given physically impossible "
+                             "sensor values (valid checksum, absurd physics) to "
+                             "exercise the GCS plausibility filter.")
     faults.add_argument("--chaos", action="store_true",
                         help="Preset: a realistically hostile link.")
 

@@ -34,8 +34,8 @@ from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QPixmap
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -62,6 +62,7 @@ from PyQt5.QtWidgets import (
 
 from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
 from csv_logger import CsvLoggerThread
+from csv_table_window import CsvTableWindow
 from diagnostics_window import DiagnosticsWindow, RawPacketStrip
 from serial_worker import SerialWorker, list_serial_ports
 from session_summary_widget import SessionSummaryWidget
@@ -94,6 +95,16 @@ TIME_RESET_TOLERANCE_S = 0.5
 #: Gap inserted in the plot clock across a detected restart.
 PLOT_TIME_GAP_S = 0.01
 EVENT_LOG_LINES = 400
+#: Minimum interval between Y-axis range recomputations, seconds. Bounds the
+#: cost of autoscaling under rapid or noisy input: the scan is O(visible
+#: points) per series, so an unthrottled recompute on every redraw is what
+#: turns a burst of wild values into visible UI lag.
+AUTOSCALE_MIN_INTERVAL_S = 0.25
+#: A press/release pair counts as a click to enlarge only if the pointer
+#: barely moved and the button was not held. Anything else is left to
+#: pyqtgraph, so drag-to-pan and wheel-zoom on the small chart still work.
+CLICK_SLOP_PX = 5
+CLICK_MAX_S = 0.4
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 
@@ -351,8 +362,134 @@ class StatusLight(QFrame):
         )
 
 
+class ChartOverlay(QWidget):
+    """Full-window dimmed overlay holding one enlarged chart.
+
+    The chart is **reparented**, not copied. The very same StripChart object is
+    lifted out of the grid and dropped into the overlay, so it keeps receiving
+    add_point()/redraw() from the render loop with no extra plumbing and no risk
+    of the enlarged view drifting out of sync with the small one. On close it
+    goes back into the exact grid cell it came from.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._chart: Optional["StripChart"] = None
+        self._home = None          # (grid_layout, row, column)
+        self.setObjectName("chartOverlay")
+        # Needed so the dim is painted rather than inherited from the parent.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.hide()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # The frame is what "inside" means: a click landing outside it closes.
+        self.frame = QFrame()
+        self.frame.setObjectName("chartOverlayFrame")
+        self.frame.setStyleSheet(
+            "QFrame#chartOverlayFrame { background-color: %s;"
+            " border: 1px solid %s; border-radius: 8px; }"
+            % (COL_PANEL, COL_ACCENT)
+        )
+        inner = QVBoxLayout(self.frame)
+        inner.setContentsMargins(10, 8, 10, 10)
+        inner.setSpacing(6)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.hint = QLabel("Click outside this panel, or press Esc, to close")
+        self.hint.setStyleSheet("color: %s;" % COL_TEXT_DIM)
+        bar.addWidget(self.hint, 1)
+        self.close_btn = QPushButton("CLOSE")
+        self.close_btn.setFixedWidth(90)
+        self.close_btn.clicked.connect(self.close_overlay)
+        bar.addWidget(self.close_btn)
+        inner.addLayout(bar)
+
+        self.slot = QVBoxLayout()
+        self.slot.setContentsMargins(0, 0, 0, 0)
+        inner.addLayout(self.slot, 1)
+
+        outer.addWidget(self.frame)
+
+    # -- open / close ------------------------------------------------------
+
+    def open_with(self, chart: "StripChart", grid, row: int, column: int) -> None:
+        """Take *chart* out of *grid* and show it enlarged."""
+        if self._chart is not None:
+            return
+        self._chart = chart
+        self._home = (grid, row, column)
+        grid.removeWidget(chart)
+        self.slot.addWidget(chart)
+        chart.show()
+        chart.set_enlarged(True)
+        self._relayout()
+        self.show()
+        self.raise_()
+        self.setFocus(Qt.OtherFocusReason)
+
+    def close_overlay(self) -> None:
+        """Return the chart to its grid cell and hide."""
+        if self._chart is None:
+            self.hide()
+            return
+        chart, (grid, row, column) = self._chart, self._home
+        self._chart = None
+        self._home = None
+        self.slot.removeWidget(chart)
+        chart.set_enlarged(False)
+        grid.addWidget(chart, row, column)
+        chart.show()
+        self.hide()
+
+    @property
+    def is_open(self) -> bool:
+        return self._chart is not None
+
+    # -- geometry / painting ----------------------------------------------
+
+    def _relayout(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.setGeometry(parent.rect())
+        w, h = parent.width(), parent.height()
+        margin_x, margin_y = int(w * 0.06), int(h * 0.07)
+        self.layout().setContentsMargins(margin_x, margin_y, margin_x, margin_y)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._relayout()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(6, 9, 13, 205))
+        painter.end()
+
+    # -- dismissal ---------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Only a press on the dimmed area counts; presses inside the frame are
+        # delivered to the chart itself and never reach here.
+        if not self.frame.geometry().contains(event.pos()):
+            self.close_overlay()
+        else:
+            super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.key() == Qt.Key_Escape:
+            self.close_overlay()
+        else:
+            super().keyPressEvent(event)
+
+
 class StripChart(pg.PlotWidget):
     """Scrolling time-series plot holding its own data buffers.
+
+    Emits :attr:`clicked` on a clean left click so the dashboard can enlarge it.
 
     Data is appended by :meth:`add_point` (cheap, called per packet) and drawn by
     :meth:`redraw` (called by the render timer).  The two are separate so packet
@@ -363,12 +500,19 @@ class StripChart(pg.PlotWidget):
     timestamp that cannot be interpreted.
     """
 
+    #: Emitted with ``self`` on a clean left click (no drag, no hold).
+    clicked = pyqtSignal(object)
+
     def __init__(self, title: str, y_label: str,
                  series: Sequence[Tuple[str, str]],
                  parent: Optional[QWidget] = None,
                  legend: bool = True,
                  min_y_span: float = 1.0) -> None:
         super().__init__(parent)
+        self._press_pos = None
+        self._press_t = 0.0
+        self._base_title = title
+        self._base_grid_alpha = 0.22
         self.setTitle(title, color=COL_TEXT, size="10pt")
         self.setLabel("left", y_label, color=COL_TEXT_DIM)
         self.setLabel("bottom", "mission time", units="s", color=COL_TEXT_DIM)
@@ -387,6 +531,7 @@ class StripChart(pg.PlotWidget):
         #: Stops the view collapsing onto sensor noise when the vehicle is
         #: stationary -- see _autoscale_y().
         self.min_y_span = float(min_y_span)
+        self._last_y_autoscale = 0.0
         self._x: List[float] = []
         #: Count of samples whose x had to be clamped to keep the series
         #: non-decreasing. Non-zero means a caller passed an unordered clock.
@@ -447,9 +592,55 @@ class StripChart(pg.PlotWidget):
     def clear_data(self) -> None:
         self._x.clear()
         self.bad_x = 0
+        self._last_y_autoscale = 0.0
         for name in self._series_names:
             self._y[name].clear()
             self._curves[name].setData([], [])
+
+    # -- click to enlarge ---------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.pos()
+            self._press_t = time.monotonic()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # pyqtgraph handles the event first, so a drag still pans normally; the
+        # click is only recognised when nothing was dragged.
+        super().mouseReleaseEvent(event)
+        press, self._press_pos = self._press_pos, None
+        if press is None or event.button() != Qt.LeftButton:
+            return
+        moved = (event.pos() - press).manhattanLength()
+        held = time.monotonic() - self._press_t
+        if moved <= CLICK_SLOP_PX and held <= CLICK_MAX_S:
+            self.clicked.emit(self)
+
+    def set_enlarged(self, enlarged: bool) -> None:
+        """Adjust presentation for the enlarged view.
+
+        Only cosmetic: denser gridlines and more tick detail, which are wasted
+        pixels at thumbnail size but the whole point when reading values off a
+        full-window chart.
+        """
+        # Wrapped: this is presentation only, and pyqtgraph's axis style keys
+        # have moved between releases. A cosmetic call must never be able to
+        # abort the reparenting that actually opens or closes the overlay.
+        try:
+            alpha = 0.34 if enlarged else self._base_grid_alpha
+            self.showGrid(x=True, y=True, alpha=alpha)
+            plot = self.getPlotItem()
+            for axis in ("left", "bottom"):
+                plot.getAxis(axis).setStyle(
+                    tickTextOffset=6 if enlarged else 3,
+                    tickLength=-9 if enlarged else -5,
+                )
+            if self._base_title:
+                self.setTitle(self._base_title, color=COL_TEXT,
+                              size="13pt" if enlarged else "10pt")
+        except Exception:
+            pass
 
     # -- rendering ----------------------------------------------------------
 
@@ -475,7 +666,12 @@ class StripChart(pg.PlotWidget):
 
         self.setXRange(cutoff, max(latest, cutoff + 1e-3), padding=0.01)
         if autoscale_y:
-            self._autoscale_y(start)
+            # Rate-limited: the Y range is recomputed at most every
+            # AUTOSCALE_MIN_INTERVAL_S, so noisy input cannot make the UI thrash.
+            now = time.monotonic()
+            if (now - self._last_y_autoscale) >= AUTOSCALE_MIN_INTERVAL_S:
+                self._last_y_autoscale = now
+                self._autoscale_y(start)
         else:
             self.disableAutoRange(axis="y")
 
@@ -599,6 +795,8 @@ class Dashboard(QMainWindow):
         self.valid_packets = 0
         self.corrupt_packets = 0
         self.resyncs = 0
+        #: Frames that passed the checksum but failed the physical bounds check.
+        self.rejected_packets = 0
         self.logging_enabled = False
         self.is_connected = False
         self._readouts_dirty = False
@@ -616,6 +814,9 @@ class Dashboard(QMainWindow):
         # Non-modal diagnostics window, created hidden. Parented to the main
         # window so it closes with it.
         self.diagnostics = DiagnosticsWindow(self)
+        # Live tabular view of the session CSV. Fed from the logger's
+        # row_written signal, never by re-reading the file.
+        self.csv_table = CsvTableWindow(self)
 
         self._wire_signals()
 
@@ -692,6 +893,11 @@ class Dashboard(QMainWindow):
         # or not, which is the first thing you want during bring-up.
         self.raw_strip = RawPacketStrip()
         root_layout.addWidget(self.raw_strip)
+
+        # Chart enlarge overlay: a child of the central widget so it can dim
+        # and cover the whole dashboard without being a separate window.
+        self.chart_overlay = ChartOverlay(root)
+        self.chart_overlay.hide()
 
         self.statusBar().setStyleSheet(
             "QStatusBar { background: %s; color: %s; border-top: 1px solid %s; }"
@@ -786,6 +992,14 @@ class Dashboard(QMainWindow):
             "Shows every field of the most recent packet plus link statistics."
         )
         layout.addWidget(self.diag_btn)
+
+        self.csv_table_btn = QPushButton("CSV TABLE")
+        self.csv_table_btn.setFixedWidth(126)
+        self.csv_table_btn.setToolTip(
+            "Open the current logging session's CSV as a live table, one row "
+            "per logged packet, with a filter box."
+        )
+        layout.addWidget(self.csv_table_btn)
 
         self.log_path_label = QLabel("CSV: not started")
         self.log_path_label.setStyleSheet("color: %s;" % COL_TEXT_DIM)
@@ -1119,7 +1333,7 @@ class Dashboard(QMainWindow):
         self.tile_rate = ReadoutTile("Packet rate", "pkt/s", COL_ACCENT, value_pt=15)
         self.tile_age = ReadoutTile("Packet age", "s", COL_TEXT, value_pt=15)
         self.tile_total = ReadoutTile("Valid/Total", "", COL_TEXT, value_pt=15)
-        self.tile_corrupt = ReadoutTile("Corrupt", "", COL_TEXT, value_pt=15)
+        self.tile_corrupt = ReadoutTile("Corrupt / Rejected", "", COL_TEXT, value_pt=15)
 
         grid.addWidget(self.tile_rate, 0, 0)
         grid.addWidget(self.tile_age, 0, 1)
@@ -1136,7 +1350,7 @@ class Dashboard(QMainWindow):
         grid.addWidget(self.stale_banner, 2, 0, 1, 2)
 
         self.tile_total.set_value("0/0")
-        self.tile_corrupt.set_value("0")
+        self.tile_corrupt.set_value("0 / 0")
         self.tile_rate.set_value("0.0")
         self.tile_age.set_value("--")
         return box
@@ -1226,12 +1440,23 @@ class Dashboard(QMainWindow):
             self.chart_volt, self.chart_acc, self.chart_gyro,
         ]
 
-        grid.addWidget(self.chart_alt, 0, 0)
-        grid.addWidget(self.chart_press, 0, 1)
-        grid.addWidget(self.chart_temp, 1, 0)
-        grid.addWidget(self.chart_volt, 1, 1)
-        grid.addWidget(self.chart_acc, 2, 0)
-        grid.addWidget(self.chart_gyro, 2, 1)
+        placements = [
+            (self.chart_alt, 0, 0), (self.chart_press, 0, 1),
+            (self.chart_temp, 1, 0), (self.chart_volt, 1, 1),
+            (self.chart_acc, 2, 0), (self.chart_gyro, 2, 1),
+        ]
+        #: Where each chart lives in the grid, so the enlarge overlay can
+        #: put it back exactly where it came from.
+        self._chart_home = {}
+        for chart, row, column in placements:
+            grid.addWidget(chart, row, column)
+            self._chart_home[chart] = (grid, row, column)
+            chart.setCursor(Qt.PointingHandCursor)
+            chart.setToolTip(
+                'Click to enlarge. Drag to pan, wheel to zoom, '
+                'double-click to auto-range.'
+            )
+            chart.clicked.connect(self.enlarge_chart)
         for row in range(3):
             grid.setRowStretch(row, 1)
         for col in range(2):
@@ -1290,11 +1515,14 @@ class Dashboard(QMainWindow):
         # the GUI event loop; the slots must stay short.
         self.serial_worker.packet_received.connect(self.on_packet)
         self.serial_worker.bad_frame.connect(self.on_bad_frame)
+        self.serial_worker.rejected_frame.connect(self.on_rejected_frame)
         self.serial_worker.stats_updated.connect(self.on_stats)
         self.serial_worker.connection_changed.connect(self.on_connection_changed)
         self.serial_worker.log_message.connect(self.append_event)
 
         self.csv_logger.file_opened.connect(self.on_log_file_opened)
+        # Every row the logger writes also lands in the live table.
+        self.csv_logger.row_written.connect(self.csv_table.add_row)
         self.csv_logger.error_occurred.connect(self.append_event)
 
         # Widgets -> GUI slots.
@@ -1303,6 +1531,7 @@ class Dashboard(QMainWindow):
         self.log_btn.clicked.connect(self.toggle_logging)
         self.clear_btn.clicked.connect(self.clear_session)
         self.diag_btn.clicked.connect(self.toggle_diagnostics)
+        self.csv_table_btn.clicked.connect(self.toggle_csv_table)
 
     # ==================================================================
     # Slots — connection control
@@ -1517,12 +1746,23 @@ class Dashboard(QMainWindow):
         # still has data even if CSV logging was never switched on.
         self.csv_logger.log_error(raw, reason)
 
+    def on_rejected_frame(self, raw: str, reason: str) -> None:
+        """A frame survived the link intact but carries impossible values.
+
+        Archived with the offending fields named, and shown on the raw strip
+        under its own tag so it reads differently from a corrupt frame at a
+        glance. Deliberately not plotted and not sent to the attitude widget.
+        """
+        self.raw_strip.show_rejected(raw)
+        self.csv_logger.log_error(raw, reason)
+
     def on_stats(self, total_frames: int, valid: int, corrupt: int,
-                 resyncs: int) -> None:
+                 resyncs: int, rejected: int) -> None:
         self.total_frames = total_frames
         self.valid_packets = valid
         self.corrupt_packets = corrupt
         self.resyncs = resyncs
+        self.rejected_packets = rejected
         self.summary.set_link_stats(valid, corrupt, resyncs)
 
     def on_log_file_opened(self, path: str) -> None:
@@ -1530,6 +1770,9 @@ class Dashboard(QMainWindow):
         # clips to a meaningless fragment. It stays available as the tooltip.
         self.log_path_label.setText("CSV: %s" % os.path.basename(path))
         self.log_path_label.setToolTip(path)
+        # Point the live table at the new session file and drop the previous
+        # session's rows, which belong to a different file.
+        self.csv_table.set_csv_path(path)
         self.append_event("Logging to %s" % path)
 
     # ==================================================================
@@ -1597,6 +1840,27 @@ class Dashboard(QMainWindow):
         self._update_payload_readouts(packet)
         self._style_fsm(packet.fsm_state)
 
+    def enlarge_chart(self, chart) -> None:
+        """Open one chart in the full-window overlay."""
+        if self.chart_overlay.is_open:
+            return
+        home = self._chart_home.get(chart)
+        if home is None:
+            return
+        grid, row, column = home
+        self.chart_overlay.open_with(chart, grid, row, column)
+
+    def toggle_csv_table(self) -> None:
+        """Show or hide the live CSV table window."""
+        if self.csv_table.isVisible():
+            self.csv_table.hide()
+            self.append_event("CSV table window closed.")
+            return
+        self.csv_table.show()
+        self.csv_table.raise_()
+        self.csv_table.activateWindow()
+        self.append_event("CSV table window opened.")
+
     def toggle_diagnostics(self) -> None:
         """Show or hide the raw diagnostics table window."""
         if self.diagnostics.isVisible():
@@ -1628,6 +1892,7 @@ class Dashboard(QMainWindow):
             rate=rate, age=age, valid=self.valid_packets,
             total=self.total_frames, corrupt=self.corrupt_packets,
             connected=self.is_connected, stale_after=STALE_AFTER_S,
+            rejected=self.rejected_packets,
         )
 
     def _apply_payload_panel(self) -> None:
@@ -1755,8 +2020,10 @@ class Dashboard(QMainWindow):
         self.tile_rate.set_value("%.1f" % rate)
 
         self.tile_total.set_value("%d/%d" % (self.valid_packets, self.total_frames))
-        self.tile_corrupt.set_value(str(self.corrupt_packets))
-        self.tile_corrupt.set_level("alert" if self.corrupt_packets else "normal")
+        self.tile_corrupt.set_value("%d / %d"
+                                    % (self.corrupt_packets, self.rejected_packets))
+        self.tile_corrupt.set_level(
+            "alert" if (self.corrupt_packets or self.rejected_packets) else "normal")
 
         self._push_link_diagnostics()
 
@@ -1818,14 +2085,17 @@ class Dashboard(QMainWindow):
         self.log_btn.style().polish(self.log_btn)
 
         if self.logging_enabled:
-            path = self.csv_logger.csv_path
+            # Each press starts a genuinely new file: the logger closes any
+            # previous one and stamps the next with the time of this press, so
+            # runs can never be overwritten or mixed together.
+            self.csv_logger.begin_session()
+            self.log_path_label.setText("CSV: waiting for first packet (TEAM_ID)…")
+            self.log_path_label.setToolTip("")
             self.append_event(
-                "CSV logging ON%s"
-                % ("" if path is None else " → %s" % path)
+                "CSV logging ON — new session file will be created on the "
+                "first packet."
             )
-            if path is None:
-                self.log_path_label.setText("CSV: waiting for first packet (TEAM_ID)…")
-            self.csv_logger.log_note("CSV logging started")
+            self.csv_logger.log_note("CSV logging started (new session file)")
         else:
             self.append_event("CSV logging OFF (file flushed and left open).")
             self.csv_logger.log_note("CSV logging stopped")
@@ -1878,8 +2148,9 @@ class Dashboard(QMainWindow):
         self.serial_worker.reset_counters()
         self.total_frames = self.valid_packets = self.corrupt_packets = 0
         self.resyncs = 0
+        self.rejected_packets = 0
         self.tile_total.set_value("0/0")
-        self.tile_corrupt.set_value("0")
+        self.tile_corrupt.set_value("0 / 0")
         self.append_event("Plots and counters cleared.")
 
     def append_event(self, text: str) -> None:
@@ -1890,6 +2161,13 @@ class Dashboard(QMainWindow):
     # ==================================================================
     # Clean shutdown
     # ==================================================================
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Keep the enlarge overlay covering the window as it is resized."""
+        super().resizeEvent(event)
+        overlay = getattr(self, "chart_overlay", None)
+        if overlay is not None and overlay.isVisible():
+            overlay._relayout()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         """Stop timers, stop both worker threads, flush and close every file.
@@ -1903,6 +2181,10 @@ class Dashboard(QMainWindow):
             self.status_timer.stop()
             self.attitude_timer.stop()
             self.diagnostics.close()
+            self.csv_table.close()
+            if self.chart_overlay.is_open:
+                # Put the chart back before teardown so the grid owns it.
+                self.chart_overlay.close_overlay()
 
             self.serial_worker.stop()
             if not self.serial_worker.wait(3000):

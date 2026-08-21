@@ -209,6 +209,26 @@ GRAVITY_MS2 = 9.80665
 #: model wildly, so the gap is capped.
 MAX_DT_S = 0.25
 
+# --- gyro bias estimation ---------------------------------------------------
+# A real MEMS gyro reads a constant non-zero rate when it is perfectly still --
+# its turn-on bias, typically a few deg/s and different every power cycle. Pure
+# integration turns that into unbounded drift: 2 deg/s rotates the model a full
+# turn in three minutes while the vehicle sits on the bench. The simulator emits
+# zero-mean noise and has no bias, which is why this only shows on real hardware.
+#
+# The fix is what every flight computer does: while the vehicle is demonstrably
+# stationary, average the gyro and subtract that average from then on.
+
+#: EMA weight for the running bias estimate. ~150 samples (7.5 s at 20 Hz) to
+#: converge -- slow enough that a genuine slow rotation is not absorbed as bias.
+BIAS_ALPHA = 0.02
+#: Body rate below which the vehicle may be considered at rest, deg/s.
+BIAS_MAX_RATE_DPS = 6.0
+#: Specific-force window for "at rest", in g.
+BIAS_ACCEL_LO, BIAS_ACCEL_HI = 0.85, 1.15
+#: Samples of stationary averaging before the estimate is reported as settled.
+BIAS_SETTLE_SAMPLES = 60
+
 # Palette, matched to dashboard_ui.py.
 COL_PANEL = "#161d27"
 COL_TEXT = "#dbe3ee"
@@ -307,9 +327,11 @@ class AttitudeEstimator:
     """
 
     __slots__ = ("q", "_last_t", "accel_valid", "samples", "corrected",
-                 "use_accel_reference")
+                 "use_accel_reference", "auto_bias", "bias", "bias_samples",
+                 "at_rest")
 
-    def __init__(self, use_accel_reference: bool = False) -> None:
+    def __init__(self, use_accel_reference: bool = False,
+                 auto_bias: bool = True) -> None:
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self._last_t: Optional[float] = None
         self.accel_valid = False   # was the last sample inside the gravity gate
@@ -317,6 +339,12 @@ class AttitudeEstimator:
         self.corrected = 0
         #: When False the estimate is a pure integral of the telemetry gyro.
         self.use_accel_reference = bool(use_accel_reference)
+        #: Subtract an auto-learned turn-on bias from the raw gyro.
+        self.auto_bias = bool(auto_bias)
+        #: Running gyro bias estimate, deg/s, one per axis.
+        self.bias = np.zeros(3)
+        self.bias_samples = 0
+        self.at_rest = False
 
     def reset(self) -> None:
         """Re-zero the estimate (clears accumulated drift).
@@ -329,6 +357,16 @@ class AttitudeEstimator:
         self.accel_valid = False
         self.samples = 0
         self.corrected = 0
+        # Re-arm bias learning: RESET is what an operator presses between bench
+        # runs, which is exactly when a fresh zero should be taken.
+        self.bias = np.zeros(3)
+        self.bias_samples = 0
+        self.at_rest = False
+
+    @property
+    def bias_settled(self) -> bool:
+        """True once enough stationary samples have been averaged to trust it."""
+        return self.bias_samples >= BIAS_SETTLE_SAMPLES
 
     def update(self, gyro_dps: Tuple[float, float, float],
                accel_ms2: Tuple[float, float, float],
@@ -356,12 +394,29 @@ class AttitudeEstimator:
         # default (pure gyro) mode this is the *only* term that reaches the
         # integrator, so zero on all three axes means the orientation is held
         # exactly still and the rotation rate tracks GYRO_X/Y/Z one to one.
-        omega = np.array([math.radians(gx), math.radians(gy), math.radians(gz)])
+        raw = np.array([gx, gy, gz])
 
         ax, ay, az = (v if math.isfinite(v) else 0.0 for v in accel_ms2)
         accel = np.array([ax, ay, az])
         norm = float(np.linalg.norm(accel))
         self.accel_valid = False
+
+        # --- turn-on bias estimation -----------------------------------------
+        # Learn only while the vehicle is demonstrably at rest: gravity-only
+        # specific force AND a body rate small enough that it cannot be real
+        # motion. In flight neither holds, so the estimate freezes at whatever
+        # was learned on the pad -- which is the value that matters.
+        g_ratio = norm / GRAVITY_MS2 if norm > 1e-6 else 0.0
+        self.at_rest = (
+            BIAS_ACCEL_LO <= g_ratio <= BIAS_ACCEL_HI
+            and float(np.max(np.abs(raw - self.bias))) < BIAS_MAX_RATE_DPS
+        )
+        if self.auto_bias and self.at_rest:
+            self.bias += BIAS_ALPHA * (raw - self.bias)
+            self.bias_samples += 1
+
+        corrected_dps = raw - self.bias if self.auto_bias else raw
+        omega = np.radians(corrected_dps)
 
         # --- optional gravity reference (Mahony proportional correction) -----
         # Off by default.  This term is derived from the accelerometer, not the
@@ -370,7 +425,6 @@ class AttitudeEstimator:
         # towards the measured gravity vector) but it breaks the 1:1
         # correspondence with GYRO_X/Y/Z, so the operator opts in.
         if self.use_accel_reference and norm > 1e-6:
-            g_ratio = norm / GRAVITY_MS2
             if ACCEL_GATE_LO <= g_ratio <= ACCEL_GATE_HI:
                 # Measured gravity direction in body frame.
                 measured = accel / norm
@@ -941,6 +995,7 @@ class AttitudeWidget(QWidget):
             self.rpy_label.setText(
                 "R %+7.1f  P %+7.1f  Y %+7.1f" % (roll, pitch, yaw)
             )
+            self._update_bias_tooltip()
             self._style_ref(self.estimator.accel_valid)
 
             if self.gl_available:
@@ -956,6 +1011,30 @@ class AttitudeWidget(QWidget):
                 self.fallback.set_attitude(roll, pitch, yaw)
         except Exception:
             pass
+
+    def _update_bias_tooltip(self) -> None:
+        """Expose the learned gyro bias; it must not be invisible magic."""
+        est = self.estimator
+        bx, by, bz = (float(v) for v in est.bias)
+        if not est.auto_bias:
+            state = "auto-zero OFF"
+        elif est.bias_settled:
+            state = "settled (%d stationary samples)" % est.bias_samples
+        elif est.bias_samples:
+            state = "learning (%d/%d samples)" % (est.bias_samples,
+                                                  BIAS_SETTLE_SAMPLES)
+        else:
+            state = "not learned yet - hold the vehicle still"
+        self.rpy_label.setToolTip(
+            "Roll / pitch / yaw, degrees.\n\n"
+            "Gyro turn-on bias auto-zero: %s\n"
+            "  estimated bias  X %+.3f  Y %+.3f  Z %+.3f deg/s\n"
+            "  vehicle at rest: %s\n\n"
+            "A real MEMS gyro reads a small non-zero rate when perfectly still.\n"
+            "That bias is learned while the vehicle is stationary and subtracted,\n"
+            "so the model holds position instead of drifting. RESET re-arms it."
+            % (state, bx, by, bz, "yes" if est.at_rest else "no")
+        )
 
     def _on_ref_toggled(self, checked: bool) -> None:
         """Switch between pure gyro integration and the complementary filter."""

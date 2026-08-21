@@ -58,6 +58,7 @@ FLUSH_EVERY_ROWS = 20
 _KIND_PACKET = "packet"
 _KIND_ERROR = "error"
 _KIND_NOTE = "note"
+_KIND_SESSION = "session"
 
 
 class CsvLoggerThread(QThread):
@@ -69,6 +70,10 @@ class CsvLoggerThread(QThread):
     error_occurred = pyqtSignal(str)
     #: ``(rows_written, rows_dropped)`` — emitted at most once a second.
     stats_updated = pyqtSignal(int, int)
+    #: One CSV record, emitted as it is written. Carries the same list that
+    #: went to disk, so a live table view never has to re-read the file and
+    #: cannot contend with this thread for it.
+    row_written = pyqtSignal(object)
 
     def __init__(self, log_dir: str = DEFAULT_LOG_DIR, parent=None) -> None:
         super().__init__(parent)
@@ -84,6 +89,9 @@ class CsvLoggerThread(QThread):
         self._rows_since_flush = 0
         self._last_flush = 0.0
         self._last_stats_emit = 0.0
+        #: Timestamp for the current session's file name, set by
+        #: begin_session() and consumed when the next packet arrives.
+        self._session_stamp = None
 
         # Counters (ints; read from the GUI thread for display only).
         self.rows_written = 0
@@ -93,6 +101,20 @@ class CsvLoggerThread(QThread):
     # ------------------------------------------------------------------
     # Producer API — safe to call from any thread, never blocks, never raises
     # ------------------------------------------------------------------
+
+    def begin_session(self) -> None:
+        """Start a new logging session: close the old file, name a new one.
+
+        The timestamp is taken *here*, when the operator presses START
+        LOGGING, not when the first packet arrives -- the file name should
+        say when the run began, not when the link happened to deliver.
+
+        Routed through the queue rather than applied directly so it is
+        ordered against the packets around it: everything queued before this
+        call lands in the previous file, everything after in the new one.
+        """
+        self._put((_KIND_SESSION,
+                   datetime.now().strftime("%Y-%m-%d_%H%M%S")))
 
     def log_packet(self, packet: TelemetryPacket) -> None:
         """Queue one validated packet for writing."""
@@ -169,6 +191,11 @@ class CsvLoggerThread(QThread):
         elif kind == _KIND_NOTE:
             stamp, text = payload
             self._write_error(stamp, "NOTE", text)
+        elif kind == _KIND_SESSION:
+            # Close the previous session's file; the next packet opens a new
+            # one under the stamp taken when START LOGGING was pressed.
+            self._close_csv()
+            self._session_stamp = payload
 
     def _write_packet(self, packet: TelemetryPacket) -> None:
         if self._csv_writer is None:
@@ -184,6 +211,8 @@ class CsvLoggerThread(QThread):
         self._csv_writer.writerow(row)
         self.rows_written += 1
         self._rows_since_flush += 1
+        # Hand the identical record to any live table view.
+        self.row_written.emit(row)
 
     def _write_error(self, stamp: float, reason: str, raw: str) -> None:
         if self._error_file is None:
@@ -237,14 +266,25 @@ class CsvLoggerThread(QThread):
             return None
         return archived
 
+    def _session_filename(self, team_id: str) -> str:
+        """``Flight_<TEAM_ID>_<YYYY-MM-DD>_<HHMMSS>.csv``.
+
+        One file per logging session. Every START LOGGING press gets its own
+        timestamp, so a new run can never overwrite or be mixed into a
+        previous one -- which is exactly what the old TEAM_ID-only name did.
+        """
+        stamp = self._session_stamp or datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        return "Flight_%s_%s.csv" % (safe_filename(team_id), stamp)
+
     def _open_csv(self, team_id: str) -> None:
         if not self._ensure_dir():
             return
-        path = os.path.join(self.log_dir, "Flight_%s.csv" % safe_filename(team_id))
+        path = os.path.join(self.log_dir, self._session_filename(team_id))
         try:
-            # Append rather than truncate: a mid-competition restart must never
-            # destroy the earlier part of the flight.  The exception is a file
-            # written under a different schema, which is archived instead.
+            # The name carries a per-session timestamp, so in practice this is
+            # always a new file. Append mode is kept anyway: if two sessions
+            # ever started inside the same second, appending preserves the
+            # earlier rows instead of truncating them away.
             exists = os.path.exists(path) and os.path.getsize(path) > 0
             if exists and not self._existing_header_matches(path):
                 archived = self._rotate_stale_log(path)
@@ -311,6 +351,25 @@ class CsvLoggerThread(QThread):
             return
         self._last_stats_emit = now
         self.stats_updated.emit(self.rows_written, self.rows_dropped)
+
+    def _close_csv(self) -> None:
+        """Flush and close just the CSV, leaving the error log open."""
+        if self._csv_file is None:
+            self._csv_writer = None
+            self._csv_path = None
+            return
+        try:
+            self._csv_file.flush()
+            os.fsync(self._csv_file.fileno())
+        except (OSError, ValueError):
+            pass
+        try:
+            self._csv_file.close()
+        except OSError:
+            pass
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_path = None
 
     def _close_files(self) -> None:
         for attr in ("_csv_file", "_error_file"):

@@ -213,11 +213,16 @@ class SerialWorker(QThread):
     packet_received = pyqtSignal(object)
     #: ``(raw_frame_text, reason)`` for a corrupt or unparseable frame.
     bad_frame = pyqtSignal(str, str)
-    #: ``(total_frames, valid_packets, corrupt_packets, resyncs)`` — throttled
-    #: to ~5 Hz.  ``resyncs`` counts frame-sync recoveries (truncated frames and
-    #: oversized junk), which the session-summary panel reports as a distinct
-    #: link-integrity category from checksum failures.
-    stats_updated = pyqtSignal(int, int, int, int)
+    #: ``(raw_frame_text, reason)`` for a frame that passed the checksum but
+    #: carries physically impossible sensor values. Kept separate from
+    #: ``bad_frame`` because the two mean completely different things: one is a
+    #: damaged link, the other is a misbehaving sensor on an intact link.
+    rejected_frame = pyqtSignal(str, str)
+    #: ``(total_frames, valid_packets, corrupt_packets, resyncs, rejected)`` —
+    #: throttled to ~5 Hz.  ``resyncs`` counts frame-sync recoveries (truncated
+    #: frames and oversized junk); ``rejected`` counts frames that passed the
+    #: checksum but failed the physical plausibility check.
+    stats_updated = pyqtSignal(int, int, int, int, int)
     #: ``(is_connected, human_readable_message)``
     connection_changed = pyqtSignal(bool, str)
     #: Free-form line for the on-screen event log.
@@ -242,6 +247,7 @@ class SerialWorker(QThread):
         self.total_frames = 0
         self.valid_packets = 0
         self.corrupt_packets = 0
+        self.rejected_packets = 0
 
         self._last_stats_emit = 0.0
         self._reported_connected = False
@@ -276,6 +282,7 @@ class SerialWorker(QThread):
         self.total_frames = 0
         self.valid_packets = 0
         self.corrupt_packets = 0
+        self.rejected_packets = 0
         self._splitter.resyncs = 0
         self._emit_stats(force=True)
 
@@ -394,6 +401,17 @@ class SerialWorker(QThread):
             self.bad_frame.emit(frame, "unexpected %s: %s" % (type(exc).__name__, exc))
             return
 
+        # The checksum only proves the bytes survived the link. A sensor that
+        # misreads -- a failed I2C transaction, an uninitialised register --
+        # yields a frame that is intact on the wire and impossible as physics.
+        # Such a packet must never reach a chart: one absurd sample drags the
+        # Y autoscale to an absurd range and every later redraw with it.
+        reasons = packet.implausible_reasons()
+        if reasons:
+            self.rejected_packets += 1
+            self.rejected_frame.emit(frame, "implausible: " + "; ".join(reasons))
+            return
+
         self.valid_packets += 1
         self.packet_received.emit(packet)
 
@@ -466,5 +484,5 @@ class SerialWorker(QThread):
         self._last_stats_emit = now
         self.stats_updated.emit(
             self.total_frames, self.valid_packets, self.corrupt_packets,
-            self._splitter.resyncs,
+            self._splitter.resyncs, self.rejected_packets,
         )
