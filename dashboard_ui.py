@@ -108,6 +108,10 @@ CLICK_MAX_S = 0.4
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 
+#: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
+#: none. Only used by that compatibility path; normal frames carry their own.
+TEAM_ID_FALLBACK = "TEST001"
+
 #: Convenience entry so the dashboard can talk to ``packet_sim.py`` over TCP
 #: without any virtual-COM-port driver installed (pyserial URL handler).
 SIM_PORT_URL = "socket://127.0.0.1:5555"
@@ -797,6 +801,9 @@ class Dashboard(QMainWindow):
         self.resyncs = 0
         #: Frames that passed the checksum but failed the physical bounds check.
         self.rejected_packets = 0
+        #: XBee API frames whose own checksum failed -- a separate layer from
+        #: the telemetry checksum and from the bounds check.
+        self.api_frame_errors = 0
         self.logging_enabled = False
         self.is_connected = False
         self._readouts_dirty = False
@@ -971,6 +978,17 @@ class Dashboard(QMainWindow):
         self.baud_combo.setCurrentText("9600")
         self.baud_combo.setFixedWidth(110)
         layout.addWidget(self.baud_combo)
+
+        layout.addSpacing(8)
+        self.raw_csv_check = QCheckBox("RAW CSV")
+        self.raw_csv_check.setToolTip(
+            "Bench-test mode for flight firmware that sends bare CSV with no "
+            "$TEAM_ID prefix and no *XX checksum.\n\n"
+            "WARNING: that format carries no checksum, so packets corrupted on "
+            "the air link cannot be detected and will be shown as valid.\n"
+            "Leave this OFF for flight."
+        )
+        layout.addWidget(self.raw_csv_check)
 
         layout.addSpacing(10)
         self.connect_btn = QPushButton("CONNECT")
@@ -1333,7 +1351,7 @@ class Dashboard(QMainWindow):
         self.tile_rate = ReadoutTile("Packet rate", "pkt/s", COL_ACCENT, value_pt=15)
         self.tile_age = ReadoutTile("Packet age", "s", COL_TEXT, value_pt=15)
         self.tile_total = ReadoutTile("Valid/Total", "", COL_TEXT, value_pt=15)
-        self.tile_corrupt = ReadoutTile("Corrupt / Rejected", "", COL_TEXT, value_pt=15)
+        self.tile_corrupt = ReadoutTile("Corrupt/Reject/API", "", COL_TEXT, value_pt=15)
 
         grid.addWidget(self.tile_rate, 0, 0)
         grid.addWidget(self.tile_age, 0, 1)
@@ -1350,7 +1368,7 @@ class Dashboard(QMainWindow):
         grid.addWidget(self.stale_banner, 2, 0, 1, 2)
 
         self.tile_total.set_value("0/0")
-        self.tile_corrupt.set_value("0 / 0")
+        self.tile_corrupt.set_value("0/0/0")
         self.tile_rate.set_value("0.0")
         self.tile_age.set_value("--")
         return box
@@ -1593,6 +1611,15 @@ class Dashboard(QMainWindow):
             QMessageBox.warning(self, "Bad baud rate", "Baud rate must be a number.")
             return
 
+        raw_csv = self.raw_csv_check.isChecked()
+        self.serial_worker.set_raw_csv_mode(raw_csv, TEAM_ID_FALLBACK)
+        if raw_csv:
+            self.append_event(
+                "RAW CSV mode ON — no telemetry checksum; corrupt packets "
+                "cannot be detected. Bench testing only."
+            )
+            self.csv_logger.log_note("RAW CSV compatibility mode enabled")
+
         self.append_event("Connecting to %s @ %d baud…" % (port, baud))
         self.csv_logger.log_note("Connect requested: %s @ %d" % (port, baud))
         self.serial_worker.request_connect(port, baud)
@@ -1673,7 +1700,7 @@ class Dashboard(QMainWindow):
             if packet.has_fix:
                 self.gps_plot.add_fix(packet.lat, packet.lon)
 
-            if packet.fsm_state != self._last_fsm:
+            if getattr(packet, "has_fsm_data", True)                     and packet.fsm_state != self._last_fsm:
                 previous = FSM_STATES.get(self._last_fsm, "—")
                 self._last_fsm = packet.fsm_state
                 self.append_event(
@@ -1757,12 +1784,13 @@ class Dashboard(QMainWindow):
         self.csv_logger.log_error(raw, reason)
 
     def on_stats(self, total_frames: int, valid: int, corrupt: int,
-                 resyncs: int, rejected: int) -> None:
+                 resyncs: int, rejected: int, api_errors: int) -> None:
         self.total_frames = total_frames
         self.valid_packets = valid
         self.corrupt_packets = corrupt
         self.resyncs = resyncs
         self.rejected_packets = rejected
+        self.api_frame_errors = api_errors
         self.summary.set_link_stats(valid, corrupt, resyncs)
 
     def on_log_file_opened(self, path: str) -> None:
@@ -1811,20 +1839,26 @@ class Dashboard(QMainWindow):
         self.tile_alt.set_value(self._fmt(packet.altitude_m, 1))
         self.tile_press.set_value(self._fmt(packet.pressure_hpa, 2))
         self.tile_temp.set_value(self._fmt(packet.temp_c, 1))
-        self.tile_volt.set_value(self._fmt(packet.voltage_v, 2))
         self.tile_sats.set_value(str(packet.sats))
 
         # Battery warning: configurable threshold, plus a hard alert 10% below it.
-        threshold = float(self.volt_spin.value())
-        voltage = packet.voltage_v
-        if not math.isfinite(voltage):
-            self.tile_volt.set_level("alert")
-        elif voltage < threshold * 0.9:
-            self.tile_volt.set_level("alert")
-        elif voltage < threshold:
-            self.tile_volt.set_level("warn")
+        # Formats that carry no battery telemetry get "--" rather than 0.00 V,
+        # which would read as a flat pack and trip a false alert.
+        if not getattr(packet, "has_voltage", True):
+            self.tile_volt.set_value("--")
+            self.tile_volt.set_level("normal")
         else:
-            self.tile_volt.set_level("ok")
+            self.tile_volt.set_value(self._fmt(packet.voltage_v, 2))
+            threshold = float(self.volt_spin.value())
+            voltage = packet.voltage_v
+            if not math.isfinite(voltage):
+                self.tile_volt.set_level("alert")
+            elif voltage < threshold * 0.9:
+                self.tile_volt.set_level("alert")
+            elif voltage < threshold:
+                self.tile_volt.set_level("warn")
+            else:
+                self.tile_volt.set_level("ok")
 
         self.tile_sats.set_level(
             "ok" if packet.sats >= 6 else ("warn" if packet.sats >= 4 else "alert")
@@ -1838,7 +1872,10 @@ class Dashboard(QMainWindow):
         self.tile_lon.set_level("normal" if packet.has_fix else "warn")
 
         self._update_payload_readouts(packet)
-        self._style_fsm(packet.fsm_state)
+        # None makes the banner read "NO DATA" instead of showing BOOT, which
+        # this format never actually reported.
+        self._style_fsm(packet.fsm_state
+                        if getattr(packet, "has_fsm_data", True) else None)
 
     def enlarge_chart(self, chart) -> None:
         """Open one chart in the full-window overlay."""
@@ -1893,6 +1930,7 @@ class Dashboard(QMainWindow):
             total=self.total_frames, corrupt=self.corrupt_packets,
             connected=self.is_connected, stale_after=STALE_AFTER_S,
             rejected=self.rejected_packets,
+            api_errors=self.api_frame_errors,
         )
 
     def _apply_payload_panel(self) -> None:
@@ -1998,7 +2036,9 @@ class Dashboard(QMainWindow):
 
     def _style_fsm(self, state: Optional[int]) -> None:
         if state is None:
-            text, color, fg = "NO DATA", "#333c48", COL_TEXT_DIM
+            # Raw-CSV firmware sends no flight state; say so rather than
+            # implying the vehicle reported one.
+            text, color, fg = "NO FSM DATA", "#333c48", COL_TEXT_DIM
         else:
             text = FSM_STATES.get(state, "UNKNOWN (%s)" % state)
             color = FSM_COLORS.get(state, "#8a2be2")
@@ -2020,10 +2060,12 @@ class Dashboard(QMainWindow):
         self.tile_rate.set_value("%.1f" % rate)
 
         self.tile_total.set_value("%d/%d" % (self.valid_packets, self.total_frames))
-        self.tile_corrupt.set_value("%d / %d"
-                                    % (self.corrupt_packets, self.rejected_packets))
+        self.tile_corrupt.set_value(
+            "%d/%d/%d" % (self.corrupt_packets, self.rejected_packets,
+                          self.api_frame_errors))
         self.tile_corrupt.set_level(
-            "alert" if (self.corrupt_packets or self.rejected_packets) else "normal")
+            "alert" if (self.corrupt_packets or self.rejected_packets
+                        or self.api_frame_errors) else "normal")
 
         self._push_link_diagnostics()
 
@@ -2149,8 +2191,9 @@ class Dashboard(QMainWindow):
         self.total_frames = self.valid_packets = self.corrupt_packets = 0
         self.resyncs = 0
         self.rejected_packets = 0
+        self.api_frame_errors = 0
         self.tile_total.set_value("0/0")
-        self.tile_corrupt.set_value("0 / 0")
+        self.tile_corrupt.set_value("0/0/0")
         self.append_event("Plots and counters cleared.")
 
     def append_event(self, text: str) -> None:

@@ -228,6 +228,7 @@ SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("valid_total", "VALID/TOTAL"),
         ("corrupt", "CORRUPT (CHECKSUM)"),
         ("rejected", "REJECTED (BOUNDS)"),
+        ("api_errors", "API FRAME ERRORS"),
         ("conn", "CONNECTION STATE"),
     ]),
 ]
@@ -404,7 +405,8 @@ class DiagnosticsWindow(QDialog):
 
     def update_link(self, rate: float, age: Optional[float], valid: int,
                     total: int, corrupt: int, connected: bool,
-                    stale_after: float = 2.0, rejected: int = 0) -> None:
+                    stale_after: float = 2.0, rejected: int = 0,
+                    api_errors: int = 0) -> None:
         """Refresh the link statistics rows."""
         try:
             self._set("rate", "%.1f pkt/s" % rate,
@@ -423,6 +425,11 @@ class DiagnosticsWindow(QDialog):
             # a sensor produced impossible numbers inside them.
             self._set("rejected", "%d" % rejected,
                       COL_WARN if rejected else COL_OK)
+            # A third, independent layer: the XBee API frame checksum. This
+            # failing points at the serial link to the radio, not at the RF
+            # hop and not at a sensor.
+            self._set("api_errors", "%d" % api_errors,
+                      COL_ALERT if api_errors else COL_OK)
             self._set("conn", "CONNECTED" if connected else "DISCONNECTED",
                       COL_OK if connected else COL_ALERT)
         except Exception:

@@ -447,6 +447,12 @@ class TelemetryPacket:
     checksum_valid: bool = True
     #: Ground-station receive time (``time.time()``), stamped by the serial thread.
     gs_recv_epoch: float = field(default_factory=time.time)
+    #: False when the wire format carries no flight state (raw-CSV mode). The
+    #: dashboard shows "NO FSM DATA" rather than rendering ``fsm_state`` as if
+    #: BOOT had been reported, which would be an invented reading.
+    has_fsm_data: bool = True
+    #: False when the wire format carries no battery telemetry (raw-CSV mode).
+    has_voltage: bool = True
 
     # -- derived helpers ---------------------------------------------------
 
@@ -464,8 +470,17 @@ class TelemetryPacket:
 
     @property
     def has_fix(self) -> bool:
-        """True when lat/lon are usable numbers and not the null-island default."""
+        """True when lat/lon describe a real fix, not a marginal or null one.
+
+        Satellite count is part of the test because coordinates alone are not
+        trustworthy: a receiver with a flickering indoor fix emits small,
+        plausible-looking values (0.083333, 0.016667 were both seen on this
+        hardware) before it resets them to zero. A fix with no satellites behind
+        it is not a fix, so those never reach the ground track.
+        """
         if not (math.isfinite(self.lat) and math.isfinite(self.lon)):
+            return False
+        if self.sats < 1:
             return False
         if abs(self.lat) < 1e-9 and abs(self.lon) < 1e-9:
             return False
@@ -779,6 +794,200 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
         **common,
         solenoid_fired=_opt_bool(fields[extra_at]),
         nichrome_fired=_opt_bool(fields[extra_at + 1]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Raw-CSV compatibility mode
+# ---------------------------------------------------------------------------
+#
+# Bench hardware (Teensy 4.1, firmware revised Aug 2026) emits bare CSV inside
+# each XBee RF frame -- no '$' prefix, no '*XX' checksum, no TEAM_ID, and no
+# newline; the RF frame boundary *is* the record boundary. This mode exists so
+# that hardware can be tested before the firmware is brought back to spec. It
+# is OFF by default and must be enabled explicitly.
+#
+# IMPORTANT: there is no checksum in this format, so nothing detects a packet
+# corrupted on the air link. Frames that arrive damaged will be accepted as
+# valid and only the plausibility filter stands between them and the display.
+# This is a bench-test aid, not a flight configuration.
+
+# ---------------------------------------------------------------------------
+# !! FIELD MAP -- GROUND TRUTH, verified against the Teensy firmware's snprintf
+# ---------------------------------------------------------------------------
+# Confirmed from the sender's source (Aug 2026), not inferred from values. An
+# earlier statistical pass over ~950 captured frames agreed on indices 0-9 but
+# got the tail wrong; both corrections are recorded here so the reasoning is not
+# repeated:
+#
+#   * Index 13 is SATELLITES, not FSM_STATE. This format carries NO flight
+#     state at all -- the firmware does not transmit it.
+#   * Indices 10/11 are LATITUDE/LONGITUDE. The odd values seen across captures
+#     (0.083333, 0.016667, 9.685300) were marginal indoor GPS fixes, not a rate
+#     field: the firmware only zeroes them when gps.location.isValid() is false,
+#     so a flickering fix emits small nonsense before resetting to 0.0. This is
+#     why position is gated on SATELLITES rather than trusted on its own.
+#
+# TWO INDEPENDENT ALTITUDES, deliberately kept apart:
+#   * index 3  BARO_ALTITUDE -- MS5611, against a fixed 1013.25 hPa sea-level
+#     reference with no ground zero-set applied, so it carries a constant offset.
+#   * index 12 GPS_ALTITUDE  -- from the GPS fix; reads 0.0 with no fix.
+# They are different measurements with different failure modes and must not be
+# conflated.
+#
+# Anything mapped to None is absent from this wire format, ignored, and simply
+# preserved in ``raw_frame``.
+RAW_CSV_FIELD_MAP = {
+    "PACKET_COUNT": 0,     # PACKET_ID       (unsigned long)
+    "TEMP": 1,             # TEMP_C          (2 dp)
+    "PRESSURE": 2,         # PRESSURE_HPA    (2 dp)
+    "ALTITUDE": 3,         # BARO_ALTITUDE_M (2 dp, 1013.25 hPa reference)
+    "ACC_X": 4,            # ACCEL_X_G       (2 dp)
+    "ACC_Y": 5,            # ACCEL_Y_G       (2 dp)
+    "ACC_Z": 6,            # ACCEL_Z_G       (2 dp)
+    "GYRO_X": 7,           # GYRO_X          (2 dp)
+    "GYRO_Y": 8,           # GYRO_Y          (2 dp)
+    "GYRO_Z": 9,           # GYRO_Z          (2 dp)
+    "LAT": 10,             # LATITUDE        (6 dp)
+    "LON": 11,             # LONGITUDE       (6 dp)
+    "NAV_ALT": 12,         # GPS_ALTITUDE_M  (2 dp) -- distinct from index 3
+    "SATS": 13,            # SATELLITES      (unsigned long)
+    # Absent from this wire format entirely:
+    "VOLTAGE": None,       # no battery telemetry
+    "FSM_STATE": None,     # firmware sends no flight state in raw CSV
+}
+
+#: A position fix is only believed when the GPS reports at least this many
+#: satellites. Without this, marginal indoor fixes plot as real coordinates.
+RAW_CSV_MIN_SATS = 1
+
+#: Number of fields in the observed record.
+RAW_CSV_FIELD_COUNT = 14
+
+#: Shortest record we will accept: enough fields to satisfy every mapped index.
+RAW_CSV_MIN_FIELDS = max(
+    (i for i in RAW_CSV_FIELD_MAP.values() if i is not None), default=0
+) + 1
+
+
+def _raw_csv_get(fields: List[str], name: str, default: float = 0.0) -> str:
+    """Return the raw text for *name*, or "" when it is unmapped/absent."""
+    idx = RAW_CSV_FIELD_MAP.get(name)
+    if idx is None or idx >= len(fields):
+        return ""
+    return fields[idx]
+
+
+def parse_raw_csv(record: str, team_id: str,
+                  gs_recv_epoch: Optional[float] = None,
+                  mission_epoch: Optional[float] = None) -> TelemetryPacket:
+    """Parse one bare-CSV record from the pre-spec Teensy firmware.
+
+    The record carries no team ID, no mission clock, no battery voltage and no
+    GPS, so those are filled from *team_id* and the ground-station clock rather
+    than invented. Everything downstream -- plausibility filtering, CSV logging,
+    the dashboard -- then works unchanged.
+
+    Parameters
+    ----------
+    record:
+        One record, without ``$``/``*XX``, e.g.
+        ``"5635,24.36,944.42,589.48,0.00,-0.00,1.00,0.01,-0.04,-0.02,..."``.
+    team_id:
+        Substituted for the missing TEAM_ID field.
+    gs_recv_epoch:
+        Ground-station receive time. Defaults to ``time.time()``.
+    mission_epoch:
+        Epoch the mission clock is measured from. Mission time is derived as
+        ``gs_recv_epoch - mission_epoch`` because the firmware sends no clock.
+        When omitted, mission time is 0.
+
+    Raises
+    ------
+    PacketParseError
+        Too few fields, or a mandatory field will not convert.
+    """
+    if gs_recv_epoch is None:
+        gs_recv_epoch = time.time()
+
+    if not isinstance(record, str):
+        raise PacketParseError("record is not a string: %r" % type(record))
+
+    text = record.strip()
+    if not text:
+        raise PacketParseError("empty record")
+    if len(text) > MAX_FRAME_LEN:
+        raise PacketParseError("record too long (%d bytes)" % len(text))
+
+    fields = text.split(",")
+    if len(fields) < RAW_CSV_MIN_FIELDS:
+        raise PacketParseError(
+            "raw-CSV record has %d fields, need at least %d: %r"
+            % (len(fields), RAW_CSV_MIN_FIELDS, text[:120])
+        )
+
+    mission_s = 0.0
+    if mission_epoch is not None:
+        mission_s = max(gs_recv_epoch - mission_epoch, 0.0)
+
+    # GPS gating. The firmware zeroes LAT/LON only when gps.location.isValid()
+    # is false, so a flickering indoor fix emits small nonsense coordinates
+    # before it resets them. Satellite count is the reliable discriminator, so
+    # position is dropped outright unless the fix is backed by satellites.
+    sats = _opt_int(_raw_csv_get(fields, "SATS"), 0)
+    lat = _opt_float(_raw_csv_get(fields, "LAT"))
+    lon = _opt_float(_raw_csv_get(fields, "LON"))
+    nav_alt = _opt_float(_raw_csv_get(fields, "NAV_ALT"))
+    if sats < RAW_CSV_MIN_SATS:
+        lat = lon = nav_alt = 0.0
+
+    # This format reports acceleration in g; every consumer downstream (the
+    # plausibility envelope, the accel strip chart, the attitude estimator)
+    # works in m/s^2, matching the $..*XX formats. Convert here so the raw-CSV
+    # path is not the one place with different units.
+    acc_x = _opt_float(_raw_csv_get(fields, "ACC_X")) * G_MS2
+    acc_y = _opt_float(_raw_csv_get(fields, "ACC_Y")) * G_MS2
+    acc_z = _opt_float(_raw_csv_get(fields, "ACC_Z")) * G_MS2
+
+    return TelemetryPacket(
+        payload_type=PAYLOAD_GENERIC,
+        team_id=team_id,
+        raw_frame=text,
+        # No checksum exists in this format. Saying "valid" would claim an
+        # integrity guarantee the wire never provided.
+        checksum_valid=False,
+        gs_recv_epoch=gs_recv_epoch,
+        timestamp_raw=format_mission_time(mission_s),
+        mission_time_s=mission_s,
+        packet_count=_req_int(_raw_csv_get(fields, "PACKET_COUNT") or "0",
+                              "PACKET_COUNT"),
+        altitude_m=_opt_float(_raw_csv_get(fields, "ALTITUDE")),
+        pressure_hpa=_opt_float(_raw_csv_get(fields, "PRESSURE")),
+        temp_c=_opt_float(_raw_csv_get(fields, "TEMP")),
+        # Unmapped fields resolve to 0.0, which the tiles read as "no data".
+        voltage_v=_opt_float(_raw_csv_get(fields, "VOLTAGE")),
+        nav_time="",
+        lat=lat,
+        lon=lon,
+        # GPS altitude (index 12) is a separate measurement from the barometric
+        # altitude in index 3 and is kept in its own field, never merged.
+        nav_alt_m=nav_alt,
+        sats=sats,
+        acc_x=acc_x,
+        acc_y=acc_y,
+        acc_z=acc_z,
+        # Gyro units are NOT stated by the firmware. Treated as deg/s to match
+        # the $..*XX formats; at rest both deg/s and rad/s read ~0, so this
+        # capture could not distinguish them. Confirm before trusting rates.
+        gyro_x=_opt_float(_raw_csv_get(fields, "GYRO_X")),
+        gyro_y=_opt_float(_raw_csv_get(fields, "GYRO_Y")),
+        gyro_z=_opt_float(_raw_csv_get(fields, "GYRO_Z")),
+        # This format carries no flight state at all. 0 is BOOT only because the
+        # dataclass needs an int; the dashboard shows "NO FSM DATA" instead,
+        # driven by has_fsm_data rather than by this value.
+        fsm_state=0,
+        has_fsm_data=False,
+        has_voltage=False,
     )
 
 

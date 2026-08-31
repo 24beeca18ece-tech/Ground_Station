@@ -97,6 +97,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Open the link immediately after the window appears.",
     )
     parser.add_argument(
+        "--raw-csv", action="store_true",
+        help="Bench-test mode: parse bare CSV records with no $TEAM_ID prefix "
+             "and no *XX checksum. That format carries no integrity check, so "
+             "corrupt packets cannot be detected. Not for flight.",
+    )
+    parser.add_argument(
         "--log-dir", default="logs",
         help="Directory for Flight_<TEAM_ID>.csv and errors.log (default: ./logs).",
     )
@@ -124,6 +130,7 @@ def main(argv=None) -> int:
     if args.port:
         window.port_combo.setEditText(args.port)
     window.baud_combo.setCurrentText(str(args.baud))
+    window.raw_csv_check.setChecked(args.raw_csv)
 
     window.show()
 

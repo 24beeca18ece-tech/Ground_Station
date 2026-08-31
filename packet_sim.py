@@ -34,6 +34,7 @@ USAGE
     python packet_sim.py --payload-type generic # legacy 19-field v1 frames
     python packet_sim.py --serial COM11         # write to a real/virtual COM port
     python packet_sim.py --stdout               # just print frames to the console
+    python packet_sim.py --api-frame-mode       # wrap in XBee 0x90 API frames
 
 FAULT INJECTION (for the robustness / fault-injection test requirement)
 -----------------------------------------------------------------------
@@ -83,6 +84,42 @@ BASE_LON = 74.8570
 BASE_ALT = 320.0
 
 GARBAGE_ALPHABET = b"abcdefghijklmnopqrstuvwxyz0123456789 ,.;:!?#@%&/\\<>[]{}"
+
+# --- XBee API mode (AP=1) framing -------------------------------------------
+API_START = 0x7E
+API_RX_PACKET = 0x90
+API_TX_STATUS = 0x8B
+#: Stand-in 64-bit source address for the simulated flight radio.
+SIM_SRC_ADDR64 = bytes((0x00, 0x13, 0xA2, 0x00, 0x41, 0x5B, 0x2C, 0x77))
+SIM_SRC_ADDR16 = bytes((0xFF, 0xFE))
+SIM_RX_OPTIONS = 0x01
+
+
+def api_checksum(frame_data: bytes) -> int:
+    """XBee API checksum: 0xFF minus the low byte of the frame_data sum."""
+    return 0xFF - (sum(frame_data) & 0xFF)
+
+
+def wrap_api_rx(payload: bytes) -> bytes:
+    """Wrap *payload* in a 0x90 Receive Packet frame, exactly as AP=1 emits."""
+    frame_data = (bytes((API_RX_PACKET,)) + SIM_SRC_ADDR64 + SIM_SRC_ADDR16
+                  + bytes((SIM_RX_OPTIONS,)) + payload)
+    length = len(frame_data)
+    return (bytes((API_START, (length >> 8) & 0xFF, length & 0xFF))
+            + frame_data + bytes((api_checksum(frame_data),)))
+
+
+def wrap_api_tx_status(frame_id: int = 0x01) -> bytes:
+    """A 0x8B Transmit Status frame.
+
+    A receive-only ground station should never see one, but the GCS must not
+    treat it as an error if a radio emits one, so the simulator can produce
+    them on demand to prove that.
+    """
+    frame_data = bytes((API_TX_STATUS, frame_id, 0xFF, 0xFE, 0x00, 0x00))
+    length = len(frame_data)
+    return (bytes((API_START, (length >> 8) & 0xFF, length & 0xFF))
+            + frame_data + bytes((api_checksum(frame_data),)))
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +421,34 @@ class FaultInjector:
         self.truncate_rate = args.truncate_rate
         self.drop_rate = args.drop_rate
         self.implausible_rate = getattr(args, "implausible_rate", 0.0)
+        self.api_mode = getattr(args, "api_frame_mode", False)
+        self.api_corrupt_rate = getattr(args, "api_corrupt_rate", 0.0)
+        self.api_status_rate = getattr(args, "api_status_rate", 0.0)
+
+    def _maybe_wrap(self, payload: bytes) -> bytes:
+        """Wrap the ASCII bytes in API framing when --api-frame-mode is on.
+
+        Wrapping happens *after* the ASCII-level faults, so a corrupt telemetry
+        checksum still travels inside a perfectly valid API frame -- which is
+        what a real radio does, and is exactly the case that proves the two
+        checksum layers are independent.
+        """
+        if not self.api_mode:
+            return payload
+
+        out = bytearray()
+        if self.api_status_rate and random.random() < self.api_status_rate:
+            # A frame type the ground station must skip without erroring.
+            out.extend(wrap_api_tx_status())
+
+        frame = bytearray(wrap_api_rx(payload))
+        if self.api_corrupt_rate and random.random() < self.api_corrupt_rate:
+            # Flip the API checksum only. The telemetry inside is untouched, so
+            # anything that still gets through is an unwrapping bug rather than
+            # a data problem.
+            frame[-1] ^= 0xFF
+        out.extend(frame)
+        return bytes(out)
 
     #: Physically impossible values, modelled on a real MS5611 I2C read failure
     #: that returned register garbage. These frames are re-checksummed so they
@@ -429,11 +494,11 @@ class FaultInjector:
             # Cut the frame short: the next '$' must trigger a resync.
             data = data[: random.randint(4, len(data) - 4)]
             out.extend(data)
-            return bytes(out)
+            return self._maybe_wrap(bytes(out))
 
         out.extend(data)
         out.extend(b"\r\n")
-        return bytes(out)
+        return self._maybe_wrap(bytes(out))
 
 
 def _make_implausible_impl(frame: str) -> str:
@@ -584,10 +649,21 @@ def run_serial(args: argparse.Namespace) -> int:
 
 
 def run_stdout(args: argparse.Namespace) -> int:
-    """Print frames to the console — useful for eyeballing the wire format."""
+    """Print frames to the console — useful for eyeballing the wire format.
+
+    Written as raw bytes rather than decoded text. In --api-frame-mode the
+    stream is binary, and decoding it as ASCII replaced every byte above 0x7F
+    with U+FFFD, silently turning a valid API frame into garbage in exactly the
+    place someone would look to check the framing was right.
+    """
     def send(data: bytes) -> None:
-        sys.stdout.write(data.decode("ascii", errors="replace"))
-        sys.stdout.flush()
+        stream = getattr(sys.stdout, "buffer", None)
+        if stream is None:                      # pragma: no cover - odd consoles
+            sys.stdout.write(data.decode("ascii", errors="replace"))
+            sys.stdout.flush()
+            return
+        stream.write(data)
+        stream.flush()
 
     try:
         _emit_loop(send, args)
@@ -659,6 +735,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Fraction of frames given physically impossible "
                              "sensor values (valid checksum, absurd physics) to "
                              "exercise the GCS plausibility filter.")
+    faults.add_argument("--api-frame-mode", action="store_true",
+                        help="Wrap every packet in an XBee 802.15.4 API "
+                             "0x90 Receive Packet frame (AP=1), as a real "
+                             "ground-side radio does. Exercises the GCS API "
+                             "unwrapping layer without any hardware.")
+    faults.add_argument("--api-corrupt-rate", type=float, default=0.0,
+                        help="Fraction of API frames given a bad API "
+                             "checksum (telemetry inside left intact).")
+    faults.add_argument("--api-status-rate", type=float, default=0.0,
+                        help="Fraction of packets preceded by a 0x8B "
+                             "Transmit Status frame, which the GCS must "
+                             "skip without counting an error.")
     faults.add_argument("--chaos", action="store_true",
                         help="Preset: a realistically hostile link.")
 
