@@ -68,18 +68,24 @@ FSM_STATES = {
 
 #: Background colour used for the big FSM banner, one distinct colour per state.
 #: Also reused by the session-summary pie chart so the two always agree.
+#:
+#: DAYLIGHT THEME: these are banner *fills* carrying white text, on a light UI.
+#: Each is therefore saturated but dark enough for white to read on it (>=4.5:1)
+#: -- the previous set was tuned to sit on near-black under dark text, and the
+#: bright ones (amber #e9c135, green #35c46b, cyan #00b0d8) would have left
+#: white text unreadable and the banner glaring against a light panel.
 FSM_COLORS = {
-    0: "#6b7785",  # BOOT               - slate grey
-    1: "#00b0d8",  # TEST_MODE          - cyan
-    2: "#e9c135",  # LAUNCH_PAD         - amber
-    3: "#f07419",  # ASCENT             - orange
-    4: "#e8384f",  # DEPLOY             - red
-    5: "#8f6bef",  # DESCENT            - violet
-    6: "#00b39b",  # AEROBRAKE_RELEASE  - teal
-    7: "#35c46b",  # IMPACT             - green
+    0: "#4a5768",  # BOOT               - slate grey
+    1: "#00697d",  # TEST_MODE          - deep cyan
+    2: "#8a5000",  # LAUNCH_PAD         - dark amber
+    3: "#c1490b",  # ASCENT             - burnt orange
+    4: "#c0182b",  # DEPLOY             - red
+    5: "#5b3fbe",  # DESCENT            - violet
+    6: "#00786a",  # AEROBRAKE_RELEASE  - teal
+    7: "#0d7a3d",  # IMPACT             - green
 }
 
-FSM_UNKNOWN_COLOR = "#8a2be2"
+FSM_UNKNOWN_COLOR = "#7b1fa2"
 
 # ---------------------------------------------------------------------------
 # Payload types
@@ -98,10 +104,11 @@ RECOVERY_STAGES = {
     2: "PARAFOIL",
 }
 
+#: Same daylight calibration as FSM_COLORS: saturated fills under white text.
 RECOVERY_STAGE_COLORS = {
-    0: "#6b7785",  # stowed   - grey
-    1: "#e9c135",  # drogue   - amber
-    2: "#35c46b",  # parafoil - green
+    0: "#4a5768",  # stowed   - grey
+    1: "#8a5000",  # drogue   - dark amber
+    2: "#0d7a3d",  # parafoil - green
 }
 
 # ---------------------------------------------------------------------------

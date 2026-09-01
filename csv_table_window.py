@@ -5,6 +5,12 @@ csv_table_window.py
 Live tabular view of the current logging session's CSV, one row per packet and
 one column per CSV field.
 
+ROW ORDER
+---------
+Newest first: each packet is inserted at the *top* of the table, matching the
+CSV file on disk. The row numbers down the left are therefore positions in the
+view (1 = most recent), not packet counts -- the packet counter is a column.
+
 WHERE THE DATA COMES FROM
 -------------------------
 Rows arrive on ``CsvLoggerThread.row_written``, which the logger emits with the
@@ -49,15 +55,15 @@ from PyQt5.QtWidgets import (
 from telemetry_packet import CSV_HEADER
 
 # Palette, matched to the rest of the application.
-COL_BG = "#0a0e13"
-COL_PANEL = "#12171f"
-COL_BORDER = "#2b3746"
-COL_TEXT = "#dbe3ee"
-COL_DIM = "#8b9aad"
-COL_HEADER = "#4aa8ff"
-COL_NUM = "#7fd6ff"
-COL_OK = "#35c46b"
-COL_ALERT = "#e8384f"
+COL_BG = "#d7dee8"
+COL_PANEL = "#f2f5f9"
+COL_BORDER = "#7a8ba4"
+COL_TEXT = "#0d1520"
+COL_DIM = "#41506a"
+COL_HEADER = "#0a4fa8"
+COL_NUM = "#0b47a1"
+COL_OK = "#0d7a3d"
+COL_ALERT = "#c0182b"
 
 #: Rows retained in memory.  ~17 minutes at 20 Hz; the CSV on disk keeps
 #: everything, this is only the scrollback.
@@ -66,9 +72,9 @@ MAX_ROWS = 20000
 #: How often buffered rows are pushed into the model.
 FLUSH_MS = 200
 
-#: Distance from the bottom, in pixels, still counted as "at the bottom" for
-#: the follow-tail behaviour.
-STICKY_BOTTOM_PX = 32
+#: Distance from the top, in pixels, still counted as "at the top" for the
+#: follow behaviour. Rows are newest-first, so the live edge is the top.
+STICKY_TOP_PX = 32
 
 
 class CsvTableModel(QAbstractTableModel):
@@ -98,7 +104,8 @@ class CsvTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             if orientation == Qt.Horizontal:
                 return self._headers[section]
-            return section + 1                # 1-based row numbers
+            # Position in the view, newest first: 1 is the most recent row.
+            return section + 1
         if role == Qt.ForegroundRole and orientation == Qt.Horizontal:
             return QColor(COL_HEADER)
         return None
@@ -125,21 +132,27 @@ class CsvTableModel(QAbstractTableModel):
     # -- data intake -------------------------------------------------------
 
     def append_rows(self, rows: List[List[Any]]) -> None:
-        """Add rows, keeping the filtered view consistent."""
+        """Add rows at the head, newest first, keeping the view consistent.
+
+        *rows* arrives in write order (oldest first). ``extendleft`` pushes each
+        onto the head in turn, so the last -- newest -- ends up first, which is
+        exactly the order wanted. The deque then evicts the oldest from the tail
+        on its own once ``MAX_ROWS`` is reached.
+        """
         if not rows:
             return
-        matching = [r for r in rows if self._matches(r)]
-        # The deque may evict from the head; if it does, the filtered view has
+        # Reversed, so the newest row of this batch is the first one inserted.
+        matching = [r for r in reversed(rows) if self._matches(r)]
+        # The deque may evict from the tail; if it does, the filtered view has
         # to be rebuilt rather than merely extended.
         evicting = len(self._rows) + len(rows) > MAX_ROWS
-        self._rows.extend(rows)
+        self._rows.extendleft(rows)
         if evicting:
             self.rebuild()
             return
         if matching:
-            first = len(self._view)
-            self.beginInsertRows(QModelIndex(), first, first + len(matching) - 1)
-            self._view.extend(matching)
+            self.beginInsertRows(QModelIndex(), 0, len(matching) - 1)
+            self._view[0:0] = matching
             self.endInsertRows()
 
     def set_filter(self, text: str) -> None:
@@ -238,13 +251,13 @@ class CsvTableWindow(QDialog):
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.view.setStyleSheet(
-            "QTableView { background: %s; alternate-background-color: #10161e;"
+            "QTableView { background: %s; alternate-background-color: #e4eaf3;"
             "             color: %s; gridline-color: %s;"
-            "             selection-background-color: #24507d; }"
-            "QHeaderView::section { background: #172231; color: %s;"
+            "             selection-background-color: #b5cdea; }"
+            "QHeaderView::section { background: #dde4ee; color: %s;"
             "             border: 0; border-right: 1px solid %s; padding: 4px 6px;"
             "             font-weight: 600; }"
-            "QTableCornerButton::section { background: #172231; border: 0; }"
+            "QTableCornerButton::section { background: #dde4ee; border: 0; }"
             % (COL_BG, COL_TEXT, COL_BORDER, COL_HEADER, COL_BORDER)
         )
         mono = QFont("Consolas")
@@ -252,7 +265,7 @@ class CsvTableWindow(QDialog):
         self.view.setFont(mono)
         self.view.verticalHeader().setDefaultSectionSize(19)
         self.view.verticalHeader().setStyleSheet(
-            "QHeaderView::section { background: #101720; color: %s; border: 0;"
+            "QHeaderView::section { background: #e4eaf3; color: %s; border: 0;"
             " padding-right: 6px; }" % COL_DIM
         )
         self.view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -294,27 +307,29 @@ class CsvTableWindow(QDialog):
 
     # -- rendering ---------------------------------------------------------
 
-    def _at_bottom(self) -> bool:
+    def _at_top(self) -> bool:
         bar = self.view.verticalScrollBar()
-        return bar.value() >= bar.maximum() - STICKY_BOTTOM_PX
+        return bar.value() <= bar.minimum() + STICKY_TOP_PX
 
     def _flush(self) -> None:
         if not self._pending:
             return
-        # Decide *before* inserting: appending rows moves the maximum, so the
-        # test has to be made against the pre-insert scroll position.
-        stick = self.follow_check.isChecked() and self._at_bottom()
+        # Decide *before* inserting: inserting at the head pushes the viewport
+        # down by the number of new rows, so the test has to be made against the
+        # pre-insert scroll position. Someone who has scrolled down into history
+        # keeps their place instead of being yanked back to the live edge.
+        stick = self.follow_check.isChecked() and self._at_top()
         rows, self._pending = self._pending, []
         self.model.append_rows(rows)
         if stick:
-            self.view.scrollToBottom()
+            self.view.scrollToTop()
         self._update_status()
 
     def _on_filter(self, text: str) -> None:
         self.model.set_filter(text)
         self._update_status()
         if self.follow_check.isChecked():
-            self.view.scrollToBottom()
+            self.view.scrollToTop()
 
     def _update_status(self) -> None:
         shown, total = self.model.rowCount(), self.model.total_rows
@@ -328,4 +343,4 @@ class CsvTableWindow(QDialog):
         self._flush()
         self.view.resizeColumnsToContents()
         if self.follow_check.isChecked():
-            self.view.scrollToBottom()
+            self.view.scrollToTop()

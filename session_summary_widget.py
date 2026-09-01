@@ -59,12 +59,12 @@ from PyQt5.QtWidgets import (
 from telemetry_packet import FSM_COLORS, FSM_STATES, FSM_UNKNOWN_COLOR
 
 # Palette, matched to dashboard_ui.py.
-COL_PANEL = "#161d27"
-COL_TEXT = "#dbe3ee"
-COL_TEXT_DIM = "#8b9aad"
-COL_OK = "#35c46b"
-COL_WARN = "#e9c135"
-COL_ALERT = "#e8384f"
+COL_PANEL = "#f2f5f9"
+COL_TEXT = "#0d1520"
+COL_TEXT_DIM = "#41506a"
+COL_OK = "#0d7a3d"
+COL_WARN = "#a05000"
+COL_ALERT = "#c0182b"
 
 #: Redraw interval.  Proportions change slowly; 1 Hz is plenty.
 SUMMARY_REDRAW_MS = 1000

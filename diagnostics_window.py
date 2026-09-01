@@ -52,16 +52,16 @@ from telemetry_packet import FSM_COLORS, FSM_UNKNOWN_COLOR
 # Palette (matched to dashboard_ui.py)
 # ---------------------------------------------------------------------------
 
-COL_BG = "#0a0e13"
-COL_PANEL = "#12171f"
-COL_BORDER = "#2b3746"
-COL_TEXT = "#dbe3ee"
-COL_DIM = "#8b9aad"
-COL_HEADER = "#4aa8ff"
-COL_NUM = "#7fd6ff"
-COL_OK = "#35c46b"
-COL_WARN = "#e9c135"
-COL_ALERT = "#e8384f"
+COL_BG = "#d7dee8"
+COL_PANEL = "#f2f5f9"
+COL_BORDER = "#7a8ba4"
+COL_TEXT = "#0d1520"
+COL_DIM = "#41506a"
+COL_HEADER = "#0a4fa8"
+COL_NUM = "#0b47a1"
+COL_OK = "#0d7a3d"
+COL_WARN = "#a05000"
+COL_ALERT = "#c0182b"
 
 MONO = "Consolas, 'DejaVu Sans Mono', monospace"
 
@@ -127,14 +127,14 @@ class RawPacketStrip(QFrame):
 
         self._raw = ""
         self._placeholder = "waiting for data…"
-        self._set_tag("NO RX", COL_DIM, "#1b232e")
+        self._set_tag("NO RX", COL_DIM, "#dbe2ec")
 
     # -- API ---------------------------------------------------------------
 
     def show_packet(self, raw: str) -> None:
         """Display a frame that passed checksum validation."""
         self._raw = _sanitise_raw(raw)
-        self._set_tag("RX", "#0b1219", COL_OK)
+        self._set_tag("RX", "#ffffff", COL_OK)
         self.text.setStyleSheet("color: %s; background: transparent;" % COL_TEXT)
         self._apply_elision()
 
@@ -152,13 +152,13 @@ class RawPacketStrip(QFrame):
         link is healthy and the fault is upstream in a sensor.
         """
         self._raw = _sanitise_raw(raw)
-        self._set_tag("REJECTED", "#0b1219", COL_WARN)
+        self._set_tag("REJECTED", "#ffffff", COL_WARN)
         self.text.setStyleSheet("color: %s; background: transparent;" % COL_WARN)
         self._apply_elision()
 
     def clear(self) -> None:
         self._raw = ""
-        self._set_tag("NO RX", COL_DIM, "#1b232e")
+        self._set_tag("NO RX", COL_DIM, "#dbe2ec")
         self.text.setStyleSheet("color: %s; background: transparent;" % COL_DIM)
         self.text.setText(self._placeholder)
 
@@ -286,7 +286,7 @@ class DiagnosticsWindow(QDialog):
             header = QLabel(section)
             header.setFont(header_font)
             header.setStyleSheet(
-                "color: %s; background: #172231; padding: 3px 6px;"
+                "color: %s; background: #dde4ee; padding: 3px 6px;"
                 " border-radius: 3px; letter-spacing: 1px;" % COL_HEADER
             )
             grid.addWidget(header, row, 0, 1, 2)

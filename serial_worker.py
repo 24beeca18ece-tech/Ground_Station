@@ -96,6 +96,12 @@ API_RX_HEADER_LEN = 12
 #:   0x81: type(1) + 16-bit addr(2) + RSSI(1) + options(1) = 5
 API_RX_64BIT = 0x80
 API_RX_16BIT = 0x81
+
+#: Byte offset of the RSSI field inside 0x80/0x81 frame_data. The legacy
+#: 802.15.4 receive frames carry the received signal strength of that packet,
+#: as a negative dBm magnitude. 0x90 has no such field (Zigbee-style firmware
+#: reports it out-of-band via ATDB instead), so it is only read for 0x80/0x81.
+API_RSSI_OFFSET = {API_RX_64BIT: 9, API_RX_16BIT: 3}
 #: Payload offset for each receive frame type.
 API_RX_HEADERS = {
     API_RX_PACKET: API_RX_HEADER_LEN,
@@ -110,6 +116,19 @@ API_MAX_FRAME_DATA = 512
 #: inside frames is the signature of a radio configured the other way, and
 #: saying so beats silently counting checksum failures forever.
 API_ESCAPE = 0x7D
+
+# --- Uplink (ground -> vehicle) ---------------------------------------------
+#: 0x10 Transmit Request. frame_data layout:
+#:   type(1) frame_id(1) addr64(8) addr16(2) broadcast_radius(1) options(1)
+#:   + RF payload
+#: The matching acknowledgement comes back as an 0x8B Transmit Status carrying
+#: the same frame_id, which is how a send is confirmed rather than assumed.
+API_TX_REQUEST = 0x10
+#: 64-bit broadcast address, and the 16-bit "unknown/broadcast" value.
+API_ADDR64_BROADCAST = b"\x00\x00\x00\x00\x00\x00\xff\xff"
+API_ADDR16_UNKNOWN = b"\xff\xfe"
+#: Delivery status byte of an 0x8B frame; 0x00 means the radio got an ack.
+API_TX_STATUS_OK = 0x00
 
 #: RX ring buffer capacity in bytes.  ~64 full frames; the link runs at 20 Hz so
 #: this is >3 s of backlog, far more than a healthy reader ever accumulates.
@@ -215,7 +234,7 @@ class ApiFrameUnwrapper:
 
     __slots__ = ("buffer", "api_frames_ok", "api_frame_errors",
                  "api_frames_other", "passthrough_bytes", "escape_hints",
-                 "records")
+                 "records", "last_rssi_dbm", "last_tx_status")
 
     def __init__(self) -> None:
         self.buffer = bytearray()
@@ -229,6 +248,14 @@ class ApiFrameUnwrapper:
         #: splitter wants; raw-CSV mode instead needs the frame boundaries,
         #: because there the RF frame boundary *is* the record separator.
         self.records: List[bytes] = []
+        #: RSSI of the most recent 0x80/0x81 frame, in dBm (negative), or None
+        #: when the radio has not reported one. This is genuine per-packet data
+        #: from the radio -- not an estimate.
+        self.last_rssi_dbm: Optional[int] = None
+        #: ``(frame_id, delivery_status)`` of the most recent 0x8B frame,
+        #: or None. Set when the radio reports the fate of something we
+        #: transmitted; consumed and cleared by the worker.
+        self.last_tx_status: Optional[Tuple[int, int]] = None
 
     def reset(self) -> None:
         self.buffer.clear()
@@ -325,15 +352,30 @@ class ApiFrameUnwrapper:
                 # Well-formed but carries no payload; nothing to hand on.
                 self.api_frames_ok += 1
                 return
+            rssi_at = API_RSSI_OFFSET.get(frame_type)
+            if rssi_at is not None and len(frame_data) > rssi_at:
+                # Carried as a positive magnitude; the value is -dBm.
+                self.last_rssi_dbm = -int(frame_data[rssi_at])
             payload = frame_data[header_len:]
             out.extend(payload)
             self.records.append(payload)
             self.api_frames_ok += 1
             return
 
-        # 0x8B Transmit Status, and anything else the radio emits (modem
-        # status, AT command responses). Not errors: a receive-only ground
-        # station simply has nothing to do with them.
+        # 0x8B Transmit Status. Now that the station can transmit, this is the
+        # only evidence that a command actually reached the far radio -- the
+        # write succeeding only proves the bytes reached our own module.
+        # Layout: type(1) frame_id(1) [addr16(2)] retries(1) status(1) ...
+        # The 802.15.4 form is type/frame_id/status; the extended form adds
+        # address and retry fields, so the status is read from the last byte,
+        # which is correct for both.
+        if frame_type == API_TX_STATUS and len(frame_data) >= 3:
+            self.last_tx_status = (frame_data[1], frame_data[-1])
+            self.api_frames_other += 1
+            return
+
+        # Anything else the radio emits (modem status, AT command responses).
+        # Not errors: the ground station simply has nothing to do with them.
         self.api_frames_other += 1
 
 
@@ -438,6 +480,13 @@ class SerialWorker(QThread):
     connection_changed = pyqtSignal(bool, str)
     #: Free-form line for the on-screen event log.
     log_message = pyqtSignal(str)
+    #: ``(ok, description)`` for an uplink attempt -- emitted once the bytes
+    #: have actually been handed to the serial port, or once the attempt has
+    #: failed. Success here means "written to the radio", NOT "acted on by the
+    #: vehicle"; see 0x8B handling for delivery confirmation.
+    command_sent = pyqtSignal(bool, str)
+    #: ``(frame_id, delivery_status)`` from an 0x8B Transmit Status frame.
+    transmit_status = pyqtSignal(int, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -469,6 +518,13 @@ class SerialWorker(QThread):
         self._reported_connected = False
         self._escape_warned = False
         self._last_open_error = ""
+        #: Frames waiting to go out, appended by the GUI thread and drained by
+        #: the worker. pyserial must only ever be touched from the worker, so a
+        #: command cannot be written directly from the button handler.
+        self._tx_queue: List[Tuple[bytes, str]] = []
+        #: Rolling API frame_id, 1-255 (0 means "no status frame please").
+        self._next_frame_id = 1
+
         #: Epoch the raw-CSV mission clock counts from (set on first record,
         #: because that format carries no mission time of its own).
         self._raw_csv_epoch: Optional[float] = None
@@ -498,6 +554,57 @@ class SerialWorker(QThread):
             if team_id:
                 self._raw_csv_team_id = team_id
         self._raw_csv_epoch = None
+
+    def send_command(self, payload: bytes, description: str = "") -> bool:
+        """Queue *payload* for transmission as an XBee 0x10 Transmit Request.
+
+        Safe to call from the GUI thread: the frame is built here (pure byte
+        arithmetic) but written by the worker thread, because pyserial handles
+        must not be shared across threads.
+
+        Returns False immediately if the link is closed, so a caller can report
+        "not sent" rather than silently dropping a command. A True return means
+        the frame was *queued*; ``command_sent`` reports whether the write
+        itself succeeded, and ``transmit_status`` reports whether the radio got
+        an acknowledgement from the far end.
+        """
+        if not payload:
+            return False
+        with self._lock:
+            if not self._want_connected:
+                return False
+            frame_id = self._next_frame_id
+            self._next_frame_id = frame_id + 1 if frame_id < 255 else 1
+            frame = self.build_tx_request(payload, frame_id)
+            self._tx_queue.append((frame, description or repr(payload)))
+        return True
+
+    @staticmethod
+    def build_tx_request(payload: bytes, frame_id: int = 1,
+                         addr64: bytes = API_ADDR64_BROADCAST,
+                         addr16: bytes = API_ADDR16_UNKNOWN) -> bytes:
+        """Build a complete 0x10 Transmit Request frame around *payload*.
+
+        Broadcast-addressed by default: the ground station knows the flight
+        radio is on the same PAN and channel, but not necessarily its 64-bit
+        address, and a command that fails because it was unicast to the wrong
+        address is a worse failure than one the whole PAN hears.
+
+        Pure function -- no I/O, no state -- so it can be unit-tested against a
+        byte-for-byte expected frame without a radio present.
+        """
+        frame_data = (
+            bytes((API_TX_REQUEST, frame_id & 0xFF))
+            + addr64 + addr16
+            + bytes((0x00, 0x00))          # broadcast radius, options
+            + payload
+        )
+        length = len(frame_data)
+        return (
+            bytes((API_START, (length >> 8) & 0xFF, length & 0xFF))
+            + frame_data
+            + bytes((ApiFrameUnwrapper.checksum(frame_data),))
+        )
 
     def request_disconnect(self) -> None:
         """Ask the worker to close the port and stay closed."""
@@ -568,6 +675,15 @@ class SerialWorker(QThread):
                 if not self._open_port(port, baud):
                     next_retry_at = time.monotonic() + RECONNECT_DELAY_S
                     continue
+
+            # --- outbound commands ---------------------------------------------
+            # Ahead of the read: a command must go out on a silent link too,
+            # which is precisely when an operator is most likely to send one.
+            self._drain_tx_queue()
+            status = self._unwrapper.last_tx_status
+            if status is not None:
+                self._unwrapper.last_tx_status = None
+                self.transmit_status.emit(status[0], status[1])
 
             # --- read ---------------------------------------------------------
             try:
@@ -685,6 +801,28 @@ class SerialWorker(QThread):
         self.valid_packets += 1
         self.packet_received.emit(packet)
 
+    def _drain_tx_queue(self) -> None:
+        """Write any queued uplink frames. Worker thread only."""
+        with self._lock:
+            pending, self._tx_queue = self._tx_queue, []
+        if not pending:
+            return
+        handle = self._serial
+        for frame, description in pending:
+            if handle is None:
+                self.command_sent.emit(False, "%s: port not open" % description)
+                continue
+            try:
+                handle.write(frame)
+                handle.flush()
+            except Exception as exc:
+                self.command_sent.emit(
+                    False, "%s: write failed (%s)" % (description, exc))
+                continue
+            self.command_sent.emit(
+                True, "%s: %d bytes written [%s]"
+                % (description, len(frame), frame.hex(" ")))
+
     def _handle_raw_csv(self, record: bytes) -> None:
         """Parse one bare-CSV record (compatibility mode); never raises.
 
@@ -798,6 +936,21 @@ class SerialWorker(QThread):
         if connected != self._reported_connected:
             self._reported_connected = connected
             self.connection_changed.emit(connected, message)
+
+    @property
+    def last_rssi_dbm(self) -> Optional[int]:
+        """RSSI of the most recent received frame, in dBm, or ``None``.
+
+        Real per-packet data reported by the radio in the 0x80/0x81 receive
+        frame. Read from the GUI thread for display only -- it is a single
+        immutable int reference, so the worst case is showing the previous
+        packet's value for one repaint.
+
+        NOTE: this is the strength of whatever reached the module's single RF
+        port. The 802.15.4 API has no per-antenna field, so this cannot be
+        attributed to one antenna of a diversity pair by the software alone.
+        """
+        return self._unwrapper.last_rssi_dbm
 
     def _emit_stats(self, force: bool = False) -> None:
         """Throttled statistics emission so bursts cannot flood the GUI."""

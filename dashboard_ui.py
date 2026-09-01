@@ -31,6 +31,7 @@ import math
 import os
 import time
 from collections import deque
+from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyqtgraph as pg
@@ -68,6 +69,7 @@ from serial_worker import SerialWorker, list_serial_ports
 from session_summary_widget import SessionSummaryWidget
 from telemetry_packet import (
     FSM_COLORS,
+    build_frame,
     FSM_STATES,
     PAYLOAD_CANSAT,
     PAYLOAD_GENERIC,
@@ -108,6 +110,17 @@ CLICK_MAX_S = 0.4
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 
+#: Uplink command payload for the payload-ejection request. Deliberately shares
+#: the $...*XX shape of telemetry so it is checksummed the same way, but its
+#: "$CMD" sentence type can never be mistaken for a telemetry frame: the parser
+#: keys on TEAM_ID in field 0 and would reject this outright.
+EJECT_COMMAND_BODY = "CMD,EJECT"
+
+#: Ground receive antennas in the SIMO diversity setup. This is a MANUAL
+#: selection, not telemetry: see the note on the combo's tooltip. Kept as a
+#: list so adding a third element later is a one-line change.
+ANTENNA_PATHS = ["WHIP / DIPOLE", "PATCH", "BOTH (COMBINED)", "UNSPECIFIED"]
+
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
 TEAM_ID_FALLBACK = "TEST001"
@@ -124,34 +137,72 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOGO_HEIGHT_PX = 40
 
 # ---------------------------------------------------------------------------
-# Dark theme
+# Daylight theme
 # ---------------------------------------------------------------------------
+#
+# Calibrated for reading OUTDOORS IN DIRECT SUN, not for a darkened room.
+#
+# Why light-on-dark fails outdoors: a dark panel reflects ambient light like a
+# mirror, so in sun the screen's own black is *brighter* than the light text it
+# is meant to contrast against, and the image washes out. A light base emits
+# near its maximum over most of the panel, so it stays above the reflected
+# ambient and dark text keeps its contrast.
+#
+# Two rules follow, and every colour below obeys them:
+#   1. Text and traces are DARK on a light ground -- never pale-on-white.
+#   2. Semantic colours are chosen for a light background specifically. The old
+#      amber #e9c135 read well on near-black and is nearly invisible on light
+#      grey; it becomes a dark ochre here. Saturated-but-dark, not bright.
+#
+# Contrast ratios against COL_PANEL (#f2f5f9) are noted where they matter; the
+# WCAG floor for body text is 4.5:1 and everything here clears 7:1.
 
-COL_BG = "#0e1218"
-COL_PANEL = "#161d27"
-COL_PANEL_HI = "#1d2633"
-COL_BORDER = "#2b3746"
-COL_TEXT = "#dbe3ee"
-COL_TEXT_DIM = "#8b9aad"
-COL_ACCENT = "#4aa8ff"
-COL_OK = "#35c46b"
-COL_WARN = "#e9c135"
-COL_ALERT = "#e8384f"
+COL_BG = "#d7dee8"        # window ground: light blue-grey, gives panels edges
+COL_PANEL = "#f2f5f9"     # panel face
+COL_PANEL_HI = "#ffffff"  # raised: tiles, buttons, inputs
+COL_BORDER = "#7a8ba4"    # strong enough to survive glare; not a hairline grey
+COL_TEXT = "#0d1520"      # near-black                       ~17:1
+COL_TEXT_DIM = "#41506a"  # dark slate, still fully readable  ~8:1
+COL_ACCENT = "#0a4fa8"    # deep aerospace blue               ~7.4:1
+COL_OK = "#0d7a3d"        # deep green                        ~5.6:1
+COL_WARN = "#a05000"      # dark ochre -- the recalibrated amber ~5.9:1
+COL_ALERT = "#c0182b"     # strong red                        ~6.3:1
 
 # Per-quantity trace colours, reused between the plots and the readout tiles.
-COL_ALT = "#4aa8ff"
-COL_PRESS = "#ffb74d"
-COL_TEMP = "#ff7a7a"
-COL_VOLT = "#7ee787"
-COL_XYZ = ("#ff6b6b", "#4ade80", "#60a5fa")  # X, Y, Z
+# All are dark enough to read as lines on a light chart, and separated in hue
+# *and* lightness so they stay distinguishable when glare flattens saturation.
+COL_ALT = "#0a4fa8"    # blue
+COL_PRESS = "#a05000"  # ochre
+COL_TEMP = "#c0182b"   # red
+COL_VOLT = "#0d7a3d"   # green
+# X/Y/Z keeps the aerospace red/green/blue axis convention, but the three are
+# ALSO separated by lightness -- green lightest, red middle, blue darkest, each
+# step >=1.4:1. Hue alone is not enough: sun glare flattens saturation, and
+# red/green deficiency collapses two of these three to the same hue. Solved
+# numerically against the plot ground rather than picked by eye.
+COL_XYZ = ("#cf1f2e", "#1b9732", "#0d49a3")  # X, Y, Z
 
 # Vehicle-specific payload colours.
-COL_PM1 = "#5ad2f4"    # SPS30 PM1.0
-COL_PM25 = "#f4b73f"   # SPS30 PM2.5
-COL_PM10 = "#f4685a"   # SPS30 PM10
-COL_WHEEL = "#c79bff"  # reaction wheel RPM
+# The PM triad shares one chart, so it gets the same lightness-laddering as
+# X/Y/Z: teal lightest, ochre middle, dark red darkest.
+COL_PM1 = "#07909e"    # SPS30 PM1.0  - teal
+COL_PM25 = "#ae4e00"   # SPS30 PM2.5  - ochre
+COL_PM10 = "#9a1222"   # SPS30 PM10   - dark red
+COL_WHEEL = "#6a3fbe"  # reaction wheel RPM - violet
 
-DARK_QSS = f"""
+# Chart interior. Deliberately NOT pure white: a white plot under sun becomes a
+# glare sheet, and thin pale gridlines disappear into it. A faint blue-grey
+# tint keeps the plot area distinct from the panel and lets the gridlines read.
+COL_PLOT_BG = "#e9edf3"
+COL_GRID = "#5b6a80"      # gridlines and axes: mid-dark, clearly visible
+
+#: Gridline opacity. 0.22 suited pale lines on black; a dark grid on a light
+#: plot needs to be firmer to stay legible once glare lifts the black point.
+GRID_ALPHA = 0.42
+#: Trace width. A hairline is the first thing to disappear in sunlight.
+TRACE_WIDTH_PX = 2.2
+
+DAYLIGHT_QSS = f"""
 QWidget {{
     background-color: {COL_BG};
     color: {COL_TEXT};
@@ -182,18 +233,30 @@ QPushButton {{
     border-radius: 5px;
     padding: 7px 16px;
     font-weight: 600;
+    color: {COL_TEXT};
 }}
-QPushButton:hover  {{ background-color: #26313f; border-color: {COL_ACCENT}; }}
-QPushButton:pressed{{ background-color: #10161e; }}
-QPushButton:disabled {{ color: #5a6675; border-color: #222b36; }}
+QPushButton:hover  {{ background-color: #e2e9f3; border-color: {COL_ACCENT}; }}
+QPushButton:pressed{{ background-color: #c9d4e3; }}
+QPushButton:disabled {{ color: #8b98ab; border-color: #c2ccda; }}
 QPushButton#connectBtn[connected="true"] {{
     background-color: {COL_ALERT}; border-color: {COL_ALERT}; color: #ffffff;
 }}
 QPushButton#connectBtn[connected="false"] {{
-    background-color: #1f6f3f; border-color: #2c8f52; color: #ffffff;
+    background-color: #0d7a3d; border-color: #0a5c2e; color: #ffffff;
 }}
+QPushButton#pauseBtn[paused="true"] {{
+    background-color: {COL_WARN}; border-color: #7a3d00; color: #ffffff;
+}}
+/* Uplink control. The only button here that transmits, so it is the only one
+   that is red at rest rather than red once armed. */
+QPushButton#ejectBtn {{
+    background-color: {COL_ALERT}; border-color: #8c1220; color: #ffffff;
+    font-weight: 800; letter-spacing: 1px;
+}}
+QPushButton#ejectBtn:hover {{ background-color: #d8283c; border-color: #8c1220; }}
+QPushButton#ejectBtn:pressed {{ background-color: #8c1220; }}
 QPushButton#logBtn[logging="true"] {{
-    background-color: #8a5a00; border-color: #b87700; color: #ffffff;
+    background-color: #a05000; border-color: #7a3d00; color: #ffffff;
 }}
 QComboBox, QSpinBox, QDoubleSpinBox {{
     background-color: {COL_PANEL_HI};
@@ -207,15 +270,15 @@ QComboBox QAbstractItemView {{
     background-color: {COL_PANEL_HI};
     border: 1px solid {COL_BORDER};
     selection-background-color: {COL_ACCENT};
-    selection-color: #06121f;
+    selection-color: #ffffff;
 }}
 QPlainTextEdit {{
-    background-color: #0a0e13;
+    background-color: #ffffff;
     border: 1px solid {COL_BORDER};
     border-radius: 5px;
     font-family: 'Consolas', 'DejaVu Sans Mono', monospace;
     font-size: 9pt;
-    color: {COL_TEXT_DIM};
+    color: {COL_TEXT};
 }}
 QCheckBox {{ spacing: 8px; }}
 QScrollBar:vertical {{
@@ -224,7 +287,7 @@ QScrollBar:vertical {{
 QScrollBar::handle:vertical {{
     background: {COL_BORDER}; border-radius: 6px; min-height: 30px;
 }}
-QScrollBar::handle:vertical:hover {{ background: #3d4c5e; }}
+QScrollBar::handle:vertical:hover {{ background: #5b6a80; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QSplitter::handle {{ background: {COL_BORDER}; width: 3px; }}
 QTabWidget::pane {{
@@ -252,6 +315,33 @@ QTabBar::tab:hover {{ color: {COL_TEXT}; }}
 # ---------------------------------------------------------------------------
 # Small reusable widgets
 # ---------------------------------------------------------------------------
+
+def _fit(button, widest: str = "", letter_spaced: bool = False) -> None:
+    """Fix a button's width to the widest label it will ever show.
+
+    Measured from the *polished* widget, so the stylesheet's font weight and
+    padding are included. Computing this from fontMetrics() before polish gives
+    a width narrower than the text, which is what clipped these labels when two
+    controls were added to the connection bar.
+
+    *widest* is the longest label the button ever displays, so a toggle does not
+    resize itself -- and shift its neighbours -- when it flips.
+    """
+    original = button.text()
+    if widest:
+        button.setText(widest)
+    button.ensurePolished()
+    width = button.sizeHint().width()
+    if widest:
+        button.setText(original)
+    # sizeHint() ignores the stylesheet's letter-spacing, so the one button
+    # that uses it needs a pixel per character on top. The rest do not, and
+    # handing every button that slack is what overflowed the bar.
+    # The letter-spaced button is also font-weight 800, heavier than the 600
+    # sizeHint() measured, so it needs two pixels a character, not one.
+    slack = 6 + (2 * len(widest or original) if letter_spaced else 0)
+    button.setFixedWidth(width + slack)
+
 
 class ReadoutTile(QFrame):
     """A single labelled numeric readout ("ALTITUDE  1234.5 m").
@@ -355,11 +445,11 @@ class StatusLight(QFrame):
 
     def set_state(self, fired: Optional[bool]) -> None:
         if fired is None:
-            text, bg, fg = "NO DATA", "#242c38", COL_TEXT_DIM
+            text, bg, fg = "NO DATA", "#dbe2ec", COL_TEXT_DIM
         elif fired:
             text, bg, fg = self._fired_text, COL_ALERT, "#ffffff"
         else:
-            text, bg, fg = self._safe_text, "#1f6f3f", "#ffffff"
+            text, bg, fg = self._safe_text, COL_OK, "#ffffff"
         self.lamp.setText(text)
         self.lamp.setStyleSheet(
             "background-color: %s; color: %s; border-radius: 4px;" % (bg, fg)
@@ -520,7 +610,7 @@ class StripChart(pg.PlotWidget):
         self.setTitle(title, color=COL_TEXT, size="10pt")
         self.setLabel("left", y_label, color=COL_TEXT_DIM)
         self.setLabel("bottom", "mission time", units="s", color=COL_TEXT_DIM)
-        self.showGrid(x=True, y=True, alpha=0.22)
+        self.showGrid(x=True, y=True, alpha=GRID_ALPHA)
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=True, y=True)
         self.setMinimumHeight(118)
@@ -548,14 +638,16 @@ class StripChart(pg.PlotWidget):
             # Anchored top-left (clear of the Y tick labels): the right-hand
             # corner is where the newest samples arrive and would be covered.
             self.addLegend(
-                offset=(58, 10), labelTextColor=COL_TEXT_DIM,
-                verSpacing=-3, brush=pg.mkBrush(20, 26, 35, 190),
+                offset=(58, 10), labelTextColor=COL_TEXT,
+                verSpacing=-3,
+                brush=pg.mkBrush(255, 255, 255, 215),
+                pen=pg.mkPen(COL_BORDER, width=1),
             )
 
         for name, color in series:
             curve = self.plot(
                 [], [],
-                pen=pg.mkPen(color, width=2),
+                pen=pg.mkPen(color, width=TRACE_WIDTH_PX),
                 name=name if (len(series) > 1 and legend) else None,
                 autoDownsample=True,
                 clipToView=True,
@@ -728,7 +820,7 @@ class GpsTrackPlot(pg.PlotWidget):
         self.setTitle("Ground track", color=COL_TEXT, size="10pt")
         self.setLabel("left", "latitude", units="°", color=COL_TEXT_DIM)
         self.setLabel("bottom", "longitude", units="°", color=COL_TEXT_DIM)
-        self.showGrid(x=True, y=True, alpha=0.22)
+        self.showGrid(x=True, y=True, alpha=GRID_ALPHA)
         self.setMenuEnabled(False)
         self.setMinimumHeight(118)
         self.setFocusPolicy(Qt.NoFocus)   # see StripChart: keeps the column put
@@ -737,9 +829,9 @@ class GpsTrackPlot(pg.PlotWidget):
         self._lons: List[float] = []
 
         self._track = self.plot(
-            [], [], pen=pg.mkPen("#3f7fbf", width=1.5),
+            [], [], pen=pg.mkPen(COL_ACCENT, width=2.0),
             symbol="o", symbolSize=3.5,
-            symbolBrush=pg.mkBrush("#2f6fa8"), symbolPen=None,
+            symbolBrush=pg.mkBrush(COL_ACCENT), symbolPen=None,
         )
         self._current = self.plot(
             [], [], pen=None, symbol="+", symbolSize=16,
@@ -807,6 +899,9 @@ class Dashboard(QMainWindow):
         self.logging_enabled = False
         self.is_connected = False
         self._readouts_dirty = False
+        #: True while the live display is frozen. Data ingestion, chart
+        #: accumulation and CSV logging are unaffected -- only repainting stops.
+        self.display_paused = False
         self._was_stale = False
         self._last_fsm: Optional[int] = None
         #: PAYLOAD_TYPE seen in the stream; drives the auto-detected panel.
@@ -844,7 +939,7 @@ class Dashboard(QMainWindow):
         # The attitude model runs on its own timer: it wants a higher, smoother
         # frame rate than the strip charts, and it is cheap (one 4x4 transform).
         self.attitude_timer = QTimer(self)
-        self.attitude_timer.timeout.connect(self.attitude.redraw)
+        self.attitude_timer.timeout.connect(self._render_attitude)
         self.attitude_timer.start(int(1000 / ATTITUDE_RENDER_HZ))
 
         # Resolve the initial vehicle choice so the panel titles and the 3D
@@ -865,8 +960,8 @@ class Dashboard(QMainWindow):
     # ==================================================================
 
     def _build_ui(self) -> None:
-        pg.setConfigOptions(antialias=True, background=COL_PANEL, foreground=COL_TEXT_DIM)
-        self.setStyleSheet(DARK_QSS)
+        pg.setConfigOptions(antialias=True, background=COL_PLOT_BG, foreground=COL_GRID)
+        self.setStyleSheet(DAYLIGHT_QSS)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -934,10 +1029,22 @@ class Dashboard(QMainWindow):
 
         label = QLabel()
         label.setPixmap(pixmap)
-        label.setFixedSize(pixmap.size())
         label.setToolTip(tooltip)
-        # Transparent so the PNG alpha shows the panel behind it, not a white box.
-        label.setStyleSheet("background: transparent; border: none;")
+        # DAYLIGHT THEME NOTE. The college seal is a white medallion with dark
+        # rim text -- artwork drawn for white paper. Against the old near-black
+        # header its white disc was what separated it from the background; on a
+        # light header that disc merges into the bar, the seal loses its edge
+        # and the rim lettering floats. The logo pixels are NOT altered (that
+        # would be recolouring someone's mark); instead it sits on an explicit
+        # white plate, which is the background the artwork was drawn for. The
+        # plate is the label's own background, so nothing moves: the extra 3 px
+        # of padding is absorbed by the bar's existing margins.
+        label.setFixedSize(pixmap.width() + 6, pixmap.height() + 4)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(
+            "background: #ffffff; border: 1px solid %s; border-radius: 4px;"
+            % COL_BORDER
+        )
         return label
 
     def _build_connection_bar(self) -> QWidget:
@@ -959,6 +1066,11 @@ class Dashboard(QMainWindow):
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)  # lets you type a URL such as socket://…
         self.port_combo.setMinimumWidth(190)
+        # Without this the combo's sizeHint grows to fit the longest port
+        # description, claiming ~295 px of a bar that has none to spare. The
+        # full text stays available in the dropdown and the tooltip.
+        self.port_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+        self.port_combo.setMinimumContentsLength(12)
         self.port_combo.setToolTip(
             "Serial device (COM7, /dev/ttyUSB0) or a pyserial URL such as\n"
             "socket://127.0.0.1:5555 for the synthetic packet generator."
@@ -966,7 +1078,7 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.port_combo)
 
         self.refresh_btn = QPushButton("RESCAN")
-        self.refresh_btn.setFixedWidth(92)
+        _fit(self.refresh_btn)
         self.refresh_btn.setToolTip("Rescan available serial ports")
         layout.addWidget(self.refresh_btn)
 
@@ -976,7 +1088,7 @@ class Dashboard(QMainWindow):
         self.baud_combo.setEditable(True)
         self.baud_combo.addItems(BAUD_RATES)
         self.baud_combo.setCurrentText("9600")
-        self.baud_combo.setFixedWidth(110)
+        self.baud_combo.setFixedWidth(92)
         layout.addWidget(self.baud_combo)
 
         layout.addSpacing(8)
@@ -994,17 +1106,17 @@ class Dashboard(QMainWindow):
         self.connect_btn = QPushButton("CONNECT")
         self.connect_btn.setObjectName("connectBtn")
         self.connect_btn.setProperty("connected", "false")
-        self.connect_btn.setFixedWidth(140)
+        _fit(self.connect_btn, "DISCONNECT")
         layout.addWidget(self.connect_btn)
 
         self.log_btn = QPushButton("START LOGGING")
         self.log_btn.setObjectName("logBtn")
         self.log_btn.setProperty("logging", "false")
-        self.log_btn.setFixedWidth(170)
+        _fit(self.log_btn, "START LOGGING")
         layout.addWidget(self.log_btn)
 
         self.diag_btn = QPushButton("DIAGNOSTICS")
-        self.diag_btn.setFixedWidth(148)
+        _fit(self.diag_btn)
         self.diag_btn.setToolTip(
             "Open the raw telemetry diagnostics table in a separate window. "
             "Shows every field of the most recent packet plus link statistics."
@@ -1012,7 +1124,7 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.diag_btn)
 
         self.csv_table_btn = QPushButton("CSV TABLE")
-        self.csv_table_btn.setFixedWidth(126)
+        _fit(self.csv_table_btn)
         self.csv_table_btn.setToolTip(
             "Open the current logging session's CSV as a live table, one row "
             "per logged packet, with a filter box."
@@ -1020,6 +1132,8 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.csv_table_btn)
 
         self.log_path_label = QLabel("CSV: not started")
+        self.log_path_label.setSizePolicy(QSizePolicy.Ignored,
+                                          QSizePolicy.Preferred)
         self.log_path_label.setStyleSheet("color: %s;" % COL_TEXT_DIM)
         self.log_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.log_path_label.setMinimumWidth(0)
@@ -1052,12 +1166,12 @@ class Dashboard(QMainWindow):
 
             sub-column A            sub-column B
             ------------            ------------
-            Flight state            GPS / NavIC + ground track
+            Flight state            GNSS / NavIC + ground track
             Live telemetry          Link status
             Payload
 
         Both sub-columns fit inside one screenful at 768 px, which is what the
-        operator needs: flight state, telemetry, GPS, ground track and link
+        operator needs: flight state, telemetry, GNSS, ground track and link
         status all visible at once, with no scrolling.
         """
         panel = QWidget()
@@ -1081,6 +1195,9 @@ class Dashboard(QMainWindow):
         right.setSpacing(6)
         right.addWidget(self._build_gps_panel())
         right.addWidget(self._build_link_panel())
+        # The gap below LINK STATUS: with a payload page expanded, the left
+        # column runs to the bottom while this one still has spare stretch.
+        right.addWidget(self._build_command_panel())
         right.addStretch(1)
 
         col_a.setMinimumWidth(286)
@@ -1317,7 +1434,7 @@ class Dashboard(QMainWindow):
         return page
 
     def _build_gps_panel(self) -> QWidget:
-        box = QGroupBox("GPS / NavIC")
+        box = QGroupBox("GNSS / NavIC")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1342,6 +1459,60 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.gps_plot)
         return box
 
+    def _build_command_panel(self) -> QWidget:
+        """Display freeze and uplink, in the spare space below LINK STATUS.
+
+        Deliberately not on the connection bar. That bar was already at its
+        width limit, and more importantly EJECT transmits: it belongs somewhere
+        an operator cannot hit it while reaching for CONNECT.
+        """
+        # A plain container, not a QGroupBox: a titled group costs ~40 px of
+        # sidebar height in chrome for what is two buttons, and the sidebar has
+        # none to spare. A thin rule separates the section instead.
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 3, 0, 0)
+        layout.setSpacing(4)
+
+        rule = QFrame()
+        rule.setFrameShape(QFrame.HLine)
+        rule.setFixedHeight(1)
+        rule.setStyleSheet("background: %s; border: none;" % COL_BORDER)
+        layout.addWidget(rule)
+
+        self.pause_btn = QPushButton("PAUSE TELEMETRY")
+        self.pause_btn.setObjectName("pauseBtn")
+        self.pause_btn.setProperty("paused", "false")
+        self.pause_btn.setToolTip(
+            "Freeze the live display so a value can be read without it moving.\n\n"
+            "This does NOT disconnect the radio and does NOT stop logging:\n"
+            "packets keep arriving, keep filling the charts and keep being\n"
+            "written to the CSV. Only the repaint is suspended, so resuming\n"
+            "shows everything that arrived while it was frozen."
+        )
+
+
+        self.eject_btn = QPushButton("EJECT PAYLOAD")
+        self.eject_btn.setObjectName("ejectBtn")
+        self.eject_btn.setToolTip(
+            "UPLINK COMMAND - this transmits to the flight computer.\n\n"
+            "Sends $" + EJECT_COMMAND_BODY + "*XX inside an XBee 0x10 Transmit\n"
+            "Request frame. Asks for confirmation first, and logs the exact\n"
+            "bytes sent to the Event Log.\n\n"
+            "NOT YET END TO END: the flight firmware does not currently\n"
+            "listen for commands, so this transmits but nothing acts on it\n"
+            "yet."
+        )
+        # Stacked, not side by side: this column is ~254 px wide, and two
+        # buttons sharing that clip "RESUME TELEMETRY" and "EJECT PAYLOAD".
+        # Full width each also gives EJECT a deliberately large target that is
+        # hard to hit by accident on the way to something else.
+        for button in (self.pause_btn, self.eject_btn):
+            button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            button.setMinimumHeight(29)
+            layout.addWidget(button)
+        return box
+
     def _build_link_panel(self) -> QWidget:
         box = QGroupBox("LINK STATUS")
         grid = QGridLayout(box)
@@ -1353,10 +1524,71 @@ class Dashboard(QMainWindow):
         self.tile_total = ReadoutTile("Valid/Total", "", COL_TEXT, value_pt=15)
         self.tile_corrupt = ReadoutTile("Corrupt/Reject/API", "", COL_TEXT, value_pt=15)
 
+        # RSSI is REAL data: the 802.15.4 0x80/0x81 receive frame carries the
+        # signal strength of that packet. It is the strength at the module's
+        # single RF port, so it describes the whole receive path, not one
+        # antenna of the pair.
+        self.tile_rssi = ReadoutTile("Signal (RSSI)", "dBm", COL_TEXT, value_pt=15)
+
+        # Antenna path is MANUAL. See ANTENNA_PATHS below for why.
+        antenna_box = QFrame()
+        antenna_box.setStyleSheet(
+            "QFrame { background-color: %s; border: 1px solid %s;"
+            " border-radius: 5px; }" % (COL_PANEL_HI, COL_BORDER)
+        )
+        ant_layout = QVBoxLayout(antenna_box)
+        ant_layout.setContentsMargins(8, 3, 8, 3)
+        ant_layout.setSpacing(0)
+        ant_caption = QLabel("ANTENNA (MANUAL)")
+        ant_font = QFont()
+        ant_font.setPointSize(8)
+        ant_font.setBold(True)
+        ant_caption.setFont(ant_font)
+        ant_caption.setStyleSheet("color: %s; border: none;" % COL_TEXT_DIM)
+        # Same trick the readout tiles use: a QLabel otherwise reports its full
+        # text width as a hard minimum, which is what starved the RSSI tile
+        # beside it down to 19 px.
+        ant_caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.antenna_combo = QComboBox()
+        self.antenna_combo.addItems(ANTENNA_PATHS)
+        self.antenna_combo.setToolTip(
+            "Which ground antenna is physically connected for this test session.\n\n"
+            "MANUAL LABEL - not read from the radio. The XBee 802.15.4 API has\n"
+            "no per-antenna field in any receive frame (0x80/0x81/0x90) and no\n"
+            "AT parameter for antenna selection, so the software cannot know\n"
+            "which element of a diversity pair received a given packet.\n\n"
+            "Set it to match the hardware so the Event Log and CSV notes\n"
+            "record which antenna a session's RSSI figures belong to."
+        )
+        self.antenna_combo.setMinimumContentsLength(8)
+        self.antenna_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+        self.antenna_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.antenna_combo.currentTextChanged.connect(self._on_antenna_changed)
+        ant_layout.addWidget(ant_caption)
+        ant_layout.addWidget(self.antenna_combo)
+
         grid.addWidget(self.tile_rate, 0, 0)
         grid.addWidget(self.tile_age, 0, 1)
         grid.addWidget(self.tile_total, 1, 0)
         grid.addWidget(self.tile_corrupt, 1, 1)
+        grid.addWidget(self.tile_rssi, 2, 0)
+        grid.addWidget(antenna_box, 2, 1)
+        # Even columns. Without this the combo's implicit minimum width claims
+        # the whole row and collapses the tiles in column 0 to slivers.
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        # Display-frozen banner. Deliberately distinct from the stale/alert
+        # banner: an operator must never confuse "I paused the screen" with
+        # "the link died".
+        self.paused_banner = QLabel("")
+        self.paused_banner.setAlignment(Qt.AlignCenter)
+        paused_font = QFont()
+        paused_font.setPointSize(12)
+        paused_font.setBold(True)
+        self.paused_banner.setFont(paused_font)
+        self.paused_banner.setMinimumHeight(28)
+        self.paused_banner.setVisible(False)
 
         self.stale_banner = QLabel("")
         self.stale_banner.setAlignment(Qt.AlignCenter)
@@ -1365,7 +1597,10 @@ class Dashboard(QMainWindow):
         stale_font.setBold(True)
         self.stale_banner.setFont(stale_font)
         self.stale_banner.setMinimumHeight(28)
-        grid.addWidget(self.stale_banner, 2, 0, 1, 2)
+        # Rows 0-2 are tiles; the two banners sit below them. stale_banner used
+        # to be row 2, which silently painted over the RSSI row added there.
+        grid.addWidget(self.stale_banner, 3, 0, 1, 2)
+        grid.addWidget(self.paused_banner, 4, 0, 1, 2)
 
         self.tile_total.set_value("0/0")
         self.tile_corrupt.set_value("0/0/0")
@@ -1512,7 +1747,7 @@ class Dashboard(QMainWindow):
         # Display settings and the event log live here rather than in the left
         # sidebar: they are the two panels an operator consults occasionally
         # rather than watching continuously, so they are the right things to
-        # cost a tab click in exchange for GPS and link status never scrolling.
+        # cost a tab click in exchange for GNSS and link status never scrolling.
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.addTab(self._build_event_log(), "Event log")
@@ -1537,6 +1772,8 @@ class Dashboard(QMainWindow):
         self.serial_worker.stats_updated.connect(self.on_stats)
         self.serial_worker.connection_changed.connect(self.on_connection_changed)
         self.serial_worker.log_message.connect(self.append_event)
+        self.serial_worker.command_sent.connect(self.on_command_sent)
+        self.serial_worker.transmit_status.connect(self.on_transmit_status)
 
         self.csv_logger.file_opened.connect(self.on_log_file_opened)
         # Every row the logger writes also lands in the live table.
@@ -1548,6 +1785,8 @@ class Dashboard(QMainWindow):
         self.connect_btn.clicked.connect(self.toggle_connection)
         self.log_btn.clicked.connect(self.toggle_logging)
         self.clear_btn.clicked.connect(self.clear_session)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.eject_btn.clicked.connect(self.on_eject_clicked)
         self.diag_btn.clicked.connect(self.toggle_diagnostics)
         self.csv_table_btn.clicked.connect(self.toggle_csv_table)
 
@@ -1654,11 +1893,19 @@ class Dashboard(QMainWindow):
             # Raw wire view and the diagnostics table. Both are plain setText
             # work; the table is skipped entirely while its window is hidden so
             # a closed diagnostics view costs nothing here.
-            self.raw_strip.show_packet(packet.raw_frame)
-            if self.diagnostics.isVisible():
-                self.diagnostics.update_packet(
-                    packet, voltage_warn=float(self.volt_spin.value())
-                )
+            #
+            # DISPLAY PAUSE: these two are the only widget writes that happen
+            # on the packet itself rather than on the render timer, so they are
+            # the only ones that have to be gated here. Everything below --
+            # chart data, the attitude estimator, the session summary, the
+            # counters and the CSV write -- runs exactly as normal, which is
+            # what makes a pause lossless.
+            if not self.display_paused:
+                self.raw_strip.show_packet(packet.raw_frame)
+                if self.diagnostics.isVisible():
+                    self.diagnostics.update_packet(
+                        packet, voltage_warn=float(self.volt_spin.value())
+                    )
             self.last_packet_epoch = packet.gs_recv_epoch
             self.recv_times.append(packet.gs_recv_epoch)
 
@@ -1700,7 +1947,8 @@ class Dashboard(QMainWindow):
             if packet.has_fix:
                 self.gps_plot.add_fix(packet.lat, packet.lon)
 
-            if getattr(packet, "has_fsm_data", True)                     and packet.fsm_state != self._last_fsm:
+            if (getattr(packet, "has_fsm_data", True)
+                    and packet.fsm_state != self._last_fsm):
                 previous = FSM_STATES.get(self._last_fsm, "—")
                 self._last_fsm = packet.fsm_state
                 self.append_event(
@@ -1767,8 +2015,10 @@ class Dashboard(QMainWindow):
     def on_bad_frame(self, raw: str, reason: str) -> None:
         """A frame failed checksum or parsing — always archived, never fatal."""
         # Still show the bytes: during bring-up, seeing corrupt traffic is far
-        # more informative than seeing nothing.
-        self.raw_strip.show_corrupt(raw)
+        # more informative than seeing nothing -- unless the display is frozen,
+        # in which case a corrupt frame must not move it either.
+        if not self.display_paused:
+            self.raw_strip.show_corrupt(raw)
         # Errors are logged unconditionally so a corrupted-link investigation
         # still has data even if CSV logging was never switched on.
         self.csv_logger.log_error(raw, reason)
@@ -1780,7 +2030,8 @@ class Dashboard(QMainWindow):
         under its own tag so it reads differently from a corrupt frame at a
         glance. Deliberately not plotted and not sent to the attitude widget.
         """
-        self.raw_strip.show_rejected(raw)
+        if not self.display_paused:
+            self.raw_strip.show_rejected(raw)
         self.csv_logger.log_error(raw, reason)
 
     def on_stats(self, total_frames: int, valid: int, corrupt: int,
@@ -1810,6 +2061,12 @@ class Dashboard(QMainWindow):
     def _render(self) -> None:
         """Repaint readouts and charts at a fixed rate, independent of RX rate."""
         try:
+            # Frozen display: data keeps accumulating in the charts and the CSV
+            # keeps being written; only the repaint is suspended. _readouts_dirty
+            # is deliberately left set, so the first render after RESUME draws
+            # everything that arrived while paused in one pass.
+            if self.display_paused:
+                return
             if self._readouts_dirty:
                 self._readouts_dirty = False
                 self._update_readouts()
@@ -2038,11 +2295,11 @@ class Dashboard(QMainWindow):
         if state is None:
             # Raw-CSV firmware sends no flight state; say so rather than
             # implying the vehicle reported one.
-            text, color, fg = "NO FSM DATA", "#333c48", COL_TEXT_DIM
+            text, color, fg = "NO FSM DATA", "#dbe2ec", COL_TEXT_DIM
         else:
             text = FSM_STATES.get(state, "UNKNOWN (%s)" % state)
             color = FSM_COLORS.get(state, "#8a2be2")
-            fg = "#080d14"
+            fg = "#ffffff"
         self.fsm_label.setText("%s%s" % (text, "" if state is None else "  [%d]" % state))
         self.fsm_label.setStyleSheet(
             "background-color: %s; color: %s; border-radius: 6px;"
@@ -2066,6 +2323,18 @@ class Dashboard(QMainWindow):
         self.tile_corrupt.set_level(
             "alert" if (self.corrupt_packets or self.rejected_packets
                         or self.api_frame_errors) else "normal")
+
+        # Real RSSI from the radio's own receive frame. None until a frame that
+        # carries the field (0x80/0x81) has arrived -- 0x90 has no RSSI byte.
+        rssi = self.serial_worker.last_rssi_dbm
+        if rssi is None:
+            self.tile_rssi.set_value("--")
+            self.tile_rssi.set_level("normal")
+        else:
+            self.tile_rssi.set_value("%d" % rssi)
+            # Typical 802.15.4 link budget: > -70 comfortable, < -85 marginal.
+            self.tile_rssi.set_level(
+                "ok" if rssi > -70 else ("warn" if rssi > -85 else "alert"))
 
         self._push_link_diagnostics()
 
@@ -2092,6 +2361,115 @@ class Dashboard(QMainWindow):
                 self.append_event("Telemetry recovered.")
                 self.csv_logger.log_note("telemetry recovered")
 
+    def _render_attitude(self) -> None:
+        """Attitude repaint tick, suspended while the display is frozen."""
+        if self.display_paused:
+            return
+        self.attitude.redraw()
+
+    def toggle_pause(self) -> None:
+        """Freeze or resume the live display without touching the link."""
+        self.display_paused = not self.display_paused
+        paused = self.display_paused
+        self.pause_btn.setText("RESUME TELEMETRY" if paused else "PAUSE TELEMETRY")
+        self.pause_btn.setProperty("paused", "true" if paused else "false")
+        self.pause_btn.style().unpolish(self.pause_btn)
+        self.pause_btn.style().polish(self.pause_btn)
+
+        self.paused_banner.setVisible(paused)
+        if paused:
+            self.paused_banner.setText("DISPLAY PAUSED — LINK LIVE")
+            self.paused_banner.setStyleSheet(
+                "background:%s; color:#ffffff; border-radius:4px;" % COL_WARN
+            )
+            self.append_event(
+                "Display PAUSED — packets still arriving and still being "
+                "logged; only the screen is frozen."
+            )
+            self.csv_logger.log_note("display paused (logging continues)")
+        else:
+            self.append_event("Display RESUMED — showing all data received "
+                              "while paused.")
+            self.csv_logger.log_note("display resumed")
+            # Draw immediately rather than waiting for the next timer tick, so
+            # the backlog appears the instant the operator asks for it.
+            self._readouts_dirty = True
+            self._render()
+            self.attitude.redraw()
+
+    def on_eject_clicked(self) -> None:
+        """Confirm, then transmit a real ejection command over the radio."""
+        team = self.latest.team_id if self.latest is not None else "UNKNOWN"
+        body = EJECT_COMMAND_BODY
+        frame_text = build_frame(body)
+
+        if not self.is_connected:
+            QMessageBox.warning(
+                self, "Not connected",
+                "The radio link is closed, so nothing can be transmitted.\n\n"
+                "Connect first, then retry."
+            )
+            self.append_event("EJECT aborted: link not connected.")
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Confirm payload ejection")
+        box.setText("Send EJECT command to %s?" % team)
+        box.setInformativeText(
+            "This transmits %s to the flight computer over the radio.\n"
+            "This cannot be undone.\n\n"
+            "Note: the flight firmware does not yet listen for commands, so "
+            "this will be transmitted but is not expected to actuate anything "
+            "until that firmware exists." % frame_text
+        )
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        box.setDefaultButton(QMessageBox.Cancel)   # never fire on a stray Enter
+        box.button(QMessageBox.Yes).setText("SEND EJECT")
+        if box.exec_() != QMessageBox.Yes:
+            self.append_event("EJECT cancelled by operator.")
+            self.csv_logger.log_note("EJECT cancelled by operator")
+            return
+
+        payload = frame_text.encode("ascii")
+        queued = self.serial_worker.send_command(payload, "EJECT")
+        stamp = datetime.now().isoformat(timespec="milliseconds")
+        if not queued:
+            self.append_event("EJECT NOT SENT — link closed at %s" % stamp)
+            self.csv_logger.log_note("EJECT not sent: link closed")
+            return
+        # Audit trail: the exact payload, before the radio has said anything.
+        self.append_event("EJECT command queued at %s: %s" % (stamp, frame_text))
+        self.csv_logger.log_note("EJECT command queued: %s" % frame_text)
+
+    def on_command_sent(self, ok: bool, detail: str) -> None:
+        """Report what actually went out of the serial port."""
+        if ok:
+            self.append_event("UPLINK WRITTEN — %s" % detail)
+            self.csv_logger.log_note("uplink written: %s" % detail)
+        else:
+            self.append_event("UPLINK FAILED — %s" % detail)
+            self.csv_logger.log_note("uplink failed: %s" % detail)
+
+    def on_transmit_status(self, frame_id: int, status: int) -> None:
+        """0x8B from the radio: did the far end acknowledge?"""
+        if status == 0x00:
+            text = "delivered (radio acknowledged)"
+        else:
+            text = "NOT delivered, status 0x%02X (no ack from the far radio)" % status
+        self.append_event("UPLINK STATUS frame_id=%d: %s" % (frame_id, text))
+        self.csv_logger.log_note(
+            "uplink status frame_id=%d status=0x%02X" % (frame_id, status))
+
+    def _on_antenna_changed(self, text: str) -> None:
+        """Record a manual antenna-path change in the event log and CSV notes.
+
+        The selection is operator-supplied, so its only value is as an audit
+        note tying a session's RSSI figures to the hardware that produced them.
+        """
+        self.append_event("Antenna path set to %s (manual label)" % text)
+        self.csv_logger.log_note("antenna path: %s (manual)" % text)
+
     def _set_stale_banner(self, stale: Optional[bool]) -> None:
         if stale is None:
             self.stale_banner.setText("AWAITING TELEMETRY")
@@ -2106,7 +2484,7 @@ class Dashboard(QMainWindow):
         else:
             self.stale_banner.setText("LINK NOMINAL")
             self.stale_banner.setStyleSheet(
-                "background:#12351f; color:%s; border-radius:4px;" % COL_OK
+                "background:%s; color:#ffffff; border-radius:4px;" % COL_OK
             )
 
     @staticmethod
@@ -2246,7 +2624,11 @@ class Dashboard(QMainWindow):
             event.accept()
 
 
-def apply_dark_palette(app: QApplication) -> None:
-    """Apply the Fusion style + dark stylesheet at application level."""
+def apply_daylight_palette(app: QApplication) -> None:
+    """Apply the Fusion style + daylight stylesheet at application level."""
     app.setStyle("Fusion")
-    app.setStyleSheet(DARK_QSS)
+    app.setStyleSheet(DAYLIGHT_QSS)
+
+
+#: Kept so existing imports keep working after the dark -> daylight rename.
+apply_dark_palette = apply_daylight_palette

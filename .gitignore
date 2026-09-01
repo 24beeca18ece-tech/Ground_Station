@@ -27,6 +27,10 @@ __pycache__/
 logs/*.csv
 logs/*.log
 logs/*.txt
+# Append-only companion of an in-progress flight CSV, and the temp file the
+# atomic newest-first rewrite swaps in. Both are runtime state, never source.
+logs/*.journal
+logs/*.tmp
 
 # --- LaTeX build artefacts ---------------------------------------------------
 # docs/*.tex and the compiled docs/*.pdf are tracked deliverables; everything

@@ -103,7 +103,7 @@ def _build_two_sided_shader():
     That is a *single fixed light direction* with no two-sided term, and every
     face pointing away from it is multiplied by 0.2.  As the vehicle rotates,
     whichever faces swing away from that one light drop to 20 % brightness --
-    which against the #161d27 panel is indistinguishable from the background.
+    which against the panel background is indistinguishable from it.
     Small parts (nose cone, thin fins) vanish first, which is precisely the
     "visible at rest, gone once it starts moving" symptom.
 
@@ -114,7 +114,12 @@ def _build_two_sided_shader():
     an outward-wound one -- geometry winding mistakes can no longer make a part
     invisible.
     """
-    ambient, diffuse = 0.55, 0.45
+    # Daylight theme: the floor stays well clear of zero (which is what made
+    # the stock shader lose parts mid-rotation) but is lower than the dark
+    # theme's 0.55, because on a LIGHT background a deeper shadow increases
+    # contrast rather than swallowing the part. shade never exceeds 1.0, so
+    # colours are only ever darkened -- a dark model cannot wash out.
+    ambient, diffuse = 0.45, 0.55
 
     # pyqtgraph switched its GLSL from the legacy fixed-pipeline style to
     # explicit uniforms/attributes.  Match whichever this install uses, or the
@@ -230,19 +235,23 @@ BIAS_ACCEL_LO, BIAS_ACCEL_HI = 0.85, 1.15
 BIAS_SETTLE_SAMPLES = 60
 
 # Palette, matched to dashboard_ui.py.
-COL_PANEL = "#161d27"
-COL_TEXT = "#dbe3ee"
-COL_TEXT_DIM = "#8b9aad"
-COL_ACCENT = "#4aa8ff"
-COL_GRID = "#2b3746"
-COL_BODY = "#c8d2e0"
-COL_NOSE = "#e8384f"
-COL_FIN = "#4aa8ff"
+COL_PANEL = "#e9edf3"   # daylight: light plot ground
+COL_TEXT = "#0d1520"
+COL_TEXT_DIM = "#41506a"
+COL_ACCENT = "#0a4fa8"
+COL_GRID = "#5b6a80"
+COL_BODY = "#46566e"   # was pale grey for a dark panel
+COL_NOSE = "#c0182b"
+COL_FIN = "#0a4fa8"
 
 # Axis colours: X red, Y green, Z blue (standard aerospace/graphics convention).
-AXIS_COLORS = ((0.92, 0.30, 0.32, 1.0),
-               (0.34, 0.80, 0.42, 1.0),
-               (0.32, 0.62, 0.95, 1.0))
+#: World axis colours, X/Y/Z. These are the same red/green/blue as the
+#: accelerometer and gyro chart traces (dashboard_ui.COL_XYZ), so an axis in the
+#: 3D view and its trace on a chart are visibly the same channel. Darkened from
+#: the dark theme's values, which were too light to read on a light ground.
+AXIS_COLORS = ((0.812, 0.122, 0.180, 1.0),   # X - #cf1f2e
+               (0.106, 0.592, 0.196, 1.0),   # Y - #1b9732
+               (0.051, 0.286, 0.639, 1.0))   # Z - #0d49a3
 
 
 # ---------------------------------------------------------------------------
@@ -594,13 +603,13 @@ ROCKET_FIN_COUNT = 4
 GROUND_Z = -2.15
 
 # Model palette.  The reference airframe's nose and fins are black, but pure
-# black on the #161d27 panel is unreadable, so they are rendered as a graphite
+# black on the panel is hard to separate, so they are rendered as a graphite
 # that still reads as "black hardware" against the orange tube.
 _C_BODY_ORANGE = (0.91, 0.38, 0.10, 1.0)
-_C_GRAPHITE = (0.34, 0.35, 0.39, 1.0)
-_C_CANSAT_BODY = (0.72, 0.76, 0.83, 1.0)
+_C_GRAPHITE = (0.24, 0.26, 0.31, 1.0)      # deeper, to read on light
+_C_CANSAT_BODY = (0.36, 0.43, 0.54, 1.0)   # darkened for a light background
 _C_CANSAT_CAP = (0.91, 0.22, 0.31, 1.0)
-_C_CANSAT_BASE = (0.24, 0.29, 0.36, 1.0)
+_C_CANSAT_BASE = (0.18, 0.22, 0.29, 1.0)
 
 
 def build_rocket_parts():
@@ -709,8 +718,8 @@ class _AttitudeFallbackView(QWidget):
         painter.translate(0.0, offset)
 
         big = radius * 3.0
-        painter.fillRect(QRectF(-big, -big, 2 * big, big), QColor("#1e4b73"))   # sky
-        painter.fillRect(QRectF(-big, 0.0, 2 * big, big), QColor("#4a3520"))    # ground
+        painter.fillRect(QRectF(-big, -big, 2 * big, big), QColor("#3f7fbc"))   # sky
+        painter.fillRect(QRectF(-big, 0.0, 2 * big, big), QColor("#8a6234"))    # ground
         painter.setPen(QPen(QColor(COL_TEXT), 2))
         painter.drawLine(int(-big), 0, int(big), 0)
 
@@ -799,7 +808,7 @@ class AttitudeWidget(QWidget):
                 # Sits just under the fin trailing edge so the vehicle stands
                 # on the ground plane instead of sinking through it.
                 grid.translate(0, 0, GROUND_Z)
-                grid.setColor(QColor(60, 76, 96, 190))
+                grid.setColor(QColor(70, 86, 108, 215))
                 view.addItem(grid)
 
                 # World axes at the origin: X red, Y green, Z blue (up).
@@ -1047,15 +1056,15 @@ class AttitudeWidget(QWidget):
         if not self.ref_btn.isChecked():
             # Pure gyro: orientation is 1:1 with the telemetry body rates.
             self.ref_btn.setText("GYRO")
-            style = "color:#0b1219; background:#8b9aad;"
+            style = "color:#ffffff; background:#41506a;"
         elif locked:
             # Filter on and the accelerometer is inside the 1 g gate.
             self.ref_btn.setText("G-LOCK")
-            style = "color:#0b1219; background:#35c46b;"
+            style = "color:#ffffff; background:#0d7a3d;"
         else:
             # Filter on but coasting: accelerometer outside the gate.
             self.ref_btn.setText("ACC REF")
-            style = "color:#0b1219; background:#e9c135;"
+            style = "color:#ffffff; background:#a05000;"
         self.ref_btn.setStyleSheet(
             style + " border-radius:3px; padding:2px 4px; font-weight:700;"
         )
