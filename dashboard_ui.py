@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -119,7 +119,7 @@ EJECT_COMMAND_BODY = "CMD,EJECT"
 #: Ground receive antennas in the SIMO diversity setup. This is a MANUAL
 #: selection, not telemetry: see the note on the combo's tooltip. Kept as a
 #: list so adding a third element later is a one-line change.
-ANTENNA_PATHS = ["WHIP / DIPOLE", "PATCH", "BOTH (COMBINED)", "UNSPECIFIED"]
+ANTENNA_PATHS = ["WHIP", "PATCH", "BOTH", "UNSET"]
 
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
@@ -183,11 +183,14 @@ COL_VOLT = "#0d7a3d"   # green
 COL_XYZ = ("#cf1f2e", "#1b9732", "#0d49a3")  # X, Y, Z
 
 # Vehicle-specific payload colours.
-# The PM triad shares one chart, so it gets the same lightness-laddering as
-# X/Y/Z: teal lightest, ochre middle, dark red darkest.
-COL_PM1 = "#07909e"    # SPS30 PM1.0  - teal
-COL_PM25 = "#ae4e00"   # SPS30 PM2.5  - ochre
-COL_PM10 = "#9a1222"   # SPS30 PM10   - dark red
+# Four PM lines share one chart, so they get the same treatment as X/Y/Z:
+# separated by hue AND stepped in lightness, so they stay distinguishable when
+# sun glare flattens saturation. Solved numerically against the plot ground --
+# see tools/pm_colours.py for the check that every pair clears 1.35:1.
+COL_PM1 = "#0894a2"    # SPS30 PM1.0  - teal      (lightest)
+COL_PM25 = "#138128"   # SPS30 PM2.5  - green
+COL_PM4 = "#944200"    # SPS30 PM4.0  - ochre
+COL_PM10 = "#8d0e19"   # SPS30 PM10   - dark red  (darkest)
 COL_WHEEL = "#6a3fbe"  # reaction wheel RPM - violet
 
 # Chart interior. Deliberately NOT pure white: a white plot under sun becomes a
@@ -244,8 +247,15 @@ QPushButton#connectBtn[connected="true"] {{
 QPushButton#connectBtn[connected="false"] {{
     background-color: #0d7a3d; border-color: #0a5c2e; color: #ffffff;
 }}
-QPushButton#pauseBtn[paused="true"] {{
+/* Telemetry ingest control. Green to start (the go action, matching CONNECT),
+   amber once running because pressing it again stops ingesting. */
+QPushButton#telemetryBtn[running="false"] {{
+    background-color: {COL_OK}; border-color: #0a5c2e; color: #ffffff;
+    font-weight: 700;
+}}
+QPushButton#telemetryBtn[running="true"] {{
     background-color: {COL_WARN}; border-color: #7a3d00; color: #ffffff;
+    font-weight: 700;
 }}
 /* Uplink control. The only button here that transmits, so it is the only one
    that is red at rest rather than red once armed. */
@@ -367,12 +377,20 @@ class ReadoutTile(QFrame):
         layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(0)
 
-        self.caption = QLabel(caption.upper())
+        # The caption is stored in full and re-elided on every resize. A QLabel
+        # with an Ignored size policy is free to be narrower than its text, and
+        # silently cuts it mid-glyph -- which is how several tiles ended up
+        # reading "CORRUPT/RE" and "NAV ALTITU". Eliding degrades to a visible
+        # ellipsis instead, and the full text stays in the tooltip.
+        self._caption_full = caption.upper()
+        self.caption = QLabel(self._caption_full)
         caption_font = QFont()
         caption_font.setPointSize(8)
         caption_font.setBold(True)
         self.caption.setFont(caption_font)
-        self.caption.setStyleSheet("color: %s;" % COL_TEXT_DIM)
+        self._caption_pt = None
+        self._apply_caption_style(self.CAPTION_PT[0])
+        self.caption.setToolTip(self._caption_full)
 
         self.value = QLabel("--")
         value_font = QFont("Consolas")
@@ -391,6 +409,54 @@ class ReadoutTile(QFrame):
 
     def set_value(self, text: str) -> None:
         self.value.setText("%s %s" % (text, self._unit) if self._unit else text)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Re-elide the caption to whatever width the tile now has."""
+        super().resizeEvent(event)
+        self._elide_caption()
+
+    #: Caption point sizes to try, largest first, before falling back to
+    #: eliding. One step is enough to rescue a caption that overruns by a few
+    #: pixels; anything longer than that genuinely needs a shorter name.
+    CAPTION_PT = (8, 7)
+
+    def _elide_caption(self) -> None:
+        avail = max(self.caption.width() - 2, 10)
+        for size in self.CAPTION_PT:
+            probe = QFont(self.caption.font())
+            probe.setPointSize(size)
+            probe.setBold(True)
+            # Metrics come from a QFont built to match, because
+            # QWidget.fontMetrics() reports the old font until Qt processes the
+            # change -- checking it here would always test the previous size.
+            if QFontMetrics(probe).horizontalAdvance(self._caption_full) <= avail:
+                self._apply_caption_style(size)
+                self.caption.setText(self._caption_full)
+                return
+        smallest = self.CAPTION_PT[-1]
+        self._apply_caption_style(smallest)
+        probe = QFont(self.caption.font())
+        probe.setPointSize(smallest)
+        probe.setBold(True)
+        self.caption.setText(
+            QFontMetrics(probe).elidedText(
+                self._caption_full, Qt.ElideRight, avail)
+        )
+
+    def _apply_caption_style(self, point_size: int) -> None:
+        """Set the caption's size via its stylesheet.
+
+        The application stylesheet sets a font-size on QWidget, which beats
+        anything passed to setFont(). Writing font-size into this widget's own
+        stylesheet is the level that actually takes effect.
+        """
+        if getattr(self, "_caption_pt", None) == point_size:
+            return
+        self._caption_pt = point_size
+        self.caption.setStyleSheet(
+            "color: %s; font-size: %dpt; font-weight: 700;"
+            % (COL_TEXT_DIM, point_size)
+        )
 
     def set_level(self, level: str) -> None:
         color = self.LEVEL_COLORS.get(level, self._base_color)
@@ -821,6 +887,17 @@ class GpsTrackPlot(pg.PlotWidget):
         self.setLabel("left", "latitude", units="°", color=COL_TEXT_DIM)
         self.setLabel("bottom", "longitude", units="°", color=COL_TEXT_DIM)
         self.showGrid(x=True, y=True, alpha=GRID_ALPHA)
+        # A stationary vehicle spans ~1e-6 degrees, so pyqtgraph labels every
+        # tick to 8 significant figures. A smaller tick font buys back some
+        # room; the exact position is on the LATITUDE / LONGITUDE tiles above,
+        # so this axis only has to convey the shape and scale of the track.
+        # (setTickDensity was tried here and made the latitude axis denser
+        # rather than sparser, so it is deliberately not used.)
+        tick_font = QFont()
+        tick_font.setPointSize(7)
+        for axis_name in ("bottom", "left"):
+            self.getAxis(axis_name).setStyle(
+                tickFont=tick_font, tickTextOffset=3, autoExpandTextSpace=True)
         self.setMenuEnabled(False)
         self.setMinimumHeight(118)
         self.setFocusPolicy(Qt.NoFocus)   # see StripChart: keeps the column put
@@ -899,9 +976,11 @@ class Dashboard(QMainWindow):
         self.logging_enabled = False
         self.is_connected = False
         self._readouts_dirty = False
-        #: True while the live display is frozen. Data ingestion, chart
-        #: accumulation and CSV logging are unaffected -- only repainting stops.
-        self.display_paused = False
+        #: True once the operator has pressed START TELEMETRY. Deliberately
+        #: False at launch: connecting the port and ingesting telemetry are
+        #: separate decisions, so a link can be opened and checked before the
+        #: dashboard starts consuming what comes over it.
+        self.telemetry_active = False
         self._was_stale = False
         self._last_fsm: Optional[int] = None
         #: PAYLOAD_TYPE seen in the stream; drives the auto-detected panel.
@@ -1195,9 +1274,6 @@ class Dashboard(QMainWindow):
         right.setSpacing(6)
         right.addWidget(self._build_gps_panel())
         right.addWidget(self._build_link_panel())
-        # The gap below LINK STATUS: with a payload page expanded, the left
-        # column runs to the bottom while this one still has spare stretch.
-        right.addWidget(self._build_command_panel())
         right.addStretch(1)
 
         col_a.setMinimumWidth(286)
@@ -1214,7 +1290,20 @@ class Dashboard(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(560)
         self._left_scroll = scroll
-        return scroll
+
+        # START/STOP TELEMETRY and EJECT PAYLOAD are pinned BELOW the scroll
+        # area, not inside it. A CanSat payload page pushes the scrolled
+        # content past 800 px, which put these below the fold at every window
+        # size that was tested -- and a control that stops ingesting telemetry
+        # is not something an operator should have to scroll to find.
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        outer.addWidget(scroll, 1)
+        outer.addWidget(self._build_command_panel(), 0)
+        wrapper.setMinimumWidth(560)
+        return wrapper
 
     def _build_fsm_banner(self) -> QWidget:
         box = QGroupBox("FLIGHT STATE")
@@ -1267,7 +1356,7 @@ class Dashboard(QMainWindow):
         A ``QStackedWidget`` rather than show/hide so the layout height stays
         constant when the vehicle changes -- nothing below it jumps around.
         """
-        self.payload_box = QGroupBox("PAYLOAD — waiting for telemetry")
+        self.payload_box = QGroupBox("SCIENTIFIC PAYLOAD")
         outer = QVBoxLayout(self.payload_box)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
@@ -1335,11 +1424,14 @@ class Dashboard(QMainWindow):
         air_row.setSpacing(6)
         self.tile_pm1 = ReadoutTile("PM1.0", "", COL_PM1, value_pt=13)
         self.tile_pm25 = ReadoutTile("PM2.5", "", COL_PM25, value_pt=13)
+        self.tile_pm4 = ReadoutTile("PM4.0", "", COL_PM4, value_pt=13)
         self.tile_pm10 = ReadoutTile("PM10", "", COL_PM10, value_pt=13)
-        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm10):
-            # Equal stretch and a small floor: three tiles must share the
-            # column width evenly without the last one being clipped.
-            tile.setMinimumWidth(56)
+        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm4,
+                     self.tile_pm10):
+            # Equal stretch and a small floor: four tiles now share the column
+            # width evenly without the last one being clipped. The floor comes
+            # down from 56 because there is one more of them.
+            tile.setMinimumWidth(44)
             air_row.addWidget(tile, 1)
         layout.addLayout(air_row)
 
@@ -1348,7 +1440,8 @@ class Dashboard(QMainWindow):
         # point of flying it is the concentration profile through the descent.
         self.chart_pm = StripChart(
             "Particulates", "µg/m³",
-            [("PM1.0", COL_PM1), ("PM2.5", COL_PM25), ("PM10", COL_PM10)],
+            [("PM1.0", COL_PM1), ("PM2.5", COL_PM25),
+             ("PM4.0", COL_PM4), ("PM10", COL_PM10)],
             legend=False,   # the colour-matched tiles above are the legend
             min_y_span=10.0,
         )
@@ -1360,7 +1453,7 @@ class Dashboard(QMainWindow):
         # --- reaction wheel -------------------------------------------------
         wheel_row = QHBoxLayout()
         wheel_row.setSpacing(6)
-        self.tile_wheel = ReadoutTile("Reaction wheel", "RPM", COL_WHEEL, value_pt=15)
+        self.tile_wheel = ReadoutTile("Wheel RPM", "RPM", COL_WHEEL, value_pt=15)
         self.tile_wheel.setToolTip(
             "Active stabilisation reaction wheel speed.\n"
             "Signed: sign indicates spin direction. Saturates at ±1124 RPM."
@@ -1434,7 +1527,7 @@ class Dashboard(QMainWindow):
         return page
 
     def _build_gps_panel(self) -> QWidget:
-        box = QGroupBox("GNSS / NavIC")
+        box = QGroupBox("GNSS")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1443,12 +1536,12 @@ class Dashboard(QMainWindow):
         grid.setSpacing(6)
         self.tile_lat = ReadoutTile("Latitude", "", COL_TEXT, value_pt=13)
         self.tile_lon = ReadoutTile("Longitude", "", COL_TEXT, value_pt=13)
-        self.tile_nav_alt = ReadoutTile("Nav altitude", "m", COL_TEXT, value_pt=13)
-        self.tile_nav_time = ReadoutTile("Nav time", "", COL_TEXT, value_pt=13)
+        self.tile_nav_alt = ReadoutTile("GNSS alt", "m", COL_TEXT, value_pt=13)
         grid.addWidget(self.tile_lat, 0, 0)
         grid.addWidget(self.tile_lon, 0, 1)
-        grid.addWidget(self.tile_nav_alt, 1, 0)
-        grid.addWidget(self.tile_nav_time, 1, 1)
+        # NAV TIME removed: with it gone, GNSS altitude takes the whole row and
+        # its value no longer has to share a half-width tile.
+        grid.addWidget(self.tile_nav_alt, 1, 0, 1, 2)
         layout.addLayout(grid)
 
         # Kept close to square: a ground track stretched vertically
@@ -1460,7 +1553,7 @@ class Dashboard(QMainWindow):
         return box
 
     def _build_command_panel(self) -> QWidget:
-        """Display freeze and uplink, in the spare space below LINK STATUS.
+        """Session controls: telemetry ingest and the uplink command.
 
         Deliberately not on the connection bar. That bar was already at its
         width limit, and more importantly EJECT transmits: it belongs somewhere
@@ -1471,8 +1564,8 @@ class Dashboard(QMainWindow):
         # none to spare. A thin rule separates the section instead.
         box = QWidget()
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 3, 0, 0)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(3)
 
         rule = QFrame()
         rule.setFrameShape(QFrame.HLine)
@@ -1480,17 +1573,19 @@ class Dashboard(QMainWindow):
         rule.setStyleSheet("background: %s; border: none;" % COL_BORDER)
         layout.addWidget(rule)
 
-        self.pause_btn = QPushButton("PAUSE TELEMETRY")
-        self.pause_btn.setObjectName("pauseBtn")
-        self.pause_btn.setProperty("paused", "false")
-        self.pause_btn.setToolTip(
-            "Freeze the live display so a value can be read without it moving.\n\n"
-            "This does NOT disconnect the radio and does NOT stop logging:\n"
-            "packets keep arriving, keep filling the charts and keep being\n"
-            "written to the CSV. Only the repaint is suspended, so resuming\n"
-            "shows everything that arrived while it was frozen."
+        self.telemetry_btn = QPushButton("START TELEMETRY")
+        self.telemetry_btn.setObjectName("telemetryBtn")
+        self.telemetry_btn.setProperty("running", "false")
+        self.telemetry_btn.setToolTip(
+            "Start or stop ingesting telemetry.\n\n"
+            "Separate from CONNECT: the port can be open and delivering\n"
+            "packets while this is stopped, and nothing is charted,\n"
+            "logged or fed to the attitude estimator until you press\n"
+            "START. Stopping does not disconnect -- packets on the wire\n"
+            "are simply ignored.\n\n"
+            "Link Status keeps showing packet rate and age either way, so\n"
+            "you can confirm the radio is delivering before you start."
         )
-
 
         self.eject_btn = QPushButton("EJECT PAYLOAD")
         self.eject_btn.setObjectName("ejectBtn")
@@ -1504,10 +1599,10 @@ class Dashboard(QMainWindow):
             "yet."
         )
         # Stacked, not side by side: this column is ~254 px wide, and two
-        # buttons sharing that clip "RESUME TELEMETRY" and "EJECT PAYLOAD".
+        # buttons sharing that clip "START TELEMETRY" and "EJECT PAYLOAD".
         # Full width each also gives EJECT a deliberately large target that is
         # hard to hit by accident on the way to something else.
-        for button in (self.pause_btn, self.eject_btn):
+        for button in (self.telemetry_btn, self.eject_btn):
             button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             button.setMinimumHeight(29)
             layout.addWidget(button)
@@ -1522,13 +1617,31 @@ class Dashboard(QMainWindow):
         self.tile_rate = ReadoutTile("Packet rate", "pkt/s", COL_ACCENT, value_pt=15)
         self.tile_age = ReadoutTile("Packet age", "s", COL_TEXT, value_pt=15)
         self.tile_total = ReadoutTile("Valid/Total", "", COL_TEXT, value_pt=15)
-        self.tile_corrupt = ReadoutTile("Corrupt/Reject/API", "", COL_TEXT, value_pt=15)
+        self.tile_corrupt = ReadoutTile("Corrupt/Rej", "", COL_TEXT, value_pt=15)
+        self.tile_corrupt.setToolTip(
+            "Three independent failure counters, shown as C/R/A:\n\n"
+            "  C  CORRUPT  - telemetry XOR checksum failed (bad RF hop)\n"
+            "  R  REJECTED - checksum passed but a value is physically\n"
+            "               impossible (bad sensor)\n"
+            "  A  API      - the radio's own frame checksum failed (bad\n"
+            "               serial link to the XBee)\n\n"
+            "They are kept apart because each points at a different layer."
+        )
 
         # RSSI is REAL data: the 802.15.4 0x80/0x81 receive frame carries the
         # signal strength of that packet. It is the strength at the module's
         # single RF port, so it describes the whole receive path, not one
         # antenna of the pair.
-        self.tile_rssi = ReadoutTile("Signal (RSSI)", "dBm", COL_TEXT, value_pt=15)
+        self.tile_rssi = ReadoutTile("Signal", "dBm", COL_TEXT, value_pt=15)
+        self.tile_rssi.setToolTip(
+            "RSSI of the most recent received packet, in dBm.\n\n"
+            "Read from the RSSI byte the radio puts in every 0x80/0x81 receive\n"
+            "frame -- real per-packet hardware data, not an estimate. Shows --\n"
+            "when the link delivers 0x90 frames, which carry no RSSI field.\n\n"
+            "Typical XBee 3 PRO: about -30 dBm touching, -100 dBm at the noise\n"
+            "floor. This is the strength at the module's single RF port, so it\n"
+            "covers the whole receive path, not one antenna of the pair."
+        )
 
         # Antenna path is MANUAL. See ANTENNA_PATHS below for why.
         antenna_box = QFrame()
@@ -1539,12 +1652,15 @@ class Dashboard(QMainWindow):
         ant_layout = QVBoxLayout(antenna_box)
         ant_layout.setContentsMargins(8, 3, 8, 3)
         ant_layout.setSpacing(0)
-        ant_caption = QLabel("ANTENNA (MANUAL)")
+        ant_caption = QLabel("ANTENNA")
         ant_font = QFont()
         ant_font.setPointSize(8)
         ant_font.setBold(True)
         ant_caption.setFont(ant_font)
-        ant_caption.setStyleSheet("color: %s; border: none;" % COL_TEXT_DIM)
+        ant_caption.setStyleSheet(
+            "color: %s; border: none; font-size: 8pt; font-weight: 700;"
+            % COL_TEXT_DIM
+        )
         # Same trick the readout tiles use: a QLabel otherwise reports its full
         # text width as a hard minimum, which is what starved the RSSI tile
         # beside it down to 19 px.
@@ -1578,17 +1694,17 @@ class Dashboard(QMainWindow):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
-        # Display-frozen banner. Deliberately distinct from the stale/alert
-        # banner: an operator must never confuse "I paused the screen" with
-        # "the link died".
-        self.paused_banner = QLabel("")
-        self.paused_banner.setAlignment(Qt.AlignCenter)
-        paused_font = QFont()
-        paused_font.setPointSize(12)
-        paused_font.setBold(True)
-        self.paused_banner.setFont(paused_font)
-        self.paused_banner.setMinimumHeight(28)
-        self.paused_banner.setVisible(False)
+        # Telemetry-stopped banner. Deliberately distinct from the stale/alert
+        # banner: an operator must never confuse "I have not started ingesting"
+        # with "the link died".
+        self.telemetry_banner = QLabel("")
+        self.telemetry_banner.setAlignment(Qt.AlignCenter)
+        banner_font = QFont()
+        banner_font.setPointSize(12)
+        banner_font.setBold(True)
+        self.telemetry_banner.setFont(banner_font)
+        self.telemetry_banner.setMinimumHeight(28)
+        self.telemetry_banner.setVisible(True)
 
         self.stale_banner = QLabel("")
         self.stale_banner.setAlignment(Qt.AlignCenter)
@@ -1599,8 +1715,11 @@ class Dashboard(QMainWindow):
         self.stale_banner.setMinimumHeight(28)
         # Rows 0-2 are tiles; the two banners sit below them. stale_banner used
         # to be row 2, which silently painted over the RSSI row added there.
+        # Both banners occupy the same row: only one is ever shown, because
+        # "I have not started ingesting" and "the link went quiet" are never
+        # both the headline at the same moment.
         grid.addWidget(self.stale_banner, 3, 0, 1, 2)
-        grid.addWidget(self.paused_banner, 4, 0, 1, 2)
+        grid.addWidget(self.telemetry_banner, 3, 0, 1, 2)
 
         self.tile_total.set_value("0/0")
         self.tile_corrupt.set_value("0/0/0")
@@ -1785,7 +1904,10 @@ class Dashboard(QMainWindow):
         self.connect_btn.clicked.connect(self.toggle_connection)
         self.log_btn.clicked.connect(self.toggle_logging)
         self.clear_btn.clicked.connect(self.clear_session)
-        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.telemetry_btn.clicked.connect(self.toggle_telemetry)
+        # Start stopped, and show it: the banner and the green START label are
+        # set through the same path a button press uses.
+        self._apply_telemetry_state()
         self.eject_btn.clicked.connect(self.on_eject_clicked)
         self.diag_btn.clicked.connect(self.toggle_diagnostics)
         self.csv_table_btn.clicked.connect(self.toggle_csv_table)
@@ -1887,27 +2009,30 @@ class Dashboard(QMainWindow):
     def on_packet(self, packet: TelemetryPacket) -> None:
         """Store one validated packet.  No widget is touched here — see _render."""
         try:
-            self.latest = packet
-            self.session_packets += 1
 
             # Raw wire view and the diagnostics table. Both are plain setText
             # work; the table is skipped entirely while its window is hidden so
             # a closed diagnostics view costs nothing here.
             #
-            # DISPLAY PAUSE: these two are the only widget writes that happen
-            # on the packet itself rather than on the render timer, so they are
-            # the only ones that have to be gated here. Everything below --
-            # chart data, the attitude estimator, the session summary, the
-            # counters and the CSV write -- runs exactly as normal, which is
-            # what makes a pause lossless.
-            if not self.display_paused:
-                self.raw_strip.show_packet(packet.raw_frame)
-                if self.diagnostics.isVisible():
-                    self.diagnostics.update_packet(
-                        packet, voltage_warn=float(self.volt_spin.value())
-                    )
+            # Link liveness is recorded either way: it describes the wire, not
+            # the telemetry, and keeps PACKET RATE / PACKET AGE truthful (and
+            # TELEMETRY STALE quiet) while ingestion is deliberately stopped.
             self.last_packet_epoch = packet.gs_recv_epoch
             self.recv_times.append(packet.gs_recv_epoch)
+
+            # STOPPED: ignore the packet entirely. Nothing is charted, logged,
+            # or fed to the attitude estimator -- the packet is dropped here.
+            if not self.telemetry_active:
+                return
+
+            self.latest = packet
+            self.session_packets += 1
+
+            self.raw_strip.show_packet(packet.raw_frame)
+            if self.diagnostics.isVisible():
+                self.diagnostics.update_packet(
+                    packet, voltage_warn=float(self.volt_spin.value())
+                )
 
             # One shared x-axis value for every chart on this packet.
             x = self._plot_time(packet)
@@ -1936,6 +2061,7 @@ class Dashboard(QMainWindow):
                 self.chart_pm.add_point(x, {
                     "PM1.0": packet.pm1_0,
                     "PM2.5": packet.pm2_5,
+                    "PM4.0": packet.pm4_0,
                     "PM10": packet.pm10,
                 })
 
@@ -2015,9 +2141,9 @@ class Dashboard(QMainWindow):
     def on_bad_frame(self, raw: str, reason: str) -> None:
         """A frame failed checksum or parsing — always archived, never fatal."""
         # Still show the bytes: during bring-up, seeing corrupt traffic is far
-        # more informative than seeing nothing -- unless the display is frozen,
-        # in which case a corrupt frame must not move it either.
-        if not self.display_paused:
+        # more informative than seeing nothing -- but not while ingestion is
+        # stopped, when nothing else on screen is moving either.
+        if self.telemetry_active:
             self.raw_strip.show_corrupt(raw)
         # Errors are logged unconditionally so a corrupted-link investigation
         # still has data even if CSV logging was never switched on.
@@ -2030,7 +2156,7 @@ class Dashboard(QMainWindow):
         under its own tag so it reads differently from a corrupt frame at a
         glance. Deliberately not plotted and not sent to the attitude widget.
         """
-        if not self.display_paused:
+        if self.telemetry_active:
             self.raw_strip.show_rejected(raw)
         self.csv_logger.log_error(raw, reason)
 
@@ -2061,12 +2187,6 @@ class Dashboard(QMainWindow):
     def _render(self) -> None:
         """Repaint readouts and charts at a fixed rate, independent of RX rate."""
         try:
-            # Frozen display: data keeps accumulating in the charts and the CSV
-            # keeps being written; only the repaint is suspended. _readouts_dirty
-            # is deliberately left set, so the first render after RESUME draws
-            # everything that arrived while paused in one pass.
-            if self.display_paused:
-                return
             if self._readouts_dirty:
                 self._readouts_dirty = False
                 self._update_readouts()
@@ -2124,7 +2244,6 @@ class Dashboard(QMainWindow):
         self.tile_lat.set_value(self._fmt(packet.lat, 6))
         self.tile_lon.set_value(self._fmt(packet.lon, 6))
         self.tile_nav_alt.set_value(self._fmt(packet.nav_alt_m, 1))
-        self.tile_nav_time.set_value(packet.nav_time or "--")
         self.tile_lat.set_level("normal" if packet.has_fix else "warn")
         self.tile_lon.set_level("normal" if packet.has_fix else "warn")
 
@@ -2188,6 +2307,7 @@ class Dashboard(QMainWindow):
             connected=self.is_connected, stale_after=STALE_AFTER_S,
             rejected=self.rejected_packets,
             api_errors=self.api_frame_errors,
+            rssi_dbm=self.serial_worker.last_rssi_dbm,
         )
 
     def _apply_payload_panel(self) -> None:
@@ -2203,30 +2323,27 @@ class Dashboard(QMainWindow):
             payload = self._detected_payload or ""
             source = "auto"
 
+        # The panel is named for what it shows -- the science instruments --
+        # rather than for the vehicle. The vehicle is already stated on the
+        # attitude panel, and the page switch below still follows it.
         if payload == PAYLOAD_CANSAT:
             self.payload_stack.setCurrentIndex(1)
-            title = "PAYLOAD — CANSAT"
         elif payload == PAYLOAD_ROCKET:
             self.payload_stack.setCurrentIndex(2)
-            title = "PAYLOAD — ROCKET"
-        elif payload == PAYLOAD_GENERIC:
-            self.payload_stack.setCurrentIndex(0)
-            title = "PAYLOAD — GENERIC (v1)"
         else:
             self.payload_stack.setCurrentIndex(0)
-            title = "PAYLOAD — waiting for telemetry"
-        if source == "manual":
-            title += "  [PINNED]"
-        self.payload_box.setTitle(title)
+        # Pin state is deliberately not shown: it is set in Settings and is not
+        # something an operator needs to re-read off a panel header mid-flight.
+        self.payload_box.setTitle("SCIENTIFIC PAYLOAD")
 
         # The 3D model follows the same resolved choice, so a pinned vehicle is
         # no longer silently overridden by whatever the stream announces.
         if hasattr(self, "attitude"):
             self.attitude.set_vehicle(payload or PAYLOAD_ROCKET)
-            if source == "manual":
-                suffix = "%s  [PINNED]" % (payload or PAYLOAD_ROCKET)
-            elif payload:
-                suffix = "%s  (auto-detected)" % payload
+            # The vehicle-type suffix stays here -- it says which model is on
+            # screen -- but the pin tag is gone, whether pinned or auto.
+            if payload:
+                suffix = payload if source == "manual" else "%s  (auto-detected)" % payload
             else:
                 suffix = "awaiting telemetry"
             self.attitude_box.setTitle("VEHICLE ATTITUDE — %s" % suffix)
@@ -2244,6 +2361,7 @@ class Dashboard(QMainWindow):
         if packet.is_cansat:
             self.tile_pm1.set_value(self._fmt(packet.pm1_0, 1))
             self.tile_pm25.set_value(self._fmt(packet.pm2_5, 1))
+            self.tile_pm4.set_value(self._fmt(packet.pm4_0, 1))
             self.tile_pm10.set_value(self._fmt(packet.pm10, 1))
 
             # WHO 24-hour guideline for PM2.5 is 15 µg/m³; well above that is
@@ -2362,40 +2480,56 @@ class Dashboard(QMainWindow):
                 self.csv_logger.log_note("telemetry recovered")
 
     def _render_attitude(self) -> None:
-        """Attitude repaint tick, suspended while the display is frozen."""
-        if self.display_paused:
+        """Attitude repaint tick. No-op while ingestion is stopped, because
+        nothing new reaches the estimator then."""
+        if not self.telemetry_active:
             return
         self.attitude.redraw()
 
-    def toggle_pause(self) -> None:
-        """Freeze or resume the live display without touching the link."""
-        self.display_paused = not self.display_paused
-        paused = self.display_paused
-        self.pause_btn.setText("RESUME TELEMETRY" if paused else "PAUSE TELEMETRY")
-        self.pause_btn.setProperty("paused", "true" if paused else "false")
-        self.pause_btn.style().unpolish(self.pause_btn)
-        self.pause_btn.style().polish(self.pause_btn)
+    def toggle_telemetry(self) -> None:
+        """Start or stop ingesting telemetry, without touching the link."""
+        self.telemetry_active = not self.telemetry_active
+        self._apply_telemetry_state()
 
-        self.paused_banner.setVisible(paused)
-        if paused:
-            self.paused_banner.setText("DISPLAY PAUSED — LINK LIVE")
-            self.paused_banner.setStyleSheet(
-                "background:%s; color:#ffffff; border-radius:4px;" % COL_WARN
-            )
+        if self.telemetry_active:
             self.append_event(
-                "Display PAUSED — packets still arriving and still being "
-                "logged; only the screen is frozen."
+                "Telemetry STARTED — packets are now being displayed"
+                + (" and logged." if self.logging_enabled else ".")
             )
-            self.csv_logger.log_note("display paused (logging continues)")
-        else:
-            self.append_event("Display RESUMED — showing all data received "
-                              "while paused.")
-            self.csv_logger.log_note("display resumed")
-            # Draw immediately rather than waiting for the next timer tick, so
-            # the backlog appears the instant the operator asks for it.
+            self.csv_logger.log_note("telemetry ingest started")
+            # Draw at once rather than waiting for the next timer tick.
             self._readouts_dirty = True
             self._render()
             self.attitude.redraw()
+        else:
+            self.append_event(
+                "Telemetry STOPPED — link still open; arriving packets are "
+                "ignored, not displayed and not logged."
+            )
+            self.csv_logger.log_note("telemetry ingest stopped")
+
+    def _apply_telemetry_state(self) -> None:
+        """Bring the button and banner into line with ``telemetry_active``.
+
+        Split out so the initial state at start-up goes through exactly the
+        same path as a button press, rather than being set up twice.
+        """
+        running = self.telemetry_active
+        self.telemetry_btn.setText(
+            "STOP TELEMETRY" if running else "START TELEMETRY")
+        self.telemetry_btn.setProperty("running", "true" if running else "false")
+        self.telemetry_btn.style().unpolish(self.telemetry_btn)
+        self.telemetry_btn.style().polish(self.telemetry_btn)
+
+        # The banner is the standing reminder that nothing is being ingested;
+        # it is only interesting while stopped.
+        self.telemetry_banner.setVisible(not running)
+        self.stale_banner.setVisible(running)
+        if not running:
+            self.telemetry_banner.setText("TELEMETRY STOPPED")
+            self.telemetry_banner.setStyleSheet(
+                "background:%s; color:#ffffff; border-radius:4px;" % COL_WARN
+            )
 
     def on_eject_clicked(self) -> None:
         """Confirm, then transmit a real ejection command over the radio."""
@@ -2471,6 +2605,10 @@ class Dashboard(QMainWindow):
         self.csv_logger.log_note("antenna path: %s (manual)" % text)
 
     def _set_stale_banner(self, stale: Optional[bool]) -> None:
+        # The telemetry-stopped banner owns this row while ingestion is off.
+        if not self.telemetry_active:
+            return
+
         if stale is None:
             self.stale_banner.setText("AWAITING TELEMETRY")
             self.stale_banner.setStyleSheet(
@@ -2532,8 +2670,8 @@ class Dashboard(QMainWindow):
 
         # Blank the payload readouts so stale values are not mistaken for live
         # ones while waiting for the next packet.
-        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm10,
-                     self.tile_wheel, self.tile_recovery):
+        for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm4,
+                     self.tile_pm10, self.tile_wheel, self.tile_recovery):
             tile.set_value("--")
             tile.set_level("normal")
         self.light_solenoid.set_state(None)

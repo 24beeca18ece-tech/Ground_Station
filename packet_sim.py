@@ -241,8 +241,8 @@ class MissionSim:
         only a few micrograms/m^3, so the plume is what dominates.
 
         SPS30 channels are *cumulative* mass concentrations, so the sensor can
-        never report PM1.0 > PM2.5 > PM10.  The model builds them additively to
-        guarantee that ordering holds for every sample.
+        never report PM1.0 > PM2.5 > PM4.0 > PM10.  The model builds them
+        additively to guarantee that ordering holds for every sample.
         """
         # Clean-air baseline with slow drift.
         base = 4.0 + 1.5 * math.sin(t / 23.0)
@@ -260,10 +260,11 @@ class MissionSim:
 
         pm1 = base + 0.30 * plume + random.gauss(0.0, 0.4)
         pm25 = pm1 + 3.5 + 0.30 * plume + abs(random.gauss(0.0, 0.5))
-        pm10 = pm25 + 5.0 + 0.40 * plume + abs(random.gauss(0.0, 0.8))
+        pm4 = pm25 + 2.0 + 0.20 * plume + abs(random.gauss(0.0, 0.5))
+        pm10 = pm4 + 3.0 + 0.20 * plume + abs(random.gauss(0.0, 0.8))
 
         clamp = lambda v: max(0.0, min(SPS30_MAX_UGM3, v))  # noqa: E731
-        return clamp(pm1), clamp(pm25), clamp(pm10)
+        return clamp(pm1), clamp(pm25), clamp(pm4), clamp(pm10)
 
     def _reaction_wheel(self, state: int, gyro_z: float) -> int:
         """Reaction-wheel RPM for the CanSat active stabilisation system.
@@ -373,11 +374,11 @@ class MissionSim:
         )
 
         if self.payload_type == PAYLOAD_CANSAT:
-            pm1, pm25, pm10 = self._particulates(t, alt_agl, state)
+            pm1, pm25, pm4, pm10 = self._particulates(t, alt_agl, state)
             rpm = self._reaction_wheel(state, gyro_z)
-            body = "%s,%s,%s,%.2f,%.2f,%.2f,%d,%d" % (
+            body = "%s,%s,%s,%.2f,%.2f,%.2f,%.2f,%d,%d" % (
                 self.team_id, PAYLOAD_CANSAT, common,
-                pm1, pm25, pm10, rpm, self._recovery_stage,
+                pm1, pm25, pm4, pm10, rpm, self._recovery_stage,
             )
             expected = FIELD_COUNT_CANSAT
         elif self.payload_type == PAYLOAD_ROCKET:

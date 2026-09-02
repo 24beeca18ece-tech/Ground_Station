@@ -14,3 +14,12 @@ PyOpenGL>=3.1.6    # 3D attitude view (pyqtgraph.opengl); see note below
 # with QPainter if PyOpenGL is missing or no OpenGL context is available (VMs,
 # RDP sessions, broken GPU drivers), so this dependency is strongly recommended
 # but not strictly required for the dashboard to start.
+
+# --- tooling, NOT needed at runtime -----------------------------------------
+# tools/step_to_mesh.py converts voronoi.step into assets/cansat_mesh.npz using
+# gmsh, which bundles OpenCASCADE and can tessellate a STEP B-rep. The dashboard
+# loads the pre-converted .npz and never imports gmsh, so this is only required
+# if the CAD geometry changes and the mesh has to be regenerated:
+#
+#     pip install gmsh
+#     python tools/step_to_mesh.py 0.012

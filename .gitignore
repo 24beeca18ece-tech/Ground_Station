@@ -51,6 +51,16 @@ logs/*.tmp
 *.ilg
 *.ind
 
+# --- Raw CAD source (NOT tracked) --------------------------------------------
+# voronoi.step is the 12.7 MB AP214 B-rep the CanSat model came from. It is the
+# design source of truth, but it is not what the dashboard loads: the runtime
+# dependency is assets/cansat_mesh.npz (750 KB), baked from it by
+# tools/step_to_mesh.py. Committing the .npz alone means a fresh clone renders
+# the real geometry without gmsh installed, and keeps a 12.7 MB blob out of the
+# history. Keep the .step in the CAD project / shared drive.
+*.step
+*.stp
+
 # --- Project assets (MUST stay tracked) --------------------------------------
 # The header logos in assets/ are source, not generated output. Nothing above
 # excludes them today; this negation is here so that adding a broad rule such

@@ -225,6 +225,7 @@ SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
     ("LINK DIAGNOSTICS", [
         ("rate", "PACKET RATE"),
         ("age", "PACKET AGE"),
+        ("rssi", "SIGNAL (RSSI)"),
         ("valid_total", "VALID/TOTAL"),
         ("corrupt", "CORRUPT (CHECKSUM)"),
         ("rejected", "REJECTED (BOUNDS)"),
@@ -406,7 +407,8 @@ class DiagnosticsWindow(QDialog):
     def update_link(self, rate: float, age: Optional[float], valid: int,
                     total: int, corrupt: int, connected: bool,
                     stale_after: float = 2.0, rejected: int = 0,
-                    api_errors: int = 0) -> None:
+                    api_errors: int = 0,
+                    rssi_dbm: Optional[int] = None) -> None:
         """Refresh the link statistics rows."""
         try:
             self._set("rate", "%.1f pkt/s" % rate,
@@ -430,6 +432,17 @@ class DiagnosticsWindow(QDialog):
             # hop and not at a sensor.
             self._set("api_errors", "%d" % api_errors,
                       COL_ALERT if api_errors else COL_OK)
+            # Same source and thresholds as the Link Status tile, so the two
+            # displays can never disagree. None means the radio has not sent a
+            # frame carrying the field, which is shown as "--" rather than 0.
+            if rssi_dbm is None:
+                self._set("rssi", "--", COL_DIM)
+            else:
+                self._set(
+                    "rssi", "%d dBm" % rssi_dbm,
+                    COL_OK if rssi_dbm > -70
+                    else (COL_WARN if rssi_dbm > -85 else COL_ALERT),
+                )
             self._set("conn", "CONNECTED" if connected else "DISCONNECTED",
                       COL_OK if connected else COL_ALERT)
         except Exception:

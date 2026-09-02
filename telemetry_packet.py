@@ -20,7 +20,8 @@ vehicle-specific sensors appended after ``FSM_STATE``::
 
     $TEAM_ID,PAYLOAD_TYPE,TIMESTAMP,...,FSM_STATE[,<vehicle fields>]*CS
 
-    CANSAT (25 fields)  adds  PM1_0,PM2_5,PM10,REACTION_WHEEL_RPM,RECOVERY_STAGE
+    CANSAT (26 fields)  adds  PM1_0,PM2_5,PM4_0,PM10,REACTION_WHEEL_RPM,
+                              RECOVERY_STAGE   (25-field pre-PM4_0 also read)
     ROCKET (22 fields)  adds  SOLENOID_FIRED,NICHROME_FIRED
 
 * The frame starts at ``$`` and ends at ``*`` followed by exactly two hex digits.
@@ -131,7 +132,16 @@ FIELDS_V2_COMMON: List[str] = [
 ]
 
 #: Sensirion SPS30 particulate payload + active stabilisation + recovery stage.
+#: PM4_0 sits between PM2_5 and PM10, matching the order the SPS30 itself
+#: reports its four mass concentrations in.
 FIELDS_CANSAT_EXTRA: List[str] = [
+    "PM1_0", "PM2_5", "PM4_0", "PM10", "REACTION_WHEEL_RPM", "RECOVERY_STAGE",
+]
+
+#: The CanSat layout before PM4_0 was added. Frames of this width are still
+#: accepted and parsed, with PM4_0 left as NaN -- old logs and any flight
+#: firmware not yet reflashed keep working.
+FIELDS_CANSAT_EXTRA_LEGACY: List[str] = [
     "PM1_0", "PM2_5", "PM10", "REACTION_WHEEL_RPM", "RECOVERY_STAGE",
 ]
 
@@ -141,7 +151,10 @@ FIELDS_ROCKET_EXTRA: List[str] = [
 ]
 
 FIELD_COUNT_V1 = len(FIELDS_V1)                                    # 19
-FIELD_COUNT_CANSAT = len(FIELDS_V2_COMMON) + len(FIELDS_CANSAT_EXTRA)  # 25
+FIELD_COUNT_CANSAT = len(FIELDS_V2_COMMON) + len(FIELDS_CANSAT_EXTRA)  # 26
+#: Pre-PM4_0 CanSat width, still accepted on the wire.
+FIELD_COUNT_CANSAT_LEGACY = (len(FIELDS_V2_COMMON)
+                             + len(FIELDS_CANSAT_EXTRA_LEGACY))  # 25
 FIELD_COUNT_ROCKET = len(FIELDS_V2_COMMON) + len(FIELDS_ROCKET_EXTRA)  # 22
 
 #: Kept for backwards compatibility with code that imported the old name.
@@ -398,6 +411,7 @@ CSV_HEADER: List[str] = [
     # --- vehicle-specific (blank when not applicable) ----------------------
     "pm1_0_ugm3",             # CanSat: Sensirion SPS30
     "pm2_5_ugm3",             # CanSat
+    "pm4_0_ugm3",             # CanSat
     "pm10_ugm3",              # CanSat
     "reaction_wheel_rpm",     # CanSat: active stabilisation
     "recovery_stage",         # CanSat: 0/1/2
@@ -596,6 +610,7 @@ class CanSatPacket(TelemetryPacket):
 
     pm1_0: float = float("nan")
     pm2_5: float = float("nan")
+    pm4_0: float = float("nan")
     pm10: float = float("nan")
     #: Signed: positive is one direction of wheel spin, negative the other.
     reaction_wheel_rpm: int = 0
@@ -612,7 +627,7 @@ class CanSatPacket(TelemetryPacket):
 
     def _variant_cells(self) -> List[Any]:
         return [
-            self.pm1_0, self.pm2_5, self.pm10,
+            self.pm1_0, self.pm2_5, self.pm4_0, self.pm10,
             self.reaction_wheel_rpm,
             self.recovery_stage, self.recovery_stage_name,
             "", "",          # solenoid / nichrome: not fitted to the CanSat
@@ -656,6 +671,9 @@ def _detect_variant(fields: List[str]) -> str:
 
     if token in (PAYLOAD_CANSAT, PAYLOAD_ROCKET):
         expected = expected_field_count(token)
+        # A CanSat frame one field short is the pre-PM4_0 layout, not an error.
+        if token == PAYLOAD_CANSAT and count == FIELD_COUNT_CANSAT_LEGACY:
+            return token
         if count != expected:
             raise PacketParseError(
                 "%s packet: expected %d fields, got %d" % (token, expected, count)
@@ -665,14 +683,15 @@ def _detect_variant(fields: List[str]) -> str:
     # No usable payload-type token: infer from the field count.
     if count == FIELD_COUNT_V1:
         return PAYLOAD_GENERIC
-    if count == FIELD_COUNT_CANSAT:
+    if count in (FIELD_COUNT_CANSAT, FIELD_COUNT_CANSAT_LEGACY):
         return PAYLOAD_CANSAT
     if count == FIELD_COUNT_ROCKET:
         return PAYLOAD_ROCKET
 
     raise PacketParseError(
-        "unrecognised field count %d (expected %d, %d or %d)"
-        % (count, FIELD_COUNT_V1, FIELD_COUNT_ROCKET, FIELD_COUNT_CANSAT)
+        "unrecognised field count %d (expected %d, %d, %d or %d)"
+        % (count, FIELD_COUNT_V1, FIELD_COUNT_ROCKET,
+           FIELD_COUNT_CANSAT_LEGACY, FIELD_COUNT_CANSAT)
     )
 
 
@@ -784,15 +803,22 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
     extra_at = len(FIELDS_V2_COMMON)   # first index past FSM_STATE
 
     if variant == PAYLOAD_CANSAT:
+        legacy_cansat = len(fields) == FIELD_COUNT_CANSAT_LEGACY
         return CanSatPacket(
             payload_type=PAYLOAD_CANSAT,
             **shared,
             **common,
             pm1_0=_opt_float(fields[extra_at]),
             pm2_5=_opt_float(fields[extra_at + 1]),
-            pm10=_opt_float(fields[extra_at + 2]),
-            reaction_wheel_rpm=_opt_int(fields[extra_at + 3], 0),
-            recovery_stage=_opt_int(fields[extra_at + 4], 0),
+            # Pre-PM4_0 frames are one field narrower; PM4_0 stays NaN and
+            # every field after it shifts back by one.
+            pm4_0=(_opt_float(fields[extra_at + 2]) if not legacy_cansat
+                   else float("nan")),
+            pm10=_opt_float(fields[extra_at + (3 if not legacy_cansat else 2)]),
+            reaction_wheel_rpm=_opt_int(
+                fields[extra_at + (4 if not legacy_cansat else 3)], 0),
+            recovery_stage=_opt_int(
+                fields[extra_at + (5 if not legacy_cansat else 4)], 0),
         )
 
     return RocketPacket(

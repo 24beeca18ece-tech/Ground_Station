@@ -56,6 +56,7 @@ fail to start because a 3D toy could not initialise.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -73,6 +74,7 @@ from PyQt5.QtWidgets import (
 # 3D rendering is optional -- see GRACEFUL DEGRADATION above.
 try:
     import pyqtgraph.opengl as gl
+    from pyqtgraph import Vector
     from pyqtgraph.opengl.shaders import (
         FragmentShader,
         ShaderProgram,
@@ -197,6 +199,32 @@ def _model_shader():
 # ---------------------------------------------------------------------------
 
 ATTITUDE_RENDER_HZ = 20
+
+#: Default camera framing, chosen at the MAXIMISED window size, which is how
+#: this dashboard is run.
+#:
+#: The distance has to be much larger than the geometry alone suggests, because
+#: pyqtgraph applies its field of view HORIZONTALLY and derives the vertical
+#: from the viewport aspect (``t = r * h / w`` in GLViewWidget.projectionMatrix).
+#: Maximised, the GL viewport is about 413x168 -- wide and short -- so the
+#: visible vertical half-extent is only ``d * tan(30deg) * (168/413)``, i.e.
+#: ``d * 0.235``. The model spans roughly +/-2.5 about the origin, so anything
+#: under ~11 clips the fins and the ground plane no matter how it looks in a
+#: taller test window.
+#:
+#: Rendered at 7.0 / 8.0 / 8.5 / 9.0 / 9.5 (all clipped at the bottom) and then
+#: 11.0 / 12.5 / 14.0 / 15.5: 12.5 is the first that clears the nose cone, the
+#: fins and all four grid edges with visible margin, without shrinking the
+#: model the way 14+ does. RESET restores exactly these values, so the initial
+#: view and a reset view are always identical.
+CAMERA_DISTANCE = 12.5
+CAMERA_ELEVATION = 16
+CAMERA_AZIMUTH = 45
+
+#: Height of the GYRO / RESET buttons. Both are pinned to it: left to their own
+#: size hints they came out 26 px and 36 px, and the taller one overran the
+#: bottom of the panel and was clipped.
+BUTTON_H = 26
 
 #: Mahony proportional feedback gain, 1/s.  Higher pulls harder towards the
 #: accelerometer reference (less drift, more vibration sensitivity).
@@ -643,17 +671,62 @@ def build_rocket_parts():
     return {"body": body, "nose": nose, "fins": _merge(fin_parts)}
 
 
-def build_cansat_parts():
-    """Return ``{part_name: (vertices, faces)}`` for the CanSat.
+#: Tessellated CAD geometry for the CanSat, produced from voronoi.step.
+#: See tools/step_to_mesh.py for the conversion; the .npz holds float32
+#: vertices and uint32 faces, already centred, scaled and stood on the ground
+#: plane, so loading it at runtime costs one np.load and no geometry work.
+CANSAT_MESH_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "cansat_mesh.npz")
 
-    Deliberately left as the plain can from the earlier work -- only the rocket
-    model gains the cone-and-fin assembly.
+
+def _load_cansat_mesh():
+    """Return ``(vertices, faces)`` from the converted CAD mesh, or None.
+
+    Returns None rather than raising if the file is missing or unreadable: a
+    checkout without the converted asset still starts, and the caller falls
+    back to the simple can with a visible warning rather than an empty view.
     """
+    try:
+        with np.load(CANSAT_MESH_FILE) as data:
+            verts = np.asarray(data["vertices"], dtype=np.float32)
+            faces = np.asarray(data["faces"], dtype=np.uint32)
+    except Exception:
+        return None
+    if verts.ndim != 2 or verts.shape[1] != 3 or len(faces) == 0:
+        return None
+    return verts, faces
+
+
+def _build_cansat_placeholder():
+    """The original plain can, kept only as a fallback."""
     return {
         "body": _lathe([(0.42, -0.75), (0.42, 0.62)], segments=26),
         "cap": _lathe([(0.42, 0.62), (0.42, 0.75)], segments=26),
         "base": _lathe([(0.30, -0.84), (0.30, -0.75)], segments=26),
     }
+
+
+#: True when the real CAD geometry was used, False when the placeholder was.
+#: Read by the widget so the fallback is stated rather than passed off as the
+#: real airframe.
+CANSAT_MESH_IS_CAD = False
+
+
+def build_cansat_parts():
+    """Return ``{part_name: (vertices, faces)}`` for the CanSat.
+
+    Prefers the tessellated CAD geometry. The CAD mesh is a single shell, so it
+    is returned as one part -- the placeholder's body/cap/base split existed
+    only to colour a lathe, and there is no equivalent division in the real
+    geometry to map those names onto.
+    """
+    global CANSAT_MESH_IS_CAD
+    mesh = _load_cansat_mesh()
+    if mesh is None:
+        CANSAT_MESH_IS_CAD = False
+        return _build_cansat_placeholder()
+    CANSAT_MESH_IS_CAD = True
+    return {"shell": mesh}
 
 
 #: Which colour each part is drawn in.
@@ -663,6 +736,9 @@ ROCKET_PART_COLORS = {
     "fins": _C_GRAPHITE,
 }
 CANSAT_PART_COLORS = {
+    # Real CAD geometry: one shell.
+    "shell": _C_CANSAT_BODY,
+    # Placeholder fallback parts.
     "body": _C_CANSAT_BODY,
     "cap": _C_CANSAT_CAP,
     "base": _C_CANSAT_BASE,
@@ -781,11 +857,13 @@ class AttitudeWidget(QWidget):
         self._parts = {"ROCKET": {}, "CANSAT": {}}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 2)
         layout.setSpacing(5)
 
         layout.addWidget(self._build_view(), 1)
-        layout.addLayout(self._build_readouts())
+        # Stretch 0 and a fixed vertical policy on the controls, so shrinking
+        # the window takes height from the 3D view and never from the buttons.
+        layout.addLayout(self._build_readouts(), 0)
 
     # -- construction ------------------------------------------------------
 
@@ -794,8 +872,10 @@ class AttitudeWidget(QWidget):
         if _GL_IMPORT_OK:
             try:
                 view = gl.GLViewWidget()
-                view.setCameraPosition(distance=5.8, elevation=14, azimuth=45)
-                view.setMinimumHeight(190)
+                view.setCameraPosition(distance=CAMERA_DISTANCE,
+                                       elevation=CAMERA_ELEVATION,
+                                       azimuth=CAMERA_AZIMUTH)
+                view.setMinimumHeight(80)
                 view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 view.setBackgroundColor(QColor(COL_PANEL))
 
@@ -868,6 +948,7 @@ class AttitudeWidget(QWidget):
         self.ref_btn.setChecked(False)
         # Fixed width so the toggle never squeezes the RESET button off the row.
         self.ref_btn.setFixedWidth(74)
+        self.ref_btn.setFixedHeight(BUTTON_H)
         self.ref_btn.setToolTip(
             "Attitude source toggle.\n\n"
             "GYRO (off, default): orientation is the integral of GYRO_X/Y/Z only.\n"
@@ -887,7 +968,9 @@ class AttitudeWidget(QWidget):
         row.addWidget(self.ref_btn)
 
         self.reset_btn = QPushButton("RESET")
+        self.reset_btn.setFont(ref_font)
         self.reset_btn.setFixedWidth(72)
+        self.reset_btn.setFixedHeight(BUTTON_H)
         self.reset_btn.setToolTip(
             "Re-zero the orientation estimate.\n"
             "Yaw has no absolute reference without a magnetometer, so it drifts;\n"
@@ -982,9 +1065,38 @@ class AttitudeWidget(QWidget):
             # An attitude display fault must never interrupt ingestion.
             pass
 
+    def reset_camera(self) -> None:
+        """Restore the default camera framing.
+
+        Separate from the orientation reset so either can be used alone, but
+        the RESET button does both: a viewer who has zoomed or orbited until
+        the model is off-screen wants one action that gives everything back.
+        """
+        if self.view is None:
+            return
+        try:
+            self.view.setCameraPosition(
+                distance=CAMERA_DISTANCE,
+                elevation=CAMERA_ELEVATION,
+                azimuth=CAMERA_AZIMUTH,
+            )
+            # pyqtgraph pans by moving the camera's centre; setCameraPosition
+            # alone leaves that offset in place, so a panned view would come
+            # back still off-centre.
+            self.view.opts["center"] = Vector(0.0, 0.0, 0.0)
+            self.view.update()
+        except Exception:
+            # A camera reset must never be able to take the widget down.
+            pass
+
     def reset_orientation(self) -> None:
-        """Re-zero the estimate; clears accumulated yaw drift."""
+        """Re-zero the estimate *and* the camera; clears accumulated yaw drift.
+
+        The orientation behaviour is unchanged -- the camera restore is added
+        alongside it, not in place of it.
+        """
         self.estimator.reset()
+        self.reset_camera()
         self._dirty = True
         self.redraw(force=True)
 
