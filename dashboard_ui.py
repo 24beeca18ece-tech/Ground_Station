@@ -252,6 +252,13 @@ QPushButton {{
 QPushButton:hover  {{ background-color: #e2e9f3; border-color: {COL_ACCENT}; }}
 QPushButton:pressed{{ background-color: #c9d4e3; }}
 QPushButton:disabled {{ color: #8b98ab; border-color: #c2ccda; }}
+/* Connection-bar controls are packed two rows deep now that there are two
+   radios, so they trade vertical padding -- and only padding -- for the height
+   the strip charts need. Text size is unchanged. */
+QGroupBox#connectionBox {{ padding: 4px 8px 4px 8px; }}
+QGroupBox#connectionBox QPushButton {{ padding: 3px 14px; }}
+QGroupBox#connectionBox QComboBox {{ padding: 2px 8px; }}
+QGroupBox#connectionBox QLabel {{ padding: 0; }}
 QPushButton#connectBtn[connected="true"] {{
     background-color: {COL_ALERT}; border-color: {COL_ALERT}; color: #ffffff;
 }}
@@ -1187,7 +1194,9 @@ class Dashboard(QMainWindow):
 
         combo = QComboBox()
         combo.setEditable(True)
-        combo.setMinimumWidth(190)
+        # Sized to show a COM name or a socket:// URL in full; the dropdown and
+        # the tooltip carry the longer device descriptions.
+        combo.setMinimumWidth(200)
         combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
         combo.setMinimumContentsLength(12)
         combo.setToolTip(
@@ -1223,7 +1232,8 @@ class Dashboard(QMainWindow):
         # the shape of the loss (only odd counts arriving) is the clearest
         # signal of which one went down.
         status = QLabel("offline")
-        status.setMinimumWidth(210)
+        status.setMinimumWidth(150)
+        status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         status.setStyleSheet("color: %s; font-size: 9pt;" % COL_TEXT_DIM)
         status.setToolTip(
             "This radio's own link: connection state, packet rate, and how\n"
@@ -1232,8 +1242,7 @@ class Dashboard(QMainWindow):
             "means half the stream is being lost -- the charts will show\n"
             "gaps where that radio's packets should have been."
         )
-        layout.addWidget(status)
-        layout.addStretch(1)
+        layout.addWidget(status, 1)
 
         self.radio_widgets[radio_id] = {
             "row": row, "port": combo, "baud": baud,
@@ -1243,25 +1252,49 @@ class Dashboard(QMainWindow):
 
     def _build_connection_bar(self) -> QWidget:
         box = QGroupBox("CONNECTION")
-        outer = QVBoxLayout(box)
-        outer.setContentsMargins(10, 3, 10, 5)
-        outer.setSpacing(4)
+        box.setObjectName("connectionBox")
 
+        # Logos flank the two control rows rather than sitting inside one of
+        # them. A logo is 40 px and a control row is 28 px, so in the row the
+        # logos were what set its height; beside the rows they are free, since
+        # two rows plus spacing already come to 59 px.
+        frame = QHBoxLayout(box)
+        frame.setContentsMargins(10, 2, 10, 3)
+        frame.setSpacing(10)
+
+        self.team_logo = self._build_logo(
+            "team_logo.png", "CU Jammu Astro — team logo")
+        if self.team_logo is not None:
+            frame.addWidget(self.team_logo, 0, Qt.AlignVCenter)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(3)
+        frame.addLayout(outer, 1)
+
+        # Both radios on ONE row, in equal-width halves. Stacking them cost
+        # 80 px of vertical space that came out of the charts below; there is
+        # ample width at full screen, so width is the cheaper axis to spend.
         self.radio_widgets = {}
-        for radio_id in RADIO_IDS:
-            outer.addWidget(self._build_radio_row(radio_id))
+        radios = QHBoxLayout()
+        radios.setContentsMargins(0, 0, 0, 0)
+        radios.setSpacing(10)
+        for index, radio_id in enumerate(RADIO_IDS):
+            if index:
+                # A rule between the halves, so it is unambiguous which
+                # controls belong to which radio.
+                divider = QFrame()
+                divider.setFrameShape(QFrame.VLine)
+                divider.setFixedWidth(1)
+                divider.setStyleSheet("background: %s; border: none;" % COL_BORDER)
+                radios.addWidget(divider)
+            radios.addWidget(self._build_radio_row(radio_id), 1)
+        outer.addLayout(radios)
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         outer.addLayout(layout)
-
-        # Team logo pins the far left of the shared controls row.
-        self.team_logo = self._build_logo(
-            "team_logo.png", "CU Jammu Astro — team logo")
-        if self.team_logo is not None:
-            layout.addWidget(self.team_logo)
-            layout.addSpacing(10)
 
         # Kept as aliases so the rest of the dashboard, the --port CLI flag and
         # the existing tests keep addressing RX1 by its old names.
@@ -1270,7 +1303,8 @@ class Dashboard(QMainWindow):
         self.connect_btn = self.radio_widgets["RX1"]["connect"]
         self.refresh_btn = self.radio_widgets["RX1"]["rescan"]
 
-        layout.addSpacing(8)
+        # No leading spacer: this row now starts flush with the radio row above
+        # it, since the team logo moved out into its own column.
         self.raw_csv_check = QCheckBox("RAW CSV")
         self.raw_csv_check.setToolTip(
             "Bench-test mode for flight firmware that sends bare CSV with no "
@@ -1316,12 +1350,10 @@ class Dashboard(QMainWindow):
         self.conn_state_label.setStyleSheet("color: %s; font-weight: 700;" % COL_ALERT)
         layout.addWidget(self.conn_state_label)
 
-        # College logo pins the far right of the same header row.
         self.college_logo = self._build_logo(
             "college_logo.png", "Central University of Jammu")
         if self.college_logo is not None:
-            layout.addSpacing(10)
-            layout.addWidget(self.college_logo)
+            frame.addWidget(self.college_logo, 0, Qt.AlignVCenter)
 
         return box
 
@@ -2173,7 +2205,10 @@ class Dashboard(QMainWindow):
                 text = "connected — no packets yet"
                 colour = COL_WARN
             else:
-                text = ("%.1f pkt/s · %.1f s ago · %d delivered"
+                # "merged", not "received": this is what this radio actually
+                # contributed to the merged stream. Kept short so a six-figure
+                # count still fits the half-width status label.
+                text = ("%.1f pkt/s · %.1f s ago · %d merged"
                         % (rate, age, contributed))
                 # Stale here means this radio specifically has gone quiet, which
                 # costs half the stream even while the other keeps running.

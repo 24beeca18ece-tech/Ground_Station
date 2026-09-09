@@ -31,22 +31,22 @@ guessed at.
 HOW ORDER IS RECOVERED
 ----------------------
 Arrivals go into a small buffer keyed by ``packet_count``.  A packet is released
-as soon as it is the next one expected.  When the next one is missing, the
-it is given up on once :data:`MIN_GAP_DEPTH` *later* packets are in hand --
-evidence that it is not simply still in transit -- with :data:`HOLD_S` as a
-backstop for when nothing later arrives either. Either way, a radio going quiet
-can never stall the display.
+as soon as it is the next one expected.  When the next one is missing, it is
+given up on once :data:`MIN_GAP_DEPTH` *later* packets are in hand — evidence
+that it is not simply still in transit — with :data:`HOLD_S` as a backstop for
+when nothing later arrives either.  Either way, a radio going quiet can never
+stall the display.
 
-Depth is the primary rule on purpose. ``add`` and ``drain`` both run on the GUI
+Depth is the primary rule on purpose.  ``add`` and ``drain`` both run on the GUI
 thread, so a rendering stall delays arrivals and the give-up decision equally; a
 pure timer would measure GUI load as much as radio latency and invent gaps that
 never happened.
 
-That timeout is the whole trade-off.  Too short and a slightly late packet is
-declared missing; too long and the display lags.  :data:`HOLD_S` is set well
-above realistic serial jitter but well below human-noticeable lag, and
-``late_drops`` counts every packet that arrived after its slot had already been
-given up on — if that number is not ~0 in practice, the timeout is too short.
+Both numbers are a trade-off: too small and a slightly late packet is declared
+missing, too large and the display lags behind the link.  ``late_drops`` counts
+every packet that arrived after its slot had already been given up on, so it is
+the number to watch — if it is not near zero on a healthy link,
+:data:`MIN_GAP_DEPTH` is too small for the latency spread between the radios.
 
 GAPS ARE REAL
 -------------
