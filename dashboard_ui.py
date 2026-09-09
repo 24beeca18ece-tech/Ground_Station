@@ -65,6 +65,7 @@ from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
 from csv_logger import CsvLoggerThread
 from csv_table_window import CsvTableWindow
 from diagnostics_window import DiagnosticsWindow, RawPacketStrip
+from packet_merger import PacketMerger
 from serial_worker import SerialWorker, list_serial_ports
 from session_summary_widget import SessionSummaryWidget
 from telemetry_packet import (
@@ -120,6 +121,16 @@ EJECT_COMMAND_BODY = "CMD,EJECT"
 #: selection, not telemetry: see the note on the combo's tooltip. Kept as a
 #: list so adding a third element later is a one-line change.
 ANTENNA_PATHS = ["WHIP", "PATCH", "BOTH", "UNSET"]
+
+#: The two ground radios. The flight transmitter alternates destinations per
+#: packet, so NEITHER of these receives the whole stream on its own -- each sees
+#: roughly every other packet, and the merge layer puts them back together.
+RADIO_IDS = ("RX1", "RX2")
+
+#: How often the merge buffer is drained into the display, in Hz. Faster than
+#: the render rate so ordering never becomes the bottleneck; the buffer's own
+#: hold window is what actually governs latency.
+MERGE_DRAIN_HZ = 30
 
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
@@ -987,7 +998,27 @@ class Dashboard(QMainWindow):
         self._detected_payload: str = ""
 
         # --- worker threads --------------------------------------------------
-        self.serial_worker = SerialWorker(self)
+        # One worker per radio. They are independent threads with independent
+        # ports: either can be connected, dropped or reconnected without
+        # touching the other, which is what the alternating-destination setup
+        # requires.
+        self.serial_workers = {rid: SerialWorker(self) for rid in RADIO_IDS}
+        #: RX1 keeps the old attribute name -- it is the uplink radio and the
+        #: one the --port CLI flag and existing call sites address.
+        self.serial_worker = self.serial_workers["RX1"]
+
+        #: Reassembles the two partial streams into one ordered sequence. All
+        #: charts, tiles, the attitude widget and the CSV are fed from its
+        #: output, never from a worker directly, so there is exactly one
+        #: chronological view of the flight.
+        self.merger = PacketMerger(on_warning=self._on_merge_warning)
+
+        #: Per-radio connection state and arrival times, for the row status.
+        self.radio_state = {
+            rid: {"connected": False, "last_epoch": None, "recv": deque(),
+                  "stats": (0, 0, 0, 0, 0, 0)}
+            for rid in RADIO_IDS
+        }
         self.csv_logger = CsvLoggerThread(log_dir=log_dir, parent=self)
 
         self._build_ui()
@@ -1004,7 +1035,8 @@ class Dashboard(QMainWindow):
         # Logger runs for the whole session: the errors log is always active,
         # while CSV rows are only queued when the user enables logging.
         self.csv_logger.start()
-        self.serial_worker.start()
+        for worker in self.serial_workers.values():
+            worker.start()
 
         # --- timers ----------------------------------------------------------
         self.render_timer = QTimer(self)
@@ -1012,6 +1044,13 @@ class Dashboard(QMainWindow):
         self.render_timer.start(int(1000 / RENDER_HZ))
 
         self.status_timer = QTimer(self)
+        # Drains the merge buffer into the display. Separate from the render
+        # timer because ordering and painting are different concerns: this one
+        # decides what is ready, the render timer decides when to draw it.
+        self.merge_timer = QTimer(self)
+        self.merge_timer.timeout.connect(self._drain_merger)
+        self.merge_timer.start(int(1000 / MERGE_DRAIN_HZ))
+
         self.status_timer.timeout.connect(self._update_link_status)
         self.status_timer.start(int(1000 / STATUS_HZ))
 
@@ -1126,49 +1165,110 @@ class Dashboard(QMainWindow):
         )
         return label
 
+    def _build_radio_row(self, radio_id: str) -> QWidget:
+        """One radio's controls: port, baud, connect, and its own live status.
+
+        Both radios get an identical row. They are genuinely independent -- one
+        can be connected, dropped and reconnected while the other keeps
+        delivering -- so nothing here is shared between them except the port
+        list they are populated from.
+        """
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        tag = QLabel(radio_id)
+        tag.setStyleSheet(
+            "color: #ffffff; background: %s; border-radius: 3px;"
+            " padding: 2px 7px; font-weight: 800;" % COL_ACCENT
+        )
+        layout.addWidget(tag)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setMinimumWidth(190)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
+        combo.setMinimumContentsLength(12)
+        combo.setToolTip(
+            "Serial device (COM7, /dev/ttyUSB0) or a pyserial URL such as\n"
+            "socket://127.0.0.1:5555 for the synthetic packet generator.\n\n"
+            "This radio receives only PART of the stream: the flight\n"
+            "transmitter alternates between the two ground radios, so both\n"
+            "must be connected to see every packet."
+        )
+        layout.addWidget(combo)
+
+        rescan = QPushButton("RESCAN")
+        _fit(rescan)
+        rescan.setToolTip("Rescan available serial ports")
+        layout.addWidget(rescan)
+
+        layout.addWidget(QLabel("Baud:"))
+        baud = QComboBox()
+        baud.setEditable(True)
+        baud.addItems(BAUD_RATES)
+        baud.setCurrentText("9600")
+        baud.setFixedWidth(92)
+        layout.addWidget(baud)
+
+        connect = QPushButton("CONNECT")
+        connect.setObjectName("connectBtn")
+        connect.setProperty("connected", "false")
+        _fit(connect, "DISCONNECT")
+        layout.addWidget(connect)
+
+        # Per-radio status. This is a diagnostic, not decoration: losing one
+        # radio now costs half the telemetry rather than a redundant copy, and
+        # the shape of the loss (only odd counts arriving) is the clearest
+        # signal of which one went down.
+        status = QLabel("offline")
+        status.setMinimumWidth(210)
+        status.setStyleSheet("color: %s; font-size: 9pt;" % COL_TEXT_DIM)
+        status.setToolTip(
+            "This radio's own link: connection state, packet rate, and how\n"
+            "long since it last delivered.\n\n"
+            "A rate near zero on one radio while the other keeps running\n"
+            "means half the stream is being lost -- the charts will show\n"
+            "gaps where that radio's packets should have been."
+        )
+        layout.addWidget(status)
+        layout.addStretch(1)
+
+        self.radio_widgets[radio_id] = {
+            "row": row, "port": combo, "baud": baud,
+            "connect": connect, "rescan": rescan, "status": status,
+        }
+        return row
+
     def _build_connection_bar(self) -> QWidget:
         box = QGroupBox("CONNECTION")
-        layout = QHBoxLayout(box)
-        # Tightened from (10, 6, 10, 8) so the logos fit inside the existing bar
-        # height instead of growing it and eating the sidebar's headroom.
-        layout.setContentsMargins(10, 3, 10, 5)
-        layout.setSpacing(8)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(10, 3, 10, 5)
+        outer.setSpacing(4)
 
-        # Team logo pins the far left of the header row.
+        self.radio_widgets = {}
+        for radio_id in RADIO_IDS:
+            outer.addWidget(self._build_radio_row(radio_id))
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        outer.addLayout(layout)
+
+        # Team logo pins the far left of the shared controls row.
         self.team_logo = self._build_logo(
             "team_logo.png", "CU Jammu Astro — team logo")
         if self.team_logo is not None:
             layout.addWidget(self.team_logo)
             layout.addSpacing(10)
 
-        layout.addWidget(QLabel("Port:"))
-        self.port_combo = QComboBox()
-        self.port_combo.setEditable(True)  # lets you type a URL such as socket://…
-        self.port_combo.setMinimumWidth(190)
-        # Without this the combo's sizeHint grows to fit the longest port
-        # description, claiming ~295 px of a bar that has none to spare. The
-        # full text stays available in the dropdown and the tooltip.
-        self.port_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
-        self.port_combo.setMinimumContentsLength(12)
-        self.port_combo.setToolTip(
-            "Serial device (COM7, /dev/ttyUSB0) or a pyserial URL such as\n"
-            "socket://127.0.0.1:5555 for the synthetic packet generator."
-        )
-        layout.addWidget(self.port_combo)
-
-        self.refresh_btn = QPushButton("RESCAN")
-        _fit(self.refresh_btn)
-        self.refresh_btn.setToolTip("Rescan available serial ports")
-        layout.addWidget(self.refresh_btn)
-
-        layout.addSpacing(6)
-        layout.addWidget(QLabel("Baud:"))
-        self.baud_combo = QComboBox()
-        self.baud_combo.setEditable(True)
-        self.baud_combo.addItems(BAUD_RATES)
-        self.baud_combo.setCurrentText("9600")
-        self.baud_combo.setFixedWidth(92)
-        layout.addWidget(self.baud_combo)
+        # Kept as aliases so the rest of the dashboard, the --port CLI flag and
+        # the existing tests keep addressing RX1 by its old names.
+        self.port_combo = self.radio_widgets["RX1"]["port"]
+        self.baud_combo = self.radio_widgets["RX1"]["baud"]
+        self.connect_btn = self.radio_widgets["RX1"]["connect"]
+        self.refresh_btn = self.radio_widgets["RX1"]["rescan"]
 
         layout.addSpacing(8)
         self.raw_csv_check = QCheckBox("RAW CSV")
@@ -1182,12 +1282,6 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.raw_csv_check)
 
         layout.addSpacing(10)
-        self.connect_btn = QPushButton("CONNECT")
-        self.connect_btn.setObjectName("connectBtn")
-        self.connect_btn.setProperty("connected", "false")
-        _fit(self.connect_btn, "DISCONNECT")
-        layout.addWidget(self.connect_btn)
-
         self.log_btn = QPushButton("START LOGGING")
         self.log_btn.setObjectName("logBtn")
         self.log_btn.setProperty("logging", "false")
@@ -1885,12 +1979,22 @@ class Dashboard(QMainWindow):
     def _wire_signals(self) -> None:
         # Worker -> GUI.  These are cross-thread, so Qt delivers them queued on
         # the GUI event loop; the slots must stay short.
-        self.serial_worker.packet_received.connect(self.on_packet)
-        self.serial_worker.bad_frame.connect(self.on_bad_frame)
-        self.serial_worker.rejected_frame.connect(self.on_rejected_frame)
-        self.serial_worker.stats_updated.connect(self.on_stats)
-        self.serial_worker.connection_changed.connect(self.on_connection_changed)
-        self.serial_worker.log_message.connect(self.append_event)
+        # Every worker signal is tagged with the radio it came from, because
+        # "which radio delivered this" is now diagnostic information rather
+        # than an implementation detail.
+        for radio_id, worker in self.serial_workers.items():
+            worker.packet_received.connect(
+                lambda pkt, rid=radio_id: self.on_radio_packet(pkt, rid))
+            worker.bad_frame.connect(self.on_bad_frame)
+            worker.rejected_frame.connect(self.on_rejected_frame)
+            worker.stats_updated.connect(
+                lambda *a, rid=radio_id: self.on_stats(rid, *a))
+            worker.connection_changed.connect(
+                lambda ok, msg, rid=radio_id:
+                self.on_connection_changed(ok, msg, rid))
+            worker.log_message.connect(
+                lambda text, rid=radio_id: self.append_event("%s: %s" % (rid, text)))
+        # Uplink is RX1's job only; a command must go out once, not twice.
         self.serial_worker.command_sent.connect(self.on_command_sent)
         self.serial_worker.transmit_status.connect(self.on_transmit_status)
 
@@ -1900,8 +2004,11 @@ class Dashboard(QMainWindow):
         self.csv_logger.error_occurred.connect(self.append_event)
 
         # Widgets -> GUI slots.
-        self.refresh_btn.clicked.connect(self.refresh_ports)
-        self.connect_btn.clicked.connect(self.toggle_connection)
+        for radio_id in RADIO_IDS:
+            w = self.radio_widgets[radio_id]
+            w["rescan"].clicked.connect(self.refresh_ports)
+            w["connect"].clicked.connect(
+                lambda _checked=False, rid=radio_id: self.toggle_connection(rid))
         self.log_btn.clicked.connect(self.toggle_logging)
         self.clear_btn.clicked.connect(self.clear_session)
         self.telemetry_btn.clicked.connect(self.toggle_telemetry)
@@ -1918,93 +2025,195 @@ class Dashboard(QMainWindow):
 
     def refresh_ports(self) -> None:
         """Rescan serial ports, preserving whatever the user had selected."""
-        current = self.port_combo.currentText().strip()
-        self.port_combo.blockSignals(True)
-        self.port_combo.clear()
+        for radio_id in RADIO_IDS:
+            self._refresh_one_port_combo(self.radio_widgets[radio_id]["port"])
+
+    def _refresh_one_port_combo(self, combo) -> None:
+        """Repopulate one radio's port list, keeping its current selection."""
+        current = combo.currentText().strip()
+        combo.blockSignals(True)
+        combo.clear()
         for device, description in list_serial_ports():
-            self.port_combo.addItem(description, device)
+            combo.addItem(description, device)
         # Always offer the simulator URL so testing needs no driver install.
-        self.port_combo.addItem("%s  (packet_sim.py)" % SIM_PORT_URL, SIM_PORT_URL)
-        self.port_combo.blockSignals(False)
+        combo.addItem("%s  (packet_sim.py)" % SIM_PORT_URL, SIM_PORT_URL)
+        combo.blockSignals(False)
 
         if current:
-            index = self.port_combo.findData(current)
+            index = combo.findData(current)
             if index < 0:
-                index = self.port_combo.findText(current, Qt.MatchStartsWith)
+                index = combo.findText(current, Qt.MatchStartsWith)
             if index >= 0:
-                self.port_combo.setCurrentIndex(index)
+                combo.setCurrentIndex(index)
             else:
-                self.port_combo.setEditText(current)
+                combo.setEditText(current)
 
-    def selected_port(self) -> str:
+    def selected_port(self, radio_id: str = "RX1") -> str:
         """Resolve the combo selection to a device name or pyserial URL.
 
         The combo is editable, so the text may either be one of the discovered
         entries ("COM7 — USB Serial Device") whose ``itemData`` holds the real
         device name, or something the operator typed by hand ("socket://…").
         """
-        text = self.port_combo.currentText().strip()
+        combo = self.radio_widgets[radio_id]["port"]
+        text = combo.currentText().strip()
         if not text:
             return ""
-        index = self.port_combo.findText(text)
+        index = combo.findText(text)
         if index >= 0:
-            data = self.port_combo.itemData(index)
+            data = combo.itemData(index)
             if data:
                 return str(data)
         return text
 
-    def toggle_connection(self) -> None:
-        if self.is_connected:
-            self.serial_worker.request_disconnect()
-            self.append_event("Disconnect requested.")
-            self.csv_logger.log_note("Disconnect requested by operator")
-            # Reflect intent immediately; the worker confirms via the signal.
-            self._set_connect_button(False)
+    def toggle_connection(self, radio_id: str = "RX1") -> None:
+        """Connect or disconnect ONE radio, leaving the other alone."""
+        worker = self.serial_workers[radio_id]
+        widgets = self.radio_widgets[radio_id]
+
+        if self.radio_state[radio_id]["connected"]:
+            worker.request_disconnect()
+            self.append_event("%s: disconnect requested." % radio_id)
+            self.csv_logger.log_note("%s disconnect requested by operator" % radio_id)
+            self._set_connect_button(False, radio_id)
             return
 
-        port = self.selected_port()
+        port = self.selected_port(radio_id)
         if not port:
-            QMessageBox.warning(self, "No port", "Select or type a serial port first.")
+            QMessageBox.warning(self, "No port",
+                                "Select or type a serial port for %s first."
+                                % radio_id)
             return
         try:
-            baud = int(self.baud_combo.currentText().strip())
+            baud = int(widgets["baud"].currentText().strip())
         except ValueError:
             QMessageBox.warning(self, "Bad baud rate", "Baud rate must be a number.")
             return
 
+        # Both radios carry the same wire format, so the raw-CSV setting is a
+        # property of the flight firmware, not of one radio.
         raw_csv = self.raw_csv_check.isChecked()
-        self.serial_worker.set_raw_csv_mode(raw_csv, TEAM_ID_FALLBACK)
+        worker.set_raw_csv_mode(raw_csv, TEAM_ID_FALLBACK)
         if raw_csv:
             self.append_event(
                 "RAW CSV mode ON — no telemetry checksum; corrupt packets "
                 "cannot be detected. Bench testing only."
             )
-            self.csv_logger.log_note("RAW CSV compatibility mode enabled")
 
-        self.append_event("Connecting to %s @ %d baud…" % (port, baud))
-        self.csv_logger.log_note("Connect requested: %s @ %d" % (port, baud))
-        self.serial_worker.request_connect(port, baud)
-        self._set_connect_button(True)
+        self.append_event("%s: connecting to %s @ %d baud…" % (radio_id, port, baud))
+        self.csv_logger.log_note("%s connect requested: %s @ %d"
+                                 % (radio_id, port, baud))
+        worker.request_connect(port, baud)
+        self._set_connect_button(True, radio_id)
 
-    def _set_connect_button(self, connected: bool) -> None:
-        self.connect_btn.setText("DISCONNECT" if connected else "CONNECT")
-        self.connect_btn.setProperty("connected", "true" if connected else "false")
+    def _set_connect_button(self, connected: bool, radio_id: str = "RX1") -> None:
+        button = self.radio_widgets[radio_id]["connect"]
+        button.setText("DISCONNECT" if connected else "CONNECT")
+        button.setProperty("connected", "true" if connected else "false")
         # Re-polish so the dynamic-property stylesheet rule takes effect.
-        self.connect_btn.style().unpolish(self.connect_btn)
-        self.connect_btn.style().polish(self.connect_btn)
+        button.style().unpolish(button)
+        button.style().polish(button)
 
-    def on_connection_changed(self, connected: bool, message: str) -> None:
-        self.is_connected = connected
-        self._set_connect_button(connected)
-        color = COL_OK if connected else COL_ALERT
-        self.conn_state_label.setText("● CONNECTED" if connected else "● DISCONNECTED")
+    def on_connection_changed(self, connected: bool, message: str,
+                              radio_id: str = "RX1") -> None:
+        self.radio_state[radio_id]["connected"] = connected
+        self._set_connect_button(connected, radio_id)
+
+        # The headline state is "is any radio delivering", because that is what
+        # decides whether the dashboard can show anything at all. Which of the
+        # two is up is on their own rows.
+        any_up = any(st["connected"] for st in self.radio_state.values())
+        both_up = all(st["connected"] for st in self.radio_state.values())
+        self.is_connected = any_up
+
+        if both_up:
+            text, color = "● RX1+RX2", COL_OK
+        elif any_up:
+            live = next(r for r, st in self.radio_state.items() if st["connected"])
+            # One radio alone sees only half the stream. That is a degraded
+            # state, not a healthy one, and it is coloured accordingly.
+            text, color = "● %s ONLY" % live, COL_WARN
+        else:
+            text, color = "● DISCONNECTED", COL_ALERT
+        self.conn_state_label.setText(text)
         self.conn_state_label.setStyleSheet("color: %s; font-weight: 700;" % color)
-        self.statusBar().showMessage(message)
-        self.append_event(message)
+
+        self.statusBar().showMessage("%s: %s" % (radio_id, message))
+        self.append_event("%s: %s" % (radio_id, message))
+        self._update_radio_rows()
+
+    def _radio_summary(self) -> str:
+        """One-line description of who is delivering, for the diagnostics table."""
+        bits = []
+        for radio_id in RADIO_IDS:
+            state = self.radio_state[radio_id]
+            n = self.merger.per_source.get(radio_id, 0)
+            if not state["connected"]:
+                bits.append("%s off" % radio_id)
+            else:
+                bits.append("%s %d" % (radio_id, n))
+        last = self.latest.radio if self.latest is not None else ""
+        return "%s%s" % (" / ".join(bits), ("  last: %s" % last) if last else "")
+
+    def _update_radio_rows(self) -> None:
+        """Refresh each radio's own status line."""
+        now = time.time()
+        for radio_id in RADIO_IDS:
+            state = self.radio_state[radio_id]
+            label = self.radio_widgets[radio_id]["status"]
+            if not state["connected"]:
+                label.setText("offline")
+                label.setStyleSheet("color: %s; font-size: 9pt;" % COL_TEXT_DIM)
+                continue
+            rate = len(state["recv"]) / RATE_WINDOW_S if state["recv"] else 0.0
+            last = state["last_epoch"]
+            age = (now - last) if last is not None else None
+            contributed = self.merger.per_source.get(radio_id, 0)
+            if age is None:
+                text = "connected — no packets yet"
+                colour = COL_WARN
+            else:
+                text = ("%.1f pkt/s · %.1f s ago · %d delivered"
+                        % (rate, age, contributed))
+                # Stale here means this radio specifically has gone quiet, which
+                # costs half the stream even while the other keeps running.
+                colour = COL_ALERT if age > STALE_AFTER_S else COL_OK
+            label.setText(text)
+            label.setStyleSheet("color: %s; font-size: 9pt; font-weight: 600;"
+                                % colour)
 
     # ==================================================================
     # Slots — telemetry (hot path: keep these cheap!)
     # ==================================================================
+
+    def on_radio_packet(self, packet: TelemetryPacket, radio_id: str) -> None:
+        """One packet from one radio: stamp it and hand it to the merger.
+
+        Nothing is charted or logged here. Each radio sees only part of the
+        stream, so a packet is not ready to be displayed until the merger has
+        decided where it belongs in the sequence.
+        """
+        state = self.radio_state[radio_id]
+        state["last_epoch"] = packet.gs_recv_epoch
+        state["recv"].append(packet.gs_recv_epoch)
+        while state["recv"] and (packet.gs_recv_epoch - state["recv"][0]) > RATE_WINDOW_S:
+            state["recv"].popleft()
+
+        packet.radio = radio_id
+        self.merger.add(packet, radio_id)
+
+    def _drain_merger(self) -> None:
+        """Emit whatever the merger says is now in order. Timer driven."""
+        try:
+            for packet, _radio in self.merger.drain():
+                self.on_packet(packet)
+        except Exception as exc:      # pragma: no cover - defensive
+            self.append_event("Merge error: %r" % exc)
+
+    def _on_merge_warning(self, text: str) -> None:
+        """Surface a merge anomaly once, in the operator's own log."""
+        self.append_event("MERGE: %s" % text)
+        self.csv_logger.log_note("merge: %s" % text)
 
     def on_packet(self, packet: TelemetryPacket) -> None:
         """Store one validated packet.  No widget is touched here — see _render."""
@@ -2160,15 +2369,24 @@ class Dashboard(QMainWindow):
             self.raw_strip.show_rejected(raw)
         self.csv_logger.log_error(raw, reason)
 
-    def on_stats(self, total_frames: int, valid: int, corrupt: int,
-                 resyncs: int, rejected: int, api_errors: int) -> None:
-        self.total_frames = total_frames
-        self.valid_packets = valid
-        self.corrupt_packets = corrupt
-        self.resyncs = resyncs
-        self.rejected_packets = rejected
-        self.api_frame_errors = api_errors
-        self.summary.set_link_stats(valid, corrupt, resyncs)
+    def on_stats(self, radio_id: str, total_frames: int, valid: int,
+                 corrupt: int, resyncs: int, rejected: int,
+                 api_errors: int) -> None:
+        """Per-radio counters, summed for the combined LINK STATUS panel.
+
+        The aggregate is what the operator judges the link by, but the split is
+        kept because a radio contributing zero is the thing worth spotting.
+        """
+        self.radio_state[radio_id]["stats"] = (
+            total_frames, valid, corrupt, resyncs, rejected, api_errors)
+        totals = [0] * 6
+        for state in self.radio_state.values():
+            for i, v in enumerate(state["stats"]):
+                totals[i] += v
+        (self.total_frames, self.valid_packets, self.corrupt_packets,
+         self.resyncs, self.rejected_packets, self.api_frame_errors) = totals
+        self.summary.set_link_stats(self.valid_packets, self.corrupt_packets,
+                                    self.resyncs)
 
     def on_log_file_opened(self, path: str) -> None:
         # File name only: the full path does not fit the header at 1366 px and
@@ -2308,6 +2526,7 @@ class Dashboard(QMainWindow):
             rejected=self.rejected_packets,
             api_errors=self.api_frame_errors,
             rssi_dbm=self.serial_worker.last_rssi_dbm,
+            radio=self._radio_summary(),
         )
 
     def _apply_payload_panel(self) -> None:
@@ -2454,6 +2673,7 @@ class Dashboard(QMainWindow):
             self.tile_rssi.set_level(
                 "ok" if rssi > -70 else ("warn" if rssi > -85 else "alert"))
 
+        self._update_radio_rows()
         self._push_link_diagnostics()
 
         if self.last_packet_epoch is None:
@@ -2745,10 +2965,20 @@ class Dashboard(QMainWindow):
                 # Put the chart back before teardown so the grid owns it.
                 self.chart_overlay.close_overlay()
 
-            self.serial_worker.stop()
-            if not self.serial_worker.wait(3000):
-                self.serial_worker.terminate()
-                self.serial_worker.wait(500)
+            # Release anything still held for reordering before the workers
+            # go away, so a clean exit does not silently drop buffered packets.
+            try:
+                for packet, _radio in self.merger.flush():
+                    self.on_packet(packet)
+            except Exception:
+                pass
+
+            for worker in self.serial_workers.values():
+                worker.stop()
+            for worker in self.serial_workers.values():
+                if not worker.wait(3000):
+                    worker.terminate()
+                    worker.wait(500)
 
             self.csv_logger.log_note("session ended")
             self.csv_logger.stop()

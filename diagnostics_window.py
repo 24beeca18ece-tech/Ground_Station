@@ -226,6 +226,7 @@ SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("rate", "PACKET RATE"),
         ("age", "PACKET AGE"),
         ("rssi", "SIGNAL (RSSI)"),
+        ("radio", "RADIOS (RX1/RX2)"),
         ("valid_total", "VALID/TOTAL"),
         ("corrupt", "CORRUPT (CHECKSUM)"),
         ("rejected", "REJECTED (BOUNDS)"),
@@ -408,7 +409,8 @@ class DiagnosticsWindow(QDialog):
                     total: int, corrupt: int, connected: bool,
                     stale_after: float = 2.0, rejected: int = 0,
                     api_errors: int = 0,
-                    rssi_dbm: Optional[int] = None) -> None:
+                    rssi_dbm: Optional[int] = None,
+                    radio: str = "") -> None:
         """Refresh the link statistics rows."""
         try:
             self._set("rate", "%.1f pkt/s" % rate,
@@ -443,6 +445,11 @@ class DiagnosticsWindow(QDialog):
                     COL_OK if rssi_dbm > -70
                     else (COL_WARN if rssi_dbm > -85 else COL_ALERT),
                 )
+            # Which radios are delivering, and how many packets each has
+            # contributed to the merged stream. With an alternating
+            # transmitter, one of these sitting still means half the telemetry
+            # is being lost.
+            self._set("radio", radio or "--", COL_NUM if radio else COL_DIM)
             self._set("conn", "CONNECTED" if connected else "DISCONNECTED",
                       COL_OK if connected else COL_ALERT)
         except Exception:

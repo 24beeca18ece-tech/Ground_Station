@@ -413,6 +413,40 @@ class MissionSim:
 # Fault injection
 # ---------------------------------------------------------------------------
 
+class AlternationFilter:
+    """Drops the packets that would have gone to the *other* ground radio.
+
+    The counter still advances for skipped packets, so the sequence numbers
+    this instance does emit are the real ones -- which is the whole point: the
+    merge under test has to reassemble the true order from two partial streams,
+    not from two independently-numbered ones.
+    """
+
+    def __init__(self, spec):
+        self.modulus = 0
+        self.residue = 0
+        if spec:
+            modulus, residue = spec.split(":")
+            self.modulus = int(modulus)
+            self.residue = int(residue)
+            if self.modulus < 1:
+                raise ValueError("--alternate modulus must be >= 1")
+
+    @property
+    def enabled(self):
+        return self.modulus > 1
+
+    def wants(self, packet_count):
+        if not self.enabled:
+            return True
+        return packet_count % self.modulus == self.residue
+
+    def describe(self):
+        if not self.enabled:
+            return "all packets"
+        return "packet_count %% %d == %d" % (self.modulus, self.residue)
+
+
 class FaultInjector:
     """Deliberately damages the outgoing byte stream to test GCS robustness."""
 
@@ -530,6 +564,9 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
     sim = MissionSim(args.team_id, payload_type=args.payload_type,
                      gyro_bias=args.gyro_bias)
     faults = FaultInjector(args)
+    alt = AlternationFilter(getattr(args, "alternate", None))
+    if alt.enabled:
+        print("[sim] alternating destination: emitting %s" % alt.describe())
     period = 1.0 / max(args.rate, 0.1)
     next_due = time.monotonic()
     sent = dropped = 0
@@ -545,7 +582,10 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
                   % (args.burst_gap, args.burst))
             time.sleep(args.burst_gap)
             for _ in range(args.burst):
-                data = faults.apply(sim.next_frame())
+                frame = sim.next_frame()
+                if not alt.wants(sim.packet_count):
+                    continue          # this one went to the other radio
+                data = faults.apply(frame)
                 if data is None:
                     dropped += 1
                     continue
@@ -563,7 +603,15 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
         if next_due < now - period:
             next_due = now + period
 
-        data = faults.apply(sim.next_frame())
+        frame = sim.next_frame()
+        if not alt.wants(sim.packet_count):
+            # Destined for the other ground radio; the counter has already
+            # advanced, so the packets this instance does send keep their true
+            # sequence numbers. next_due was advanced by the pacing block
+            # above -- advancing it again here would double-count the skipped
+            # slot and quietly halve the effective rate.
+            continue
+        data = faults.apply(frame)
         if data is None:
             dropped += 1
         else:
@@ -748,6 +796,17 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Fraction of packets preceded by a 0x8B "
                              "Transmit Status frame, which the GCS must "
                              "skip without counting an error.")
+    transport = parser.add_argument_group("dual ground station")
+    transport.add_argument(
+        "--alternate", default=None, metavar="N:M",
+        help="Emit only packets where packet_count %% N == M, simulating one "
+             "radio of an alternating-destination pair. Run two instances with "
+             "--alternate 2:1 and --alternate 2:0 on different ports to "
+             "reproduce the real split. The counter still advances normally, "
+             "so the packets each instance emits carry their true sequence "
+             "numbers and the two streams interleave exactly.",
+    )
+
     faults.add_argument("--chaos", action="store_true",
                         help="Preset: a realistically hostile link.")
 

@@ -376,7 +376,7 @@ def format_mission_time(seconds: float) -> str:
 #: Number of vehicle-specific cells every packet contributes to a CSV row.
 #: A packet that does not carry a given sensor writes an empty cell for it, so
 #: one CSV can hold a mixed CanSat/Rocket session without a schema change.
-_VARIANT_CELL_COUNT = 8
+_VARIANT_CELL_COUNT = 9
 
 #: CSV column order.  ``CSV_HEADER``, :meth:`TelemetryPacket.to_csv_row` and
 #: :meth:`TelemetryPacket._variant_cells` are kept adjacent on purpose -- if you
@@ -384,6 +384,7 @@ _VARIANT_CELL_COUNT = 8
 CSV_HEADER: List[str] = [
     "gs_recv_iso",        # ground-station wall clock, ISO-8601 UTC
     "gs_recv_epoch",      # ground-station wall clock, float seconds
+    "radio",              # which ground radio received it (RX1/RX2), "" if one
     "checksum_valid",     # 1 / 0
     "team_id",
     "payload_type",       # CANSAT / ROCKET / GENERIC
@@ -421,6 +422,20 @@ CSV_HEADER: List[str] = [
     # -----------------------------------------------------------------------
     "raw_frame",
 ]
+
+#: The vehicle-specific block runs from the first CanSat column to just before
+#: raw_frame, which is always last. Checked against _VARIANT_CELL_COUNT at
+#: import so a header change that forgets the row builders fails loudly here
+#: rather than silently writing a misaligned CSV for one payload type.
+_VARIANT_SPAN = (CSV_HEADER.index("pm1_0_ugm3"), CSV_HEADER.index("raw_frame"))
+if _VARIANT_SPAN[1] - _VARIANT_SPAN[0] != _VARIANT_CELL_COUNT:
+    raise RuntimeError(
+        "CSV schema mismatch: header has %d vehicle-specific columns but "
+        "_VARIANT_CELL_COUNT is %d. Update CSV_HEADER, _VARIANT_CELL_COUNT and "
+        "every _variant_cells() together."
+        % (_VARIANT_SPAN[1] - _VARIANT_SPAN[0], _VARIANT_CELL_COUNT)
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +489,11 @@ class TelemetryPacket:
     has_fsm_data: bool = True
     #: False when the wire format carries no battery telemetry (raw-CSV mode).
     has_voltage: bool = True
+    #: Which ground radio delivered this packet ("RX1"/"RX2"), or "" on a
+    #: single-radio session. Stamped by the merge layer, not by the parser --
+    #: the wire format carries no such field, and inventing one would be a lie
+    #: about what the flight computer sent.
+    radio: str = ""
 
     # -- derived helpers ---------------------------------------------------
 
@@ -569,6 +589,7 @@ class TelemetryPacket:
         row: List[Any] = [
             iso,
             "%.6f" % self.gs_recv_epoch,
+            self.radio,
             1 if self.checksum_valid else 0,
             self.team_id,
             self.payload_type,
@@ -645,7 +666,9 @@ class RocketPacket(TelemetryPacket):
 
     def _variant_cells(self) -> List[Any]:
         return [
-            "", "", "", "", "", "",   # PM / wheel / recovery stage: CanSat only
+            # PM1.0 / PM2.5 / PM4.0 / PM10 / wheel RPM / recovery stage /
+            # recovery stage name: all CanSat-only, blank on a rocket.
+            "", "", "", "", "", "", "",
             1 if self.solenoid_fired else 0,
             1 if self.nichrome_fired else 0,
         ]

@@ -93,6 +93,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Pre-select the baud rate (default: 9600).",
     )
     parser.add_argument(
+        "--port2", default=None,
+        help="Pre-select the SECOND ground radio's device. The flight "
+             "transmitter alternates between the two, so both are needed to "
+             "receive every packet.",
+    )
+    parser.add_argument(
         "--autoconnect", action="store_true",
         help="Open the link immediately after the window appears.",
     )
@@ -129,14 +135,19 @@ def main(argv=None) -> int:
 
     if args.port:
         window.port_combo.setEditText(args.port)
-    window.baud_combo.setCurrentText(str(args.baud))
+    if args.port2:
+        window.radio_widgets["RX2"]["port"].setEditText(args.port2)
+    for radio_id in ("RX1", "RX2"):
+        window.radio_widgets[radio_id]["baud"].setCurrentText(str(args.baud))
     window.raw_csv_check.setChecked(args.raw_csv)
 
     window.show()
 
     if args.autoconnect and args.port:
         # Fire once the event loop is running so the window paints first.
-        QTimer.singleShot(300, window.toggle_connection)
+        QTimer.singleShot(300, lambda: window.toggle_connection("RX1"))
+        if args.port2:
+            QTimer.singleShot(500, lambda: window.toggle_connection("RX2"))
 
     return app.exec_()
 
