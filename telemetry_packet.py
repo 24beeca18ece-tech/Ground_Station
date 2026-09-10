@@ -489,6 +489,15 @@ class TelemetryPacket:
     has_fsm_data: bool = True
     #: False when the wire format carries no battery telemetry (raw-CSV mode).
     has_voltage: bool = True
+    #: False when the wire format carries no satellite count. The current
+    #: raw-CSV firmware sends satellites over a separate LoRa link that this
+    #: ground station does not ingest, so the field is permanently absent
+    #: rather than momentarily zero -- and ``sats == 0`` would otherwise render
+    #: as a red "no satellites" alert for a receiver that is working fine.
+    has_sats: bool = True
+    #: False when the wire format carries no GPS altitude, for the same reason.
+    #: Distinct from ``altitude_m``, which is barometric and still present.
+    has_nav_alt: bool = True
     #: Which ground radio delivered this packet ("RX1"/"RX2"), or "" on a
     #: single-radio session. Stamped by the merge layer, not by the parser --
     #: the wire format carries no such field, and inventing one would be a lie
@@ -513,15 +522,24 @@ class TelemetryPacket:
     def has_fix(self) -> bool:
         """True when lat/lon describe a real fix, not a marginal or null one.
 
-        Satellite count is part of the test because coordinates alone are not
-        trustworthy: a receiver with a flickering indoor fix emits small,
-        plausible-looking values (0.083333, 0.016667 were both seen on this
-        hardware) before it resets them to zero. A fix with no satellites behind
-        it is not a fix, so those never reach the ground track.
+        Satellite count is the strongest part of the test, because coordinates
+        alone are not trustworthy: a receiver with a flickering indoor fix emits
+        small, plausible-looking values (0.083333, 0.016667 were both seen on
+        this hardware) before it resets them to zero. A fix with no satellites
+        behind it is not a fix, so those never reach the ground track.
+
+        **When the format carries no satellite count** (``has_sats`` False --
+        the current raw-CSV firmware, which sends satellites over LoRa instead)
+        that check cannot be applied, and this degrades to the firmware's own
+        validity behaviour: it zeroes lat/lon when ``gps.location.isValid()`` is
+        false, so exactly-zero coordinates are still rejected. A *marginal* fix
+        is no longer distinguishable from a good one on this link. That is a
+        real reduction in confidence, not an oversight -- the discriminator is
+        simply not on the wire any more.
         """
         if not (math.isfinite(self.lat) and math.isfinite(self.lon)):
             return False
-        if self.sats < 1:
+        if self.has_sats and self.sats < 1:
             return False
         if abs(self.lat) < 1e-9 and abs(self.lon) < 1e-9:
             return False
@@ -636,6 +654,12 @@ class CanSatPacket(TelemetryPacket):
     #: Signed: positive is one direction of wheel spin, negative the other.
     reaction_wheel_rpm: int = 0
     recovery_stage: int = 0
+    #: False when the frame carries the SPS30 payload but no actuator
+    #: telemetry -- the raw-CSV format sends particulates and nothing about the
+    #: reaction wheel or the recovery stage. Without this the tiles would show
+    #: "+0 rpm" and stage 0's name, both of which are dataclass defaults being
+    #: rendered as if the vehicle had reported them.
+    has_actuator_data: bool = True
 
     @property
     def recovery_stage_name(self) -> str:
@@ -871,54 +895,67 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
 # ---------------------------------------------------------------------------
 # !! FIELD MAP -- GROUND TRUTH, verified against the Teensy firmware's snprintf
 # ---------------------------------------------------------------------------
-# Confirmed from the sender's source (Aug 2026), not inferred from values. An
-# earlier statistical pass over ~950 captured frames agreed on indices 0-9 but
-# got the tail wrong; both corrections are recorded here so the reasoning is not
-# repeated:
+# Confirmed from the sender's source (Sep 2026), not inferred from values. This
+# is the SECOND layout this firmware has used; the differences from the first
+# are recorded because getting either wrong is silent, not loud.
 #
-#   * Index 13 is SATELLITES, not FSM_STATE. This format carries NO flight
-#     state at all -- the firmware does not transmit it.
-#   * Indices 10/11 are LATITUDE/LONGITUDE. The odd values seen across captures
-#     (0.083333, 0.016667, 9.685300) were marginal indoor GPS fixes, not a rate
-#     field: the firmware only zeroes them when gps.location.isValid() is false,
-#     so a flickering fix emits small nonsense before resetting to 0.0. This is
-#     why position is gated on SATELLITES rather than trusted on its own.
+#   * GYRO NOW PRECEDES ACCEL on the wire (4-6 gyro, 7-9 accel). The previous
+#     layout had accel at 4-6. Both are three consecutive small floats, so
+#     reading one layout with the other's map does not fail to parse -- it
+#     swaps the two sensors and reports rates as accelerations. Nothing but
+#     this comment and the tests stands between that mistake and a plausible-
+#     looking display, so treat the order as load-bearing.
+#   * GPS_ALTITUDE and SATELLITES ARE GONE from this link. The firmware still
+#     produces both, but sends them over a separate LoRa radio that this ground
+#     station does not ingest. They are absent, permanently and by design --
+#     not missing, not a fault to chase -- so the packet carries has_nav_alt /
+#     has_sats False and the tiles read "--" rather than 0.
+#   * PM1.0/PM2.5/PM4.0/PM10 arrive here now, straight from the SPS30, which is
+#     why this format now produces a CanSatPacket: it carries the particulate
+#     payload, so it is a CanSat frame in everything but the missing header.
 #
-# TWO INDEPENDENT ALTITUDES, deliberately kept apart:
-#   * index 3  BARO_ALTITUDE -- MS5611, against a fixed 1013.25 hPa sea-level
-#     reference with no ground zero-set applied, so it carries a constant offset.
-#   * index 12 GPS_ALTITUDE  -- from the GPS fix; reads 0.0 with no fix.
-# They are different measurements with different failure modes and must not be
-# conflated.
+# CONSEQUENCE FOR POSITION GATING, stated plainly because it is a real loss:
+# the old map gated lat/lon on SATELLITES, because a receiver with a flickering
+# indoor fix emits small plausible-looking coordinates (0.083333, 0.016667 were
+# both seen on this hardware) before zeroing them. With no satellite count on
+# this link that discriminator is gone. All that remains is the firmware's own
+# behaviour -- it zeroes lat/lon when gps.location.isValid() is false -- so a
+# marginal fix can now reach the ground track where it previously could not.
+# has_fix documents exactly this.
+#
+# ALTITUDE: only ONE altitude arrives on this link now, the barometric one at
+# index 3 (BMP581, against a fixed 1013.25 hPa sea-level reference with no
+# ground zero-set, so it carries a constant offset). It is still kept in
+# altitude_m and never merged with nav_alt_m, which now simply has no source.
 #
 # Anything mapped to None is absent from this wire format, ignored, and simply
 # preserved in ``raw_frame``.
 RAW_CSV_FIELD_MAP = {
     "PACKET_COUNT": 0,     # PACKET_ID       (unsigned long)
-    "TEMP": 1,             # TEMP_C          (2 dp)
-    "PRESSURE": 2,         # PRESSURE_HPA    (2 dp)
+    "TEMP": 1,             # TEMP_C          (BMP581, 2 dp)
+    "PRESSURE": 2,         # PRESSURE_HPA    (BMP581, 2 dp)
     "ALTITUDE": 3,         # BARO_ALTITUDE_M (2 dp, 1013.25 hPa reference)
-    "ACC_X": 4,            # ACCEL_X_G       (2 dp)
-    "ACC_Y": 5,            # ACCEL_Y_G       (2 dp)
-    "ACC_Z": 6,            # ACCEL_Z_G       (2 dp)
-    "GYRO_X": 7,           # GYRO_X          (2 dp)
-    "GYRO_Y": 8,           # GYRO_Y          (2 dp)
-    "GYRO_Z": 9,           # GYRO_Z          (2 dp)
+    "GYRO_X": 4,           # GYRO_X          (deg/s, 2 dp)  <-- gyro FIRST
+    "GYRO_Y": 5,           # GYRO_Y          (deg/s, 2 dp)
+    "GYRO_Z": 6,           # GYRO_Z          (deg/s, 2 dp)
+    "ACC_X": 7,            # ACCEL_X_G       (g, 3 dp)      <-- accel SECOND
+    "ACC_Y": 8,            # ACCEL_Y_G       (g, 3 dp)
+    "ACC_Z": 9,            # ACCEL_Z_G       (g, 3 dp)
     "LAT": 10,             # LATITUDE        (6 dp)
     "LON": 11,             # LONGITUDE       (6 dp)
-    "NAV_ALT": 12,         # GPS_ALTITUDE_M  (2 dp) -- distinct from index 3
-    "SATS": 13,            # SATELLITES      (unsigned long)
+    "PM1_0": 12,           # PM1_0           (SPS30, ug/m3, 2 dp)
+    "PM2_5": 13,           # PM2_5           (SPS30, ug/m3, 2 dp)
+    "PM4_0": 14,           # PM4_0           (SPS30, ug/m3, 2 dp)
+    "PM10": 15,            # PM10            (SPS30, ug/m3, 2 dp)
     # Absent from this wire format entirely:
     "VOLTAGE": None,       # no battery telemetry
     "FSM_STATE": None,     # firmware sends no flight state in raw CSV
+    "NAV_ALT": None,       # GPS altitude goes out over LoRa, not this link
+    "SATS": None,          # satellite count goes out over LoRa, not this link
 }
 
-#: A position fix is only believed when the GPS reports at least this many
-#: satellites. Without this, marginal indoor fixes plot as real coordinates.
-RAW_CSV_MIN_SATS = 1
-
-#: Number of fields in the observed record.
-RAW_CSV_FIELD_COUNT = 14
+#: Number of fields in the record this firmware emits.
+RAW_CSV_FIELD_COUNT = 16
 
 #: Shortest record we will accept: enough fields to satisfy every mapped index.
 RAW_CSV_MIN_FIELDS = max(
@@ -939,16 +976,21 @@ def parse_raw_csv(record: str, team_id: str,
                   mission_epoch: Optional[float] = None) -> TelemetryPacket:
     """Parse one bare-CSV record from the pre-spec Teensy firmware.
 
-    The record carries no team ID, no mission clock, no battery voltage and no
-    GPS, so those are filled from *team_id* and the ground-station clock rather
-    than invented. Everything downstream -- plausibility filtering, CSV logging,
-    the dashboard -- then works unchanged.
+    The record carries no team ID, no mission clock, no battery voltage, no
+    flight state, no GPS altitude and no satellite count, so what can be
+    supplied is filled from *team_id* and the ground-station clock and the rest
+    is flagged absent rather than invented. Everything downstream --
+    plausibility filtering, CSV logging, the dashboard -- then works unchanged.
+
+    It carries SPS30 particulates, so the result is a :class:`CanSatPacket`.
 
     Parameters
     ----------
     record:
-        One record, without ``$``/``*XX``, e.g.
-        ``"5635,24.36,944.42,589.48,0.00,-0.00,1.00,0.01,-0.04,-0.02,..."``.
+        One 16-field record, without ``$``/``*XX``, e.g.
+        ``"5635,24.36,944.42,589.48,0.01,-0.04,-0.02,0.00,-0.00,1.00,"``
+        ``"32.726598,74.857000,4.10,6.35,7.02,7.44"`` -- gyro at 4-6, accel at
+        7-9, SPS30 particulates at 12-15.
     team_id:
         Substituted for the missing TEAM_ID field.
     gs_recv_epoch:
@@ -986,27 +1028,28 @@ def parse_raw_csv(record: str, team_id: str,
     if mission_epoch is not None:
         mission_s = max(gs_recv_epoch - mission_epoch, 0.0)
 
-    # GPS gating. The firmware zeroes LAT/LON only when gps.location.isValid()
-    # is false, so a flickering indoor fix emits small nonsense coordinates
-    # before it resets them. Satellite count is the reliable discriminator, so
-    # position is dropped outright unless the fix is backed by satellites.
-    sats = _opt_int(_raw_csv_get(fields, "SATS"), 0)
+    # Position. There is no satellite count on this link to gate on any more
+    # (it goes out over LoRa), so all that is left is the firmware's own rule:
+    # it writes 0.0/0.0 when gps.location.isValid() is false. has_fix rejects
+    # exactly-zero coordinates, which is where that case lands.
     lat = _opt_float(_raw_csv_get(fields, "LAT"))
     lon = _opt_float(_raw_csv_get(fields, "LON"))
-    nav_alt = _opt_float(_raw_csv_get(fields, "NAV_ALT"))
-    if sats < RAW_CSV_MIN_SATS:
-        lat = lon = nav_alt = 0.0
 
-    # This format reports acceleration in g; every consumer downstream (the
-    # plausibility envelope, the accel strip chart, the attitude estimator)
-    # works in m/s^2, matching the $..*XX formats. Convert here so the raw-CSV
-    # path is not the one place with different units.
+    # This format reports acceleration in g (indices 7-9 in the current
+    # layout); every consumer downstream -- the plausibility envelope, the
+    # accel strip chart, the attitude estimator -- works in m/s^2, matching the
+    # $..*XX formats. Convert here so the raw-CSV path is not the one place
+    # with different units.
     acc_x = _opt_float(_raw_csv_get(fields, "ACC_X")) * G_MS2
     acc_y = _opt_float(_raw_csv_get(fields, "ACC_Y")) * G_MS2
     acc_z = _opt_float(_raw_csv_get(fields, "ACC_Z")) * G_MS2
 
-    return TelemetryPacket(
-        payload_type=PAYLOAD_GENERIC,
+    # A CanSatPacket, not a generic one: this frame carries the SPS30
+    # particulates, so it is the CanSat payload and belongs on the CanSat
+    # tiles and chart. What it does NOT carry -- wheel RPM, recovery stage --
+    # is flagged absent rather than left to render as dataclass defaults.
+    return CanSatPacket(
+        payload_type=PAYLOAD_CANSAT,
         team_id=team_id,
         raw_frame=text,
         # No checksum exists in this format. Saying "valid" would claim an
@@ -1025,25 +1068,38 @@ def parse_raw_csv(record: str, team_id: str,
         nav_time="",
         lat=lat,
         lon=lon,
-        # GPS altitude (index 12) is a separate measurement from the barometric
-        # altitude in index 3 and is kept in its own field, never merged.
-        nav_alt_m=nav_alt,
-        sats=sats,
+        # GPS altitude and satellite count are not on this link at all -- the
+        # firmware sends them over LoRa. 0 here is a placeholder the dataclass
+        # requires; has_nav_alt / has_sats are what the display reads, and they
+        # make both tiles show "--" instead of a fabricated 0.
+        nav_alt_m=0.0,
+        sats=0,
+        has_nav_alt=False,
+        has_sats=False,
         acc_x=acc_x,
         acc_y=acc_y,
         acc_z=acc_z,
-        # Gyro units are NOT stated by the firmware. Treated as deg/s to match
-        # the $..*XX formats; at rest both deg/s and rad/s read ~0, so this
-        # capture could not distinguish them. Confirm before trusting rates.
+        # Gyro is deg/s, confirmed from the firmware source, matching the
+        # $..*XX formats -- no conversion needed. Note these are indices 4-6:
+        # this layout puts gyro BEFORE accel.
         gyro_x=_opt_float(_raw_csv_get(fields, "GYRO_X")),
         gyro_y=_opt_float(_raw_csv_get(fields, "GYRO_Y")),
         gyro_z=_opt_float(_raw_csv_get(fields, "GYRO_Z")),
+        # SPS30 mass concentrations, ug/m3. Names and units already match the
+        # $..*XX CanSat fields, so the existing tiles and chart take them
+        # unchanged.
+        pm1_0=_opt_float(_raw_csv_get(fields, "PM1_0")),
+        pm2_5=_opt_float(_raw_csv_get(fields, "PM2_5")),
+        pm4_0=_opt_float(_raw_csv_get(fields, "PM4_0")),
+        pm10=_opt_float(_raw_csv_get(fields, "PM10")),
         # This format carries no flight state at all. 0 is BOOT only because the
         # dataclass needs an int; the dashboard shows "NO FSM DATA" instead,
         # driven by has_fsm_data rather than by this value.
         fsm_state=0,
         has_fsm_data=False,
         has_voltage=False,
+        # No reaction-wheel or recovery telemetry on this link either.
+        has_actuator_data=False,
     )
 
 

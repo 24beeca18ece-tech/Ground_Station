@@ -375,11 +375,22 @@ class DiagnosticsWindow(QDialog):
                 self._set("lat", "NO FIX", COL_WARN)
                 self._set("lon", "NO FIX", COL_WARN)
 
-            self._set("nav_alt", *self._num(packet.nav_alt_m, 2, "m"))
+            # Both come off the flight computer's LoRa link on the current
+            # raw-CSV firmware, which this station does not ingest. Absent is
+            # not zero: a red "0 satellites" would send the operator hunting a
+            # GPS fault that does not exist.
+            if getattr(packet, "has_nav_alt", True):
+                self._set("nav_alt", *self._num(packet.nav_alt_m, 2, "m"))
+            else:
+                self._set("nav_alt", "-- (not on this link)", COL_DIM)
 
-            sats = packet.sats
-            sat_color = COL_OK if sats >= 6 else (COL_WARN if sats >= 4 else COL_ALERT)
-            self._set("sats", "%d" % sats, sat_color)
+            if getattr(packet, "has_sats", True):
+                sats = packet.sats
+                sat_color = (COL_OK if sats >= 6
+                             else (COL_WARN if sats >= 4 else COL_ALERT))
+                self._set("sats", "%d" % sats, sat_color)
+            else:
+                self._set("sats", "-- (not on this link)", COL_DIM)
 
             for key, value in (("acc_x", packet.acc_x), ("acc_y", packet.acc_y),
                                ("acc_z", packet.acc_z)):
@@ -388,8 +399,15 @@ class DiagnosticsWindow(QDialog):
                                ("gyro_z", packet.gyro_z)):
                 self._set(key, *self._num(value, 3, "°/s"))
 
-            self._set("fsm", "%s (%d)" % (packet.fsm_name, packet.fsm_state),
-                      FSM_COLORS.get(packet.fsm_state, FSM_UNKNOWN_COLOR))
+            # fsm_state is 0 by dataclass default on formats that carry no
+            # flight state, and 0 is BOOT -- so rendering it unconditionally
+            # reports a state the vehicle never sent. The banner already says
+            # "NO FSM DATA"; this row must agree with it.
+            if getattr(packet, "has_fsm_data", True):
+                self._set("fsm", "%s (%d)" % (packet.fsm_name, packet.fsm_state),
+                          FSM_COLORS.get(packet.fsm_state, FSM_UNKNOWN_COLOR))
+            else:
+                self._set("fsm", "-- (not on this link)", COL_DIM)
 
             # Rocket-only recovery flags.  A CanSat or legacy packet does not
             # carry them, and showing "SAFE" there would be a lie.

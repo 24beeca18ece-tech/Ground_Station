@@ -2299,9 +2299,14 @@ class Dashboard(QMainWindow):
                 self.append_event("Payload type detected: %s" % packet.payload_type)
 
             if packet.is_cansat:
-                self.chart_wheel.add_point(
-                    x, {"rpm": float(packet.reaction_wheel_rpm)}
-                )
+                # Only chart the wheel when the frame actually reported it.
+                # The raw-CSV format carries particulates but no actuator
+                # telemetry, and a flat zero line reads as "wheel idle" rather
+                # than "no such measurement".
+                if getattr(packet, "has_actuator_data", True):
+                    self.chart_wheel.add_point(
+                        x, {"rpm": float(packet.reaction_wheel_rpm)}
+                    )
                 self.chart_pm.add_point(x, {
                     "PM1.0": packet.pm1_0,
                     "PM2.5": packet.pm2_5,
@@ -2469,7 +2474,6 @@ class Dashboard(QMainWindow):
         self.tile_alt.set_value(self._fmt(packet.altitude_m, 1))
         self.tile_press.set_value(self._fmt(packet.pressure_hpa, 2))
         self.tile_temp.set_value(self._fmt(packet.temp_c, 1))
-        self.tile_sats.set_value(str(packet.sats))
 
         # Battery warning: configurable threshold, plus a hard alert 10% below it.
         # Formats that carry no battery telemetry get "--" rather than 0.00 V,
@@ -2490,13 +2494,27 @@ class Dashboard(QMainWindow):
             else:
                 self.tile_volt.set_level("ok")
 
-        self.tile_sats.set_level(
-            "ok" if packet.sats >= 6 else ("warn" if packet.sats >= 4 else "alert")
-        )
+        # Satellite count and GPS altitude are absent from the current raw-CSV
+        # firmware -- it sends both over a separate LoRa link this station does
+        # not ingest. Showing 0 would read as "no satellites, no altitude" and
+        # colour the tile red for a receiver that is working perfectly, so an
+        # absent field says "--" and stays neutral.
+        if getattr(packet, "has_sats", True):
+            self.tile_sats.set_value(str(packet.sats))
+            self.tile_sats.set_level(
+                "ok" if packet.sats >= 6
+                else ("warn" if packet.sats >= 4 else "alert")
+            )
+        else:
+            self.tile_sats.set_value("--")
+            self.tile_sats.set_level("normal")
 
         self.tile_lat.set_value(self._fmt(packet.lat, 6))
         self.tile_lon.set_value(self._fmt(packet.lon, 6))
-        self.tile_nav_alt.set_value(self._fmt(packet.nav_alt_m, 1))
+        self.tile_nav_alt.set_value(
+            self._fmt(packet.nav_alt_m, 1)
+            if getattr(packet, "has_nav_alt", True) else "--"
+        )
         self.tile_lat.set_level("normal" if packet.has_fix else "warn")
         self.tile_lon.set_level("normal" if packet.has_fix else "warn")
 
@@ -2632,18 +2650,27 @@ class Dashboard(QMainWindow):
             else:
                 self.tile_pm25.set_level("ok")
 
-            rpm = packet.reaction_wheel_rpm
-            self.tile_wheel.set_value("%+d" % rpm)
-            # Near saturation the wheel can no longer authority-control the
-            # spin, which is worth flagging to the operator.
-            self.tile_wheel.set_level("alert" if abs(rpm) >= 1050 else "normal")
+            # The raw-CSV firmware sends particulates but no actuator
+            # telemetry. "+0 rpm" and stage 0's name are dataclass defaults,
+            # not readings, so say "--" rather than render them.
+            if not getattr(packet, "has_actuator_data", True):
+                self.tile_wheel.set_value("--")
+                self.tile_wheel.set_level("normal")
+                self.tile_recovery.set_value("--")
+                self.tile_recovery.value.setStyleSheet("color: %s;" % COL_TEXT_DIM)
+            else:
+                rpm = packet.reaction_wheel_rpm
+                self.tile_wheel.set_value("%+d" % rpm)
+                # Near saturation the wheel can no longer authority-control the
+                # spin, which is worth flagging to the operator.
+                self.tile_wheel.set_level("alert" if abs(rpm) >= 1050 else "normal")
 
-            stage = packet.recovery_stage
-            self.tile_recovery.set_value(
-                RECOVERY_STAGES.get(stage, "UNKNOWN(%s)" % stage)
-            )
-            color = RECOVERY_STAGE_COLORS.get(stage, COL_TEXT)
-            self.tile_recovery.value.setStyleSheet("color: %s;" % color)
+                stage = packet.recovery_stage
+                self.tile_recovery.set_value(
+                    RECOVERY_STAGES.get(stage, "UNKNOWN(%s)" % stage)
+                )
+                color = RECOVERY_STAGE_COLORS.get(stage, COL_TEXT)
+                self.tile_recovery.value.setStyleSheet("color: %s;" % color)
 
         elif packet.is_rocket:
             self.light_solenoid.set_state(packet.solenoid_fired)
