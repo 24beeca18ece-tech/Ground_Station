@@ -132,6 +132,38 @@ RADIO_IDS = ("RX1", "RX2")
 #: hold window is what actually governs latency.
 MERGE_DRAIN_HZ = 30
 
+# --- expected gaps in the merged stream ------------------------------------
+# The flight computer routes by ``packetId % 3``: 1 -> RX1, 2 -> RX2, 0 -> the
+# LoRa link. LoRa is not ingested here, so every third packet_count is missing
+# from the merged stream permanently and by design.
+#
+# At 20 Hz that is ~6.7 gaps a second. Logging each one individually drowned
+# the event log -- in a 15 s bench run, 99 of 109 log lines were routine gap
+# notices, which is exactly the condition under which a real dropout goes
+# unnoticed. So the routine case is counted and summarised periodically, and
+# anything that is NOT the routine case is still logged the instant it happens.
+#
+# A routine gap is defined narrowly: EXACTLY ONE packet_count, and that count a
+# multiple of the modulus. Under this routing that is the only shape an
+# expected gap can take -- two adjacent missing counts already mean something
+# else went wrong -- so anything wider stays loud even if it contains
+# multiples. Set LORA_ROUTING_MODULUS to 0 to treat every gap as unexpected.
+LORA_ROUTING_MODULUS = 3
+
+#: Seconds between routine-gap summary lines.
+GAP_SUMMARY_INTERVAL_S = 10.0
+
+#: An unexpected gap is always logged in full the moment it happens -- but a
+#: radio that stays down keeps producing them (with one of two radios gone,
+#: every third gap is a 2-packet run), and 58 identical lines bury the first
+#: one just as effectively as the routine chatter did. So the leading edge is
+#: immediate and the repeats within this window are collapsed into one line.
+GAP_ANOMALY_QUIET_S = 10.0
+
+#: ...or this many routine gaps, whichever comes first, so a fast link does not
+#: wait the full interval before saying anything.
+GAP_SUMMARY_MAX_PENDING = 200
+
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
 TEAM_ID_FALLBACK = "TEST001"
@@ -1018,7 +1050,21 @@ class Dashboard(QMainWindow):
         #: charts, tiles, the attitude widget and the CSV are fed from its
         #: output, never from a worker directly, so there is exactly one
         #: chronological view of the flight.
-        self.merger = PacketMerger(on_warning=self._on_merge_warning)
+        self.merger = PacketMerger(on_warning=self._on_merge_warning,
+                                   on_gap=self._on_merge_gap)
+        # Routine (LoRa-routed) gaps waiting to be summarised: count, the
+        # packet_count range they span, and when this batch started.
+        self._routine_gaps = 0
+        self._routine_gap_first: Optional[int] = None
+        self._routine_gap_last: Optional[int] = None
+        self._routine_gap_since = time.time()
+        # Repeats of an ongoing anomaly, collapsed the same way. The first one
+        # after a quiet period is never banked -- it goes straight out.
+        self._anomaly_last_logged = 0.0
+        self._anomaly_repeats = 0
+        self._anomaly_first: Optional[int] = None
+        self._anomaly_last: Optional[int] = None
+        self._anomaly_packets = 0
 
         #: Per-radio connection state and arrival times, for the row status.
         self.radio_state = {
@@ -2250,6 +2296,110 @@ class Dashboard(QMainWindow):
         self.append_event("MERGE: %s" % text)
         self.csv_logger.log_note("merge: %s" % text)
 
+    @staticmethod
+    def _is_routine_gap(first: int, last: int, lost: int) -> bool:
+        """True for the one gap shape this flight's routing plan predicts.
+
+        Exactly one packet_count, and that count routed to LoRa. Deliberately
+        narrow: a two-count gap is not what the routing produces, so it stays
+        loud even though one of its counts may be a multiple of the modulus.
+        """
+        if LORA_ROUTING_MODULUS <= 1:
+            return False
+        return lost == 1 and first == last and first % LORA_ROUTING_MODULUS == 0
+
+    def _on_merge_gap(self, first: int, last: int, lost: int) -> None:
+        """Decide how loudly to report one confirmed gap.
+
+        The merger has already counted it -- ``missing`` and ``gaps`` are
+        updated before this is called, for routine and unexpected alike. All
+        that is decided here is what reaches the operator's log.
+        """
+        if not self._is_routine_gap(first, last, lost):
+            self._report_unexpected_gap(first, last, lost)
+            return
+
+        if self._routine_gaps == 0:
+            self._routine_gap_since = time.time()
+            self._routine_gap_first = first
+        self._routine_gap_last = last
+        self._routine_gaps += 1
+        if self._routine_gaps >= GAP_SUMMARY_MAX_PENDING:
+            self._flush_routine_gaps()
+
+    def _report_unexpected_gap(self, first: int, last: int, lost: int) -> None:
+        """Log an unexpected gap now, or bank it if one was just reported.
+
+        Not the expected pattern: a dropout, a corrupted frame, or anything
+        else. The first one after a quiet period goes out immediately and in
+        full -- that instant is the whole reason this branch exists.
+        """
+        now = time.time()
+        if now - self._anomaly_last_logged < GAP_ANOMALY_QUIET_S:
+            # The same anomaly, still going. Count it; the timer will say so.
+            self._anomaly_repeats += 1
+            self._anomaly_packets += lost
+            if self._anomaly_first is None:
+                self._anomaly_first = first
+            self._anomaly_last = last
+            return
+
+        # Any routine gaps banked so far happened BEFORE this, and the log
+        # would imply otherwise if they were emitted after it.
+        self._flush_routine_gaps(before_anomaly=True)
+        span = str(first) if first == last else "%d-%d" % (first, last)
+        self._on_merge_warning(
+            "UNEXPECTED gap -- packet_count %s never arrived (%d packet%s); "
+            "charts will show a gap" % (span, lost, "" if lost == 1 else "s")
+        )
+        self._anomaly_last_logged = now
+
+    def _flush_anomaly_repeats(self) -> None:
+        """Emit one line for unexpected gaps that repeated since the last one."""
+        if self._anomaly_repeats <= 0:
+            return
+        text = ("%d further unexpected gaps (packet_count %d-%d, %d packets) "
+                "-- still losing data, not the routine 1-in-%d pattern"
+                % (self._anomaly_repeats, self._anomaly_first,
+                   self._anomaly_last, self._anomaly_packets,
+                   LORA_ROUTING_MODULUS))
+        self.append_event("MERGE: %s" % text)
+        self.csv_logger.log_note("merge: %s" % text)
+        self._anomaly_repeats = 0
+        self._anomaly_first = None
+        self._anomaly_last = None
+        self._anomaly_packets = 0
+        self._anomaly_last_logged = time.time()
+
+    def _flush_routine_gaps(self, before_anomaly: bool = False) -> None:
+        """Emit one summary line for the routine gaps banked so far."""
+        if self._routine_gaps <= 0:
+            return
+        elapsed = max(time.time() - self._routine_gap_since, 0.0)
+        text = ("%d routine gaps in %.0f s (packet_count %d-%d, each a single "
+                "multiple of %d -- LoRa-routed, not received over XBee)"
+                % (self._routine_gaps, elapsed,
+                   self._routine_gap_first, self._routine_gap_last,
+                   LORA_ROUTING_MODULUS))
+        if before_anomaly:
+            text += " [preceding the gap above]"
+        self.append_event("MERGE: %s" % text)
+        self.csv_logger.log_note("merge: %s" % text)
+        self._routine_gaps = 0
+        self._routine_gap_first = None
+        self._routine_gap_last = None
+        self._routine_gap_since = time.time()
+
+    def _tick_routine_gap_summary(self) -> None:
+        """Timer hook: emit either summary once its interval has elapsed."""
+        now = time.time()
+        if (self._routine_gaps > 0
+                and now - self._routine_gap_since >= GAP_SUMMARY_INTERVAL_S):
+            self._flush_routine_gaps()
+        if (self._anomaly_repeats > 0
+                and now - self._anomaly_last_logged >= GAP_ANOMALY_QUIET_S):
+            self._flush_anomaly_repeats()
+
     def on_packet(self, packet: TelemetryPacket) -> None:
         """Store one validated packet.  No widget is touched here — see _render."""
         try:
@@ -2737,6 +2887,7 @@ class Dashboard(QMainWindow):
 
         self._update_radio_rows()
         self._push_link_diagnostics()
+        self._tick_routine_gap_summary()
 
         if self.last_packet_epoch is None:
             self.tile_age.set_value("--")
@@ -2784,6 +2935,10 @@ class Dashboard(QMainWindow):
             self._render()
             self.attitude.redraw()
         else:
+            # Bank nothing across a stop: the summaries belong with the
+            # packets they describe, not with whatever runs next.
+            self._flush_anomaly_repeats()
+            self._flush_routine_gaps()
             self.append_event(
                 "Telemetry STOPPED — link still open; arriving packets are "
                 "ignored, not displayed and not logged."
@@ -3018,6 +3173,8 @@ class Dashboard(QMainWindow):
         logger (so it can drain whatever is still queued before closing files).
         """
         try:
+            self._flush_anomaly_repeats()
+            self._flush_routine_gaps()
             self.render_timer.stop()
             self.status_timer.stop()
             self.attitude_timer.stop()

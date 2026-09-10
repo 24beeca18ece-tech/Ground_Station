@@ -108,12 +108,22 @@ class PacketMerger:
         Called with a human-readable string for conditions worth surfacing --
         duplicates, gaps, counter resets.  Optional; counters are kept
         regardless.
+    on_gap:
+        Called as ``on_gap(first, last, lost)`` when a run of packet_counts is
+        given up on, *instead of* the string warning for that one case.  It
+        exists so a caller that knows the flight's routing plan can decide
+        which gaps are expected before deciding how loudly to report them --
+        this class deliberately knows nothing about that.  Optional; with no
+        callback the string warning is emitted exactly as before, and either
+        way ``missing`` and ``gaps`` count identically.
     """
 
     def __init__(self, hold_s: float = HOLD_S,
-                 on_warning: Optional[Callable[[str], None]] = None) -> None:
+                 on_warning: Optional[Callable[[str], None]] = None,
+                 on_gap: Optional[Callable[[int, int, int], None]] = None) -> None:
         self.hold_s = float(hold_s)
         self._on_warning = on_warning
+        self._on_gap = on_gap
 
         #: packet_count -> (packet, source, arrival_monotonic)
         self._buffer: Dict[int, Tuple[Any, str, float]] = {}
@@ -255,12 +265,7 @@ class PacketMerger:
             if lost > 0:
                 self.missing += lost
                 self.gaps += 1
-                self._warn(
-                    "packet_count %s never arrived (%d packet%s); charts will "
-                    "show a gap"
-                    % (self._describe_range(self._next, oldest_count - 1),
-                       lost, "" if lost == 1 else "s")
-                )
+                self._report_gap(self._next, oldest_count - 1, lost)
             self._next = oldest_count
 
         return out
@@ -335,6 +340,25 @@ class PacketMerger:
         self._recent_set.add(count)
         if len(self._recent) > RECENT_MEMORY:
             self._recent_set.discard(self._recent.pop(0))
+
+    def _report_gap(self, first: int, last: int, lost: int) -> None:
+        """Hand a confirmed gap to whichever callback the caller supplied.
+
+        Counters are already updated by the caller; this only decides how the
+        gap is announced. ``on_gap`` gets the raw range so the caller can
+        classify it; without one, the same string warning as always is sent.
+        """
+        if self._on_gap is not None:
+            try:
+                self._on_gap(first, last, lost)
+            except Exception:
+                # A reporting callback must never be able to break ingestion.
+                pass
+            return
+        self._warn(
+            "packet_count %s never arrived (%d packet%s); charts will show a gap"
+            % (self._describe_range(first, last), lost, "" if lost == 1 else "s")
+        )
 
     def _warn(self, text: str) -> None:
         if self._on_warning is not None:
