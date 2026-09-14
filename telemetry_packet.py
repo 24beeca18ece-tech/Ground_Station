@@ -382,6 +382,7 @@ _VARIANT_CELL_COUNT = 9
 #: :meth:`TelemetryPacket._variant_cells` are kept adjacent on purpose -- if you
 #: add a field, change all three.
 CSV_HEADER: List[str] = [
+    "seq",                # Nth packet logged this session; stamped by the logger
     "gs_recv_iso",        # ground-station wall clock, ISO-8601 UTC
     "gs_recv_epoch",      # ground-station wall clock, float seconds
     "radio",              # which ground radio received it (RX1/RX2), "" if one
@@ -605,6 +606,10 @@ class TelemetryPacket:
             timespec="milliseconds"
         )
         row: List[Any] = [
+            # seq is a property of the logging session, not of the packet --
+            # the same packet logged twice would rightly get two numbers -- so
+            # the logger fills it in at write time. Blank here on purpose.
+            "",
             iso,
             "%.6f" % self.gs_recv_epoch,
             self.radio,

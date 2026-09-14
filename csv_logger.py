@@ -72,6 +72,9 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from telemetry_packet import CSV_HEADER, TelemetryPacket, safe_filename
 
+#: Column carrying the per-session sequence number.
+SEQ_COL = CSV_HEADER.index("seq")
+
 #: Default output directory, relative to the working directory.
 DEFAULT_LOG_DIR = "logs"
 
@@ -162,6 +165,13 @@ class CsvLoggerThread(QThread):
         self.rows_written = 0
         self.rows_dropped = 0
         self.errors_written = 0
+        #: Sequence number of the last row written to the CURRENT file. Per
+        #: file, not per process: a new START LOGGING starts again at 1, and a
+        #: resumed file continues from its highest existing value. This is
+        #: what the ``seq`` column and the table's row labels show, and it is
+        #: assigned in arrival order and never touched again -- which is what
+        #: makes it independent of where the row ends up being displayed.
+        self._seq = 0
 
     # ------------------------------------------------------------------
     # Producer API — safe to call from any thread, never blocks, never raises
@@ -274,6 +284,10 @@ class CsvLoggerThread(QThread):
         # their own sensor columns and leave the other vehicle's columns blank,
         # so one CSV can hold a mixed session and the row width never varies.
         row: List[Any] = packet.to_csv_row()
+        # Arrival order, stamped once, before the row goes anywhere. The
+        # newest-first rewrite and the table both just carry it along.
+        self._seq += 1
+        row[SEQ_COL] = self._seq
         # Journal first: the row is durable before it is anywhere else.
         self._journal_writer.writerow(row)
         self._rows.append(row)
@@ -346,6 +360,17 @@ class CsvLoggerThread(QThread):
         stamp = self._session_stamp or datetime.now().strftime("%Y-%m-%d_%H%M%S")
         return "Flight_%s_%s.csv" % (safe_filename(team_id), stamp)
 
+    @staticmethod
+    def _highest_seq(rows: List[List[Any]]) -> int:
+        """Largest ``seq`` in *rows*, or 0 -- so a resumed file keeps counting."""
+        best = 0
+        for row in rows:
+            try:
+                best = max(best, int(row[SEQ_COL]))
+            except (IndexError, ValueError, TypeError):
+                continue
+        return best
+
     def _load_existing_rows(self, path: str) -> List[List[Any]]:
         """Read the data rows of an existing newest-first CSV, oldest-first.
 
@@ -384,6 +409,7 @@ class CsvLoggerThread(QThread):
                     return  # could not archive; do not corrupt the old file
 
             self._rows = self._load_existing_rows(path) if exists else []
+            self._seq = self._highest_seq(self._rows)
 
             # The journal is append-only and never re-read during a session, so
             # it is opened in append mode and simply grows.

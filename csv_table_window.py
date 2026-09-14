@@ -89,8 +89,15 @@ class CsvTableModel(QAbstractTableModel):
         try:
             self._state_col = self._headers.index("fsm_state_name")
             self._valid_col = self._headers.index("checksum_valid")
+            self._seq_col = self._headers.index("seq")
         except ValueError:                    # pragma: no cover - schema change
-            self._state_col = self._valid_col = -1
+            self._state_col = self._valid_col = self._seq_col = -1
+        # Columns rendered as text rather than numbers.
+        self._text_cols = {i for i, name in enumerate(self._headers)
+                           if name in ("gs_recv_iso", "radio", "team_id",
+                                       "payload_type", "timestamp",
+                                       "mission_time_hms", "nav_time",
+                                       "recovery_stage_name", "raw_frame")}
 
     # -- Qt model interface ------------------------------------------------
 
@@ -104,7 +111,15 @@ class CsvTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             if orientation == Qt.Horizontal:
                 return self._headers[section]
-            # Position in the view, newest first: 1 is the most recent row.
+            # The row's own sequence number, NOT its position in the view.
+            # Position was the bug: newest-first puts every new row at index
+            # 0, so the newest was always "1" and every older row was
+            # renumbered on each arrival. seq is stamped by the logger in
+            # arrival order and travels with the row.
+            if 0 <= self._seq_col and section < len(self._view):
+                row = self._view[section]
+                if self._seq_col < len(row) and str(row[self._seq_col]) != "":
+                    return str(row[self._seq_col])
             return section + 1
         if role == Qt.ForegroundRole and orientation == Qt.Horizontal:
             return QColor(COL_HEADER)
@@ -124,7 +139,7 @@ class CsvTableModel(QAbstractTableModel):
                 return QColor(COL_ALERT)
             if col == self._state_col:
                 return QColor(COL_OK)
-            return QColor(COL_NUM if col > 2 else COL_TEXT)
+            return QColor(COL_TEXT if col in self._text_cols else COL_NUM)
         if role == Qt.TextAlignmentRole:
             return int(Qt.AlignRight | Qt.AlignVCenter)
         return None

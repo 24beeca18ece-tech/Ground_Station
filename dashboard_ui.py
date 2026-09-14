@@ -1866,32 +1866,13 @@ class Dashboard(QMainWindow):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
-        # Telemetry-stopped banner. Deliberately distinct from the stale/alert
-        # banner: an operator must never confuse "I have not started ingesting"
-        # with "the link died".
-        self.telemetry_banner = QLabel("")
-        self.telemetry_banner.setAlignment(Qt.AlignCenter)
-        banner_font = QFont()
-        banner_font.setPointSize(12)
-        banner_font.setBold(True)
-        self.telemetry_banner.setFont(banner_font)
-        self.telemetry_banner.setMinimumHeight(28)
-        self.telemetry_banner.setVisible(True)
-
-        self.stale_banner = QLabel("")
-        self.stale_banner.setAlignment(Qt.AlignCenter)
-        stale_font = QFont()
-        stale_font.setPointSize(12)
-        stale_font.setBold(True)
-        self.stale_banner.setFont(stale_font)
-        self.stale_banner.setMinimumHeight(28)
-        # Rows 0-2 are tiles; the two banners sit below them. stale_banner used
-        # to be row 2, which silently painted over the RSSI row added there.
-        # Both banners occupy the same row: only one is ever shown, because
-        # "I have not started ingesting" and "the link went quiet" are never
-        # both the headline at the same moment.
-        grid.addWidget(self.stale_banner, 3, 0, 1, 2)
-        grid.addWidget(self.telemetry_banner, 3, 0, 1, 2)
+        # No status banner below the tiles any more. The row used to carry
+        # "TELEMETRY STOPPED" / "LINK NOMINAL" / "!! TELEMETRY STALE !!", and a
+        # one-second dropout flipped it red before the link had even finished
+        # recovering, which read as "broken" to an operator glancing over.
+        # Nothing it said is lost: ingestion state is the START/STOP TELEMETRY
+        # button, staleness colours the PACKET AGE tile and is logged, and
+        # link state is on the connection bar.
 
         self.tile_total.set_value("0/0")
         self.tile_corrupt.set_value("0/0/0")
@@ -2892,7 +2873,6 @@ class Dashboard(QMainWindow):
         if self.last_packet_epoch is None:
             self.tile_age.set_value("--")
             self.tile_age.set_level("normal")
-            self._set_stale_banner(None)
             return
 
         age = now - self.last_packet_epoch
@@ -2900,7 +2880,6 @@ class Dashboard(QMainWindow):
 
         stale = age > STALE_AFTER_S
         self.tile_age.set_level("alert" if stale else "ok")
-        self._set_stale_banner(stale)
 
         if stale != self._was_stale:
             self._was_stale = stale
@@ -2957,16 +2936,6 @@ class Dashboard(QMainWindow):
         self.telemetry_btn.setProperty("running", "true" if running else "false")
         self.telemetry_btn.style().unpolish(self.telemetry_btn)
         self.telemetry_btn.style().polish(self.telemetry_btn)
-
-        # The banner is the standing reminder that nothing is being ingested;
-        # it is only interesting while stopped.
-        self.telemetry_banner.setVisible(not running)
-        self.stale_banner.setVisible(running)
-        if not running:
-            self.telemetry_banner.setText("TELEMETRY STOPPED")
-            self.telemetry_banner.setStyleSheet(
-                "background:%s; color:#ffffff; border-radius:4px;" % COL_WARN
-            )
 
     def on_eject_clicked(self) -> None:
         """Confirm, then transmit a real ejection command over the radio."""
@@ -3040,27 +3009,6 @@ class Dashboard(QMainWindow):
         """
         self.append_event("Antenna path set to %s (manual label)" % text)
         self.csv_logger.log_note("antenna path: %s (manual)" % text)
-
-    def _set_stale_banner(self, stale: Optional[bool]) -> None:
-        # The telemetry-stopped banner owns this row while ingestion is off.
-        if not self.telemetry_active:
-            return
-
-        if stale is None:
-            self.stale_banner.setText("AWAITING TELEMETRY")
-            self.stale_banner.setStyleSheet(
-                "background:#242c38; color:%s; border-radius:4px;" % COL_TEXT_DIM
-            )
-        elif stale:
-            self.stale_banner.setText("!! TELEMETRY STALE !!")
-            self.stale_banner.setStyleSheet(
-                "background:%s; color:#ffffff; border-radius:4px;" % COL_ALERT
-            )
-        else:
-            self.stale_banner.setText("LINK NOMINAL")
-            self.stale_banner.setStyleSheet(
-                "background:%s; color:#ffffff; border-radius:4px;" % COL_OK
-            )
 
     @staticmethod
     def _fmt(value: float, digits: int) -> str:
