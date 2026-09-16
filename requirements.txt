@@ -9,6 +9,7 @@ pyqtgraph>=0.13.3
 pyserial>=3.5
 numpy>=1.23        # required by pyqtgraph for array handling
 PyOpenGL>=3.1.6    # 3D attitude view (pyqtgraph.opengl); see note below
+pyttsx3>=2.90      # spoken altitude callouts; drives the OS speech engine offline
 
 # The attitude panel degrades gracefully to a 2D artificial-horizon view drawn
 # with QPainter if PyOpenGL is missing or no OpenGL context is available (VMs,

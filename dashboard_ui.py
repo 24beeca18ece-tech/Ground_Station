@@ -62,6 +62,7 @@ from PyQt5.QtWidgets import (
 )
 
 from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
+from altitude_callout import AltitudeCallout, TTS_AVAILABLE
 from csv_logger import CsvLoggerThread
 from csv_table_window import CsvTableWindow
 from diagnostics_window import DiagnosticsWindow, RawPacketStrip
@@ -163,6 +164,20 @@ GAP_ANOMALY_QUIET_S = 10.0
 #: ...or this many routine gaps, whichever comes first, so a fast link does not
 #: wait the full interval before saying anything.
 GAP_SUMMARY_MAX_PENDING = 200
+
+# --- spoken altitude ---------------------------------------------------------
+#: Seconds between altitude callouts while the vehicle is in flight.
+CALLOUT_INTERVAL_S = 3.0
+
+#: FSM states in which altitude is spoken. Flight only: nothing on the pad,
+#: nothing in BOOT or TEST_MODE, and nothing after IMPACT. Keyed by number so
+#: a renamed state cannot silently drop out of the set.
+CALLOUT_FSM_STATES = frozenset({
+    3,   # ASCENT
+    4,   # DEPLOY
+    5,   # DESCENT
+    6,   # AEROBRAKE_RELEASE
+})
 
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
@@ -315,6 +330,17 @@ QPushButton#ejectBtn {{
 }}
 QPushButton#ejectBtn:hover {{ background-color: #d8283c; border-color: #8c1220; }}
 QPushButton#ejectBtn:pressed {{ background-color: #8c1220; }}
+/* Voice callout toggle. Quiet when speaking is enabled (it is the normal
+   state); amber when muted, because a muted callout during a flight is the
+   thing an operator would want to notice. */
+QPushButton#voiceBtn[muted="false"] {{
+    background-color: {COL_PANEL_HI}; border-color: {COL_OK}; color: {COL_OK};
+    font-weight: 700;
+}}
+QPushButton#voiceBtn[muted="true"] {{
+    background-color: {COL_WARN}; border-color: #7a3d00; color: #ffffff;
+    font-weight: 700;
+}}
 QPushButton#logBtn[logging="true"] {{
     background-color: #a05000; border-color: #7a3d00; color: #ffffff;
 }}
@@ -1074,6 +1100,19 @@ class Dashboard(QMainWindow):
         }
         self.csv_logger = CsvLoggerThread(log_dir=log_dir, parent=self)
 
+        # Spoken altitude. Its own thread, because an utterance blocks for
+        # two to three seconds and the GUI thread cannot be away that long.
+        self.callout = AltitudeCallout(parent=self)
+        #: Operator's mute switch. Unmuted by default: the callout only ever
+        #: speaks in ASCENT..AEROBRAKE_RELEASE, so it is silent through every
+        #: pre-launch state and cannot be a nuisance on the pad -- and a
+        #: default of muted would mean the one flight it was built for goes
+        #: silent unless someone remembers a button.
+        self.callouts_muted = False
+        #: Whether the callout gate was open on the previous tick, so the
+        #: transitions (and only the transitions) reach the event log.
+        self._callout_armed = False
+
         self._build_ui()
 
         # Non-modal diagnostics window, created hidden. Parented to the main
@@ -1088,6 +1127,7 @@ class Dashboard(QMainWindow):
         # Logger runs for the whole session: the errors log is always active,
         # while CSV rows are only queued when the user enables logging.
         self.csv_logger.start()
+        self.callout.start()
         for worker in self.serial_workers.values():
             worker.start()
 
@@ -1095,6 +1135,16 @@ class Dashboard(QMainWindow):
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self._render)
         self.render_timer.start(int(1000 / RENDER_HZ))
+
+        # Altitude callout cadence. Always running; the tick decides whether
+        # there is anything to say, which keeps the flight-state gating in
+        # one place rather than spread over start/stop transitions.
+        self.callout_timer = QTimer(self)
+        # Qt's default coarse timer may fire up to 5 % early or late, which
+        # at 3 s is +/-150 ms: enough to make the cadence audibly uneven.
+        self.callout_timer.setTimerType(Qt.PreciseTimer)
+        self.callout_timer.timeout.connect(self._tick_altitude_callout)
+        self.callout_timer.start(int(CALLOUT_INTERVAL_S * 1000))
 
         self.status_timer = QTimer(self)
         # Drains the merge buffer into the display. Separate from the render
@@ -1446,6 +1496,7 @@ class Dashboard(QMainWindow):
         right.setSpacing(6)
         right.addWidget(self._build_gps_panel())
         right.addWidget(self._build_link_panel())
+        right.addWidget(self._build_voice_row())
         right.addStretch(1)
 
         col_a.setMinimumWidth(286)
@@ -1880,6 +1931,45 @@ class Dashboard(QMainWindow):
         self.tile_age.set_value("--")
         return box
 
+    def _build_voice_row(self) -> QWidget:
+        """The spoken-altitude mute switch, kept in sight below LINK STATUS.
+
+        Not in the Settings tab: a control that silences something during a
+        flight has to be reachable in one click without hunting for a tab.
+        """
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.voice_btn = QPushButton()
+        self.voice_btn.setObjectName("voiceBtn")
+        self.voice_btn.setCheckable(False)
+        self.voice_btn.clicked.connect(self.toggle_voice_callouts)
+        self.voice_btn.setToolTip(
+            "Spoken altitude callouts.\n\n"
+            "While telemetry is running and the vehicle is in flight "
+            "(ASCENT, DEPLOY, DESCENT, AEROBRAKE_RELEASE) the current "
+            "altitude is read aloud every %.0f s, using the operating "
+            "system's own offline speech engine. Nothing is spoken on the "
+            "pad, in BOOT or TEST_MODE, or after IMPACT.\n\n"
+            "MUTE silences it without stopping telemetry. An utterance "
+            "already in progress finishes (under 3 s); no new one starts."
+            % CALLOUT_INTERVAL_S
+        )
+        _fit(self.voice_btn, "VOICE MUTED")
+        layout.addWidget(self.voice_btn)
+
+        self.voice_state = QLabel("")
+        self.voice_state.setStyleSheet("color: %s; font-size: 9pt;" % COL_TEXT_DIM)
+        layout.addWidget(self.voice_state, 1)
+
+        if not TTS_AVAILABLE:
+            self.voice_btn.setEnabled(False)
+            self.voice_state.setText("speech engine unavailable")
+        self._apply_voice_state()
+        return row
+
     def _build_settings_panel(self) -> QWidget:
         box = QWidget()
         grid = QGridLayout(box)
@@ -2060,6 +2150,7 @@ class Dashboard(QMainWindow):
         self.csv_logger.file_opened.connect(self.on_log_file_opened)
         # Every row the logger writes also lands in the live table.
         self.csv_logger.row_written.connect(self.csv_table.add_row)
+        self.callout.error_occurred.connect(self._on_callout_error)
         self.csv_logger.error_occurred.connect(self.append_event)
 
         # Widgets -> GUI slots.
@@ -2898,6 +2989,85 @@ class Dashboard(QMainWindow):
             return
         self.attitude.redraw()
 
+    # ==================================================================
+    # Spoken altitude
+    # ==================================================================
+
+    def _callout_gate_open(self) -> bool:
+        """True when there is a flight altitude worth speaking right now."""
+        if self.callouts_muted or not self.telemetry_active:
+            return False
+        packet = self.latest
+        if packet is None or not getattr(packet, "has_fsm_data", True):
+            # The raw-CSV firmware sends no flight state at all, so there is
+            # nothing to gate on: it stays silent rather than guess.
+            return False
+        if packet.fsm_state not in CALLOUT_FSM_STATES:
+            return False
+        if not math.isfinite(packet.altitude_m):
+            return False
+        # A dead link must not keep announcing the last altitude it saw as
+        # if the vehicle were still there. Silence is the honest signal.
+        if (self.last_packet_epoch is None
+                or time.time() - self.last_packet_epoch > STALE_AFTER_S):
+            return False
+        return True
+
+    def _tick_altitude_callout(self) -> None:
+        """Every CALLOUT_INTERVAL_S: speak the current altitude, or not."""
+        # On the pad, with the link up: get the engine's one-time set-up out
+        # of the way so the first ASCENT callout is not a second late.
+        packet = self.latest
+        if (packet is not None and self.telemetry_active
+                and not self.callouts_muted
+                and getattr(packet, "has_fsm_data", True)
+                and packet.fsm_state == 2):            # LAUNCH_PAD
+            self.callout.warm_up()
+        open_now = self._callout_gate_open()
+        if open_now != self._callout_armed:
+            self._callout_armed = open_now
+            if open_now:
+                self.append_event(
+                    "Altitude callouts ON — %s, every %.0f s"
+                    % (self.latest.fsm_name, CALLOUT_INTERVAL_S))
+            elif self.latest is not None and not self.callouts_muted:
+                self.append_event(
+                    "Altitude callouts off — %s"
+                    % (self.latest.fsm_name
+                       if getattr(self.latest, "has_fsm_data", True)
+                       else "no flight state on this link"))
+        if not open_now:
+            return
+        # request() refuses -- and speaks nothing -- while the previous
+        # utterance is still going. Next tick offers a fresher altitude,
+        # which is the one the operator should hear. No backlog, ever.
+        self.callout.request(self.latest.altitude_m)
+
+    def toggle_voice_callouts(self) -> None:
+        self.callouts_muted = not self.callouts_muted
+        self._apply_voice_state()
+        self.append_event("Altitude callouts %s"
+                          % ("MUTED" if self.callouts_muted else "unmuted"))
+        # Re-evaluate immediately so the log transition and the next spoken
+        # altitude do not wait a full interval.
+        self._tick_altitude_callout()
+
+    def _apply_voice_state(self) -> None:
+        muted = self.callouts_muted
+        self.voice_btn.setText("VOICE MUTED" if muted else "VOICE ON")
+        self.voice_btn.setProperty("muted", "true" if muted else "false")
+        self.voice_btn.style().unpolish(self.voice_btn)
+        self.voice_btn.style().polish(self.voice_btn)
+        if TTS_AVAILABLE:
+            self.voice_state.setText(
+                "altitude callouts silenced" if muted
+                else "altitude spoken in flight")
+
+    def _on_callout_error(self, message: str) -> None:
+        self.append_event("VOICE: %s" % message)
+        self.voice_state.setText("speech engine error — see log")
+        self.voice_state.setStyleSheet("color: %s; font-size: 9pt;" % COL_ALERT)
+
     def toggle_telemetry(self) -> None:
         """Start or stop ingesting telemetry, without touching the link."""
         self.telemetry_active = not self.telemetry_active
@@ -3123,6 +3293,7 @@ class Dashboard(QMainWindow):
         try:
             self._flush_anomaly_repeats()
             self._flush_routine_gaps()
+            self.callout_timer.stop()
             self.render_timer.stop()
             self.status_timer.stop()
             self.attitude_timer.stop()
@@ -3152,6 +3323,13 @@ class Dashboard(QMainWindow):
             if not self.csv_logger.wait(5000):
                 self.csv_logger.terminate()
                 self.csv_logger.wait(500)
+
+            # An utterance in progress finishes on its own within ~3 s; the
+            # thread is only forced if the speech engine has hung.
+            self.callout.stop()
+            if not self.callout.wait(4000):
+                self.callout.terminate()
+                self.callout.wait(500)
         except Exception:
             # Shutdown must never raise — the user is trying to close the window.
             pass
