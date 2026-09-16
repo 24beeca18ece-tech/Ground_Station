@@ -14,15 +14,23 @@ buffer would stall. So the actual speaking happens here, on its own QThread,
 the same way serial ingestion and CSV logging do. The GUI thread only ever
 hands over a number and returns immediately.
 
-FRESHEST, NEVER A BACKLOG
--------------------------
-There is deliberately no queue. If the GUI asks for a callout while one is
-still being spoken, the request is refused (``request`` returns False) and
-the GUI simply tries again on its next tick. A queue would do the wrong thing
-in exactly the situation it is meant for: if speech ever ran slower than the
-cadence, it would accumulate a backlog of altitudes the vehicle left behind
-seconds ago, and the operator would hear the past. Silence for one tick and
-then the current altitude is strictly better than a stale number.
+TWO KINDS OF CALLOUT, TWO POLICIES
+----------------------------------
+*Altitude* is periodic and perishable. There is deliberately no queue for
+it: if the GUI asks for an altitude while something is still being spoken,
+the request is refused (``request`` returns False) and the GUI tries again
+on its next tick. A queue would do the wrong thing in exactly the situation
+it is meant for -- if speech ever ran slower than the cadence it would
+accumulate a backlog of altitudes the vehicle left behind seconds ago, and
+the operator would hear the past. Silence for one tick and then the current
+altitude is strictly better than a stale number.
+
+*State changes* are events, and each one is information the operator does
+not get again. Those go into a short FIFO (``announce_state``) and are
+spoken as soon as the engine is free, ahead of any waiting altitude. A
+transition that lands mid-utterance is therefore delayed by at most one
+utterance, never dropped. The queue is bounded only as a guard against a
+runaway source; transitions are seconds apart in any real flight.
 
 ONE ENGINE PER UTTERANCE
 ------------------------
@@ -46,7 +54,8 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from collections import deque
+from typing import Deque, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -87,10 +96,28 @@ def format_altitude(altitude_m: float) -> str:
 #: Sentinel queued by warm_up(): build an engine, say nothing, discard it.
 _WARM_UP = object()
 
+#: Upper bound on queued state announcements. Transitions in a flight are
+#: seconds to minutes apart, so this is a guard against a flapping source,
+#: not a working limit. If it is ever hit the OLDEST is dropped and counted,
+#: because by then the newer states are the truth.
+STATE_QUEUE_MAX = 4
 
-class AltitudeCallout(QThread):
-    """Owns the speech engine; speaks one altitude at a time, never a queue."""
 
+def format_state(fsm_name: str) -> str:
+    """The spoken phrase for an FSM state, e.g. ``"State: Aerobrake release"``.
+
+    The wire names are SHOUTED_WITH_UNDERSCORES, which SAPI may spell out
+    letter by letter; lower-cased words with one capital read as words.
+    """
+    words = str(fsm_name).replace("_", " ").strip().lower()
+    return "State: %s" % (words[:1].upper() + words[1:])
+
+
+class VoiceCallout(QThread):
+    """Owns the speech engine: periodic altitude, plus state changes on demand."""
+
+    #: ``(phrase,)`` as an utterance begins.
+    started = pyqtSignal(str)
     #: ``(phrase,)`` after an utterance has been spoken to completion.
     spoken = pyqtSignal(str)
     #: ``(message,)`` once per distinct failure; the callout then stays quiet.
@@ -99,7 +126,10 @@ class AltitudeCallout(QThread):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._cond = threading.Condition()
+        #: The one altitude waiting to be spoken, if any. A slot, not a queue.
         self._pending: Optional[float] = None
+        #: State-change phrases waiting to be spoken, oldest first.
+        self._states: Deque[str] = deque()
         self._speaking = False
         self._warmed = False
         self._running = True
@@ -107,8 +137,10 @@ class AltitudeCallout(QThread):
         #: Name of the OS voice actually in use, for the operator's log.
         self.voice_name = ""
         self.engine_name = ""
-        #: Requests refused because an utterance was still in progress.
+        #: Altitude requests refused because an utterance was in progress.
         self.skipped = 0
+        #: State announcements lost to a full queue (expected to stay 0).
+        self.states_dropped = 0
         self.spoken_count = 0
 
     # ------------------------------------------------------------------
@@ -118,24 +150,43 @@ class AltitudeCallout(QThread):
     @property
     def busy(self) -> bool:
         with self._cond:
-            return self._speaking or self._pending is not None
+            return (self._speaking or self._pending is not None
+                    or bool(self._states))
 
     def request(self, altitude_m: float) -> bool:
         """Ask for *altitude_m* to be spoken now.
 
         Returns False -- and speaks nothing -- if an utterance is still in
-        progress. That is the whole overlap policy: the caller's next tick
-        will offer a fresher number, which is the one worth hearing.
+        progress or a state announcement is waiting. That is the whole
+        overlap policy for altitude: the caller's next tick will offer a
+        fresher number, which is the one worth hearing.
         """
         if not TTS_AVAILABLE:
             return False
         with self._cond:
-            if self._speaking or self._pending is not None:
+            if self._speaking or self._pending is not None or self._states:
                 self.skipped += 1
                 return False
             self._pending = float(altitude_m)
             self._cond.notify()
         return True
+
+    def announce_state(self, fsm_name: str) -> None:
+        """Speak a state change as soon as the engine is free. Never refused.
+
+        Unlike an altitude, a transition is not superseded by the next one:
+        missing "State: Deploy" is a real loss even if "State: Descent"
+        follows. So this queues -- briefly, behind at most the utterance in
+        progress -- and is spoken ahead of any waiting altitude.
+        """
+        if not TTS_AVAILABLE:
+            return
+        with self._cond:
+            if len(self._states) >= STATE_QUEUE_MAX:
+                self._states.popleft()
+                self.states_dropped += 1
+            self._states.append(format_state(fsm_name))
+            self._cond.notify()
 
     def warm_up(self) -> None:
         """Pay the one-time engine set-up cost now, silently.
@@ -143,15 +194,16 @@ class AltitudeCallout(QThread):
         The first engine of a process costs ~1 s more than the rest (comtypes
         builds its SAPI type library on first use), which made the first
         callout of every session run long enough for the second to be
-        skipped as overlapping. Called once the vehicle is on the pad -- the
-        link is up by then, and a burst of set-up work mid-stream was
-        measured to cost the merge nothing -- so the first ASCENT callout
-        comes out on time. Idempotent; never speaks.
+        skipped as overlapping. Called when telemetry is started -- the link
+        is up by then, and a burst of set-up work mid-stream was measured to
+        cost the merge nothing -- so the first callout comes out on time.
+        Idempotent; never speaks.
         """
         if not TTS_AVAILABLE:
             return
         with self._cond:
-            if self._warmed or self._speaking or self._pending is not None:
+            if (self._warmed or self._speaking or self._pending is not None
+                    or self._states):
                 return
             self._warmed = True
             self._pending = _WARM_UP
@@ -161,6 +213,7 @@ class AltitudeCallout(QThread):
         with self._cond:
             self._running = False
             self._pending = None
+            self._states.clear()
             self._cond.notify_all()
 
     # ------------------------------------------------------------------
@@ -180,18 +233,26 @@ class AltitudeCallout(QThread):
         # speaks the first real callout instead, well after the link is up.
         while True:
             with self._cond:
-                while self._running and self._pending is None:
+                while (self._running and self._pending is None
+                       and not self._states):
                     self._cond.wait(timeout=0.5)
                 if not self._running:
                     return
-                altitude = self._pending
-                self._pending = None
+                # State changes first: they are the rarer, more valuable
+                # event, and an altitude is at most one tick from a retry.
+                if self._states:
+                    job = self._states.popleft()
+                else:
+                    job = self._pending
+                    self._pending = None
                 self._speaking = True
             try:
-                if altitude is _WARM_UP:
+                if job is _WARM_UP:
                     self._warm()
+                elif isinstance(job, str):
+                    self._speak(job)
                 else:
-                    self._speak(format_altitude(altitude))
+                    self._speak(format_altitude(job))
             finally:
                 with self._cond:
                     self._speaking = False
@@ -237,6 +298,7 @@ class AltitudeCallout(QThread):
             engine.connect("finished-utterance",
                            lambda name, completed: completed_flags.append(
                                bool(completed)))
+            self.started.emit(phrase)
             engine.say(phrase)
             engine.runAndWait()
             try:

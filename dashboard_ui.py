@@ -62,7 +62,7 @@ from PyQt5.QtWidgets import (
 )
 
 from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
-from altitude_callout import AltitudeCallout, TTS_AVAILABLE
+from altitude_callout import VoiceCallout, TTS_AVAILABLE
 from csv_logger import CsvLoggerThread
 from csv_table_window import CsvTableWindow
 from diagnostics_window import DiagnosticsWindow, RawPacketStrip
@@ -166,18 +166,12 @@ GAP_ANOMALY_QUIET_S = 10.0
 GAP_SUMMARY_MAX_PENDING = 200
 
 # --- spoken altitude ---------------------------------------------------------
-#: Seconds between altitude callouts while the vehicle is in flight.
+#: Seconds between altitude callouts while telemetry is running. Spoken in
+#: EVERY flight state -- on the pad, in BOOT and TEST_MODE, and after IMPACT
+#: -- not only in flight. That also means it works on links that carry no
+#: flight state at all (the raw-CSV firmware). The trade is continuous
+#: "Altitude 0 meters" through a long pad wait; VOICE MUTED is one click.
 CALLOUT_INTERVAL_S = 3.0
-
-#: FSM states in which altitude is spoken. Flight only: nothing on the pad,
-#: nothing in BOOT or TEST_MODE, and nothing after IMPACT. Keyed by number so
-#: a renamed state cannot silently drop out of the set.
-CALLOUT_FSM_STATES = frozenset({
-    3,   # ASCENT
-    4,   # DEPLOY
-    5,   # DESCENT
-    6,   # AEROBRAKE_RELEASE
-})
 
 #: Team ID stamped onto packets in RAW CSV mode, where the wire format carries
 #: none. Only used by that compatibility path; normal frames carry their own.
@@ -1102,12 +1096,11 @@ class Dashboard(QMainWindow):
 
         # Spoken altitude. Its own thread, because an utterance blocks for
         # two to three seconds and the GUI thread cannot be away that long.
-        self.callout = AltitudeCallout(parent=self)
-        #: Operator's mute switch. Unmuted by default: the callout only ever
-        #: speaks in ASCENT..AEROBRAKE_RELEASE, so it is silent through every
-        #: pre-launch state and cannot be a nuisance on the pad -- and a
-        #: default of muted would mean the one flight it was built for goes
-        #: silent unless someone remembers a button.
+        self.callout = VoiceCallout(parent=self)
+        #: Operator's mute switch. Unmuted by default, so the flight it was
+        #: built for is never silent because someone forgot a button; the
+        #: cost is that a long pad wait hears the altitude every 3 s until
+        #: VOICE MUTED is pressed.
         self.callouts_muted = False
         #: Whether the callout gate was open on the previous tick, so the
         #: transitions (and only the transitions) reach the event log.
@@ -1947,13 +1940,13 @@ class Dashboard(QMainWindow):
         self.voice_btn.setCheckable(False)
         self.voice_btn.clicked.connect(self.toggle_voice_callouts)
         self.voice_btn.setToolTip(
-            "Spoken altitude callouts.\n\n"
-            "While telemetry is running and the vehicle is in flight "
-            "(ASCENT, DEPLOY, DESCENT, AEROBRAKE_RELEASE) the current "
-            "altitude is read aloud every %.0f s, using the operating "
-            "system's own offline speech engine. Nothing is spoken on the "
-            "pad, in BOOT or TEST_MODE, or after IMPACT.\n\n"
-            "MUTE silences it without stopping telemetry. An utterance "
+            "Spoken callouts, using the operating system's own offline "
+            "speech engine.\n\n"
+            "While telemetry is running the current altitude is read aloud "
+            "every %.0f s in every flight state, pad included. Each flight-"
+            "state change (e.g. LAUNCH_PAD to ASCENT) is announced the "
+            "moment it is seen, ahead of the next altitude.\n\n"
+            "MUTE silences both without stopping telemetry. An utterance "
             "already in progress finishes (under 3 s); no new one starts."
             % CALLOUT_INTERVAL_S
         )
@@ -2547,11 +2540,17 @@ class Dashboard(QMainWindow):
             if (getattr(packet, "has_fsm_data", True)
                     and packet.fsm_state != self._last_fsm):
                 previous = FSM_STATES.get(self._last_fsm, "—")
+                changed = self._last_fsm is not None
                 self._last_fsm = packet.fsm_state
                 self.append_event(
                     "FSM %s → %s at T+%s"
                     % (previous, packet.fsm_name, packet.mission_time_hms)
                 )
+                # Spoken the moment it is seen, not on the altitude timer.
+                # Queued behind an utterance in progress rather than dropped:
+                # a transition is not superseded by the next one.
+                if changed and not self.callouts_muted:
+                    self.callout.announce_state(packet.fsm_name)
 
             if self.logging_enabled:
                 self.csv_logger.log_packet(packet)
@@ -2994,17 +2993,15 @@ class Dashboard(QMainWindow):
     # ==================================================================
 
     def _callout_gate_open(self) -> bool:
-        """True when there is a flight altitude worth speaking right now."""
+        """True when there is a current altitude worth speaking right now.
+
+        No flight-state condition: altitude is spoken in every FSM state, and
+        on links that carry no FSM state at all.
+        """
         if self.callouts_muted or not self.telemetry_active:
             return False
         packet = self.latest
-        if packet is None or not getattr(packet, "has_fsm_data", True):
-            # The raw-CSV firmware sends no flight state at all, so there is
-            # nothing to gate on: it stays silent rather than guess.
-            return False
-        if packet.fsm_state not in CALLOUT_FSM_STATES:
-            return False
-        if not math.isfinite(packet.altitude_m):
+        if packet is None or not math.isfinite(packet.altitude_m):
             return False
         # A dead link must not keep announcing the last altitude it saw as
         # if the vehicle were still there. Silence is the honest signal.
@@ -3015,27 +3012,14 @@ class Dashboard(QMainWindow):
 
     def _tick_altitude_callout(self) -> None:
         """Every CALLOUT_INTERVAL_S: speak the current altitude, or not."""
-        # On the pad, with the link up: get the engine's one-time set-up out
-        # of the way so the first ASCENT callout is not a second late.
-        packet = self.latest
-        if (packet is not None and self.telemetry_active
-                and not self.callouts_muted
-                and getattr(packet, "has_fsm_data", True)
-                and packet.fsm_state == 2):            # LAUNCH_PAD
-            self.callout.warm_up()
         open_now = self._callout_gate_open()
         if open_now != self._callout_armed:
             self._callout_armed = open_now
             if open_now:
                 self.append_event(
-                    "Altitude callouts ON — %s, every %.0f s"
-                    % (self.latest.fsm_name, CALLOUT_INTERVAL_S))
-            elif self.latest is not None and not self.callouts_muted:
-                self.append_event(
-                    "Altitude callouts off — %s"
-                    % (self.latest.fsm_name
-                       if getattr(self.latest, "has_fsm_data", True)
-                       else "no flight state on this link"))
+                    "Altitude callouts ON — every %.0f s" % CALLOUT_INTERVAL_S)
+            elif not self.callouts_muted and self.telemetry_active:
+                self.append_event("Altitude callouts off — no current altitude")
         if not open_now:
             return
         # request() refuses -- and speaks nothing -- while the previous
@@ -3049,7 +3033,10 @@ class Dashboard(QMainWindow):
         self.append_event("Altitude callouts %s"
                           % ("MUTED" if self.callouts_muted else "unmuted"))
         # Re-evaluate immediately so the log transition and the next spoken
-        # altitude do not wait a full interval.
+        # altitude do not wait a full interval -- and restart the timer from
+        # this instant, so the tick after it is a full interval away rather
+        # than whatever was left of the old phase.
+        self.callout_timer.start()
         self._tick_altitude_callout()
 
     def _apply_voice_state(self) -> None:
@@ -3060,8 +3047,8 @@ class Dashboard(QMainWindow):
         self.voice_btn.style().polish(self.voice_btn)
         if TTS_AVAILABLE:
             self.voice_state.setText(
-                "altitude callouts silenced" if muted
-                else "altitude spoken in flight")
+                "callouts silenced" if muted
+                else "altitude + state changes spoken")
 
     def _on_callout_error(self, message: str) -> None:
         self.append_event("VOICE: %s" % message)
@@ -3074,6 +3061,8 @@ class Dashboard(QMainWindow):
         self._apply_telemetry_state()
 
         if self.telemetry_active:
+            if not self.callouts_muted:
+                self.callout.warm_up()
             self.append_event(
                 "Telemetry STARTED — packets are now being displayed"
                 + (" and logged." if self.logging_enabled else ".")
