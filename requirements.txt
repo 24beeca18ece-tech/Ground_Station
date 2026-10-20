@@ -17,6 +17,12 @@ pyttsx3>=2.90      # spoken altitude callouts; drives the OS speech engine offli
 # but not strictly required for the dashboard to start.
 
 # --- tooling, NOT needed at runtime -----------------------------------------
+# The test suite under tools/ runs on pytest:
+#
+#     pip install pytest
+#     python -m pytest tools/ -v
+#
+
 # tools/step_to_mesh.py converts voronoi.step into assets/cansat_mesh.npz using
 # gmsh, which bundles OpenCASCADE and can tessellate a STEP B-rep. The dashboard
 # loads the pre-converted .npz and never imports gmsh, so this is only required

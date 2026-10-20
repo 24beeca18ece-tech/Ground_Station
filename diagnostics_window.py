@@ -353,15 +353,21 @@ class DiagnosticsWindow(QDialog):
             self._set("pressure", *self._num(packet.pressure_hpa, 2, "hPa"))
             self._set("temperature", *self._num(packet.temp_c, 2, "°C"))
 
-            voltage, color = self._num(packet.voltage_v, 2, "V")
-            if math.isfinite(packet.voltage_v):
-                if packet.voltage_v < voltage_warn * 0.9:
-                    color = COL_ALERT
-                elif packet.voltage_v < voltage_warn:
-                    color = COL_WARN
-                else:
-                    color = COL_OK
-            self._set("voltage", voltage, color)
+            # No battery sensor fitted means no reading, not a flat pack:
+            # neutral "--", never a warn or alert colour. The dashboard's
+            # battery tile already behaves this way.
+            if not getattr(packet, "has_voltage", True):
+                self._set("voltage", "-- (no battery sensor)", COL_DIM)
+            else:
+                voltage, color = self._num(packet.voltage_v, 2, "V")
+                if math.isfinite(packet.voltage_v):
+                    if packet.voltage_v < voltage_warn * 0.9:
+                        color = COL_ALERT
+                    elif packet.voltage_v < voltage_warn:
+                        color = COL_WARN
+                    else:
+                        color = COL_OK
+                self._set("voltage", voltage, color)
 
             self._set("nav_time", packet.nav_time or "--",
                       COL_NUM if packet.nav_time else COL_WARN)

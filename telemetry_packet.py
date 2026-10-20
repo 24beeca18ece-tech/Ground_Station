@@ -753,6 +753,15 @@ def _common_kwargs(fields: List[str], base: int) -> dict:
     *base* is the index of the TIMESTAMP field: 1 for legacy v1 frames, 2 for
     v2 frames where PAYLOAD_TYPE occupies index 1.
     """
+    # VOLTAGE is OPTIONAL. Flight hardware with no battery sensor fitted
+    # transmits the literal "nan", and firmware that has not wired the divider
+    # yet transmits an empty field; neither is a corrupt frame, and failing a
+    # whole packet over a sensor nobody installed would throw away the
+    # telemetry that IS there. Anything non-finite becomes NaN with
+    # has_voltage False, which is what makes the tile read "--" rather than
+    # "0.00 V" -- a flat pack, which would trip a false low-battery alert.
+    # Every other mandatory field stays mandatory.
+    voltage = _opt_float(fields[base + 5])
     return dict(
         timestamp_raw=fields[base].strip(),
         mission_time_s=parse_mission_time(fields[base]),
@@ -760,7 +769,8 @@ def _common_kwargs(fields: List[str], base: int) -> dict:
         altitude_m=_req_float(fields[base + 2], "ALTITUDE"),
         pressure_hpa=_req_float(fields[base + 3], "PRESSURE"),
         temp_c=_req_float(fields[base + 4], "TEMP"),
-        voltage_v=_req_float(fields[base + 5], "VOLTAGE"),
+        voltage_v=voltage,
+        has_voltage=math.isfinite(voltage),
         nav_time=fields[base + 6].strip(),
         lat=_opt_float(fields[base + 7]),
         lon=_opt_float(fields[base + 8]),
@@ -856,6 +866,8 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
 
     if variant == PAYLOAD_CANSAT:
         legacy_cansat = len(fields) == FIELD_COUNT_CANSAT_LEGACY
+        wheel_raw = fields[extra_at + (4 if not legacy_cansat else 3)]
+        stage_raw = fields[extra_at + (5 if not legacy_cansat else 4)]
         return CanSatPacket(
             payload_type=PAYLOAD_CANSAT,
             **shared,
@@ -867,10 +879,14 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
             pm4_0=(_opt_float(fields[extra_at + 2]) if not legacy_cansat
                    else float("nan")),
             pm10=_opt_float(fields[extra_at + (3 if not legacy_cansat else 2)]),
-            reaction_wheel_rpm=_opt_int(
-                fields[extra_at + (4 if not legacy_cansat else 3)], 0),
-            recovery_stage=_opt_int(
-                fields[extra_at + (5 if not legacy_cansat else 4)], 0),
+            reaction_wheel_rpm=_opt_int(wheel_raw, 0),
+            recovery_stage=_opt_int(stage_raw, 0),
+            # Both actuator fields blank means this airframe has no reaction
+            # wheel and no staged recovery -- not that the wheel is stopped at
+            # 0 rpm in stage STOWED. Those are the dataclass defaults, and
+            # rendering them would report readings the vehicle never sent.
+            # One value present is enough to believe the pair.
+            has_actuator_data=bool(wheel_raw.strip() or stage_raw.strip()),
         )
 
     return RocketPacket(
