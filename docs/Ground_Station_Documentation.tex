@@ -1887,6 +1887,168 @@ Get-Content logs\Flight_2025ASI001.csv -TotalCount 1
 \end{enumerate}
 
 %==============================================================================
+\section{Live Map and KML Export}
+\label{sec:map-kml}
+
+Two features share one source of truth. Every position fix of a session is
+recorded once, in \texttt{track\_store.py}, from
+\texttt{Dashboard.on\_packet}; the map draws from it and the KML export
+writes from it. That is deliberate: the track an operator watched has to be
+the track a recovery team later flies from, and two independent copies would
+eventually disagree.
+
+A fix is recorded only when \texttt{has\_fix} is true, latitude and longitude
+are finite and in range, and the point is not exactly $0,0$ --- a receiver
+without a lock transmits zeros, and a flickering lock transmits small
+plausible-looking values near Null Island. Intake is a single append, so a
+20\,Hz stream costs nothing measurable on the GUI thread, and fixes are
+recorded whether or not the map window is open.
+
+\subsection{Live map}
+
+\textbf{MAP}, next to \textbf{CSV TABLE}, opens a non-modal window drawing
+256\,px Web Mercator (EPSG:3857) tiles with \texttt{QPainter}. QtWebEngine
+was rejected: it is a browser engine, a second process and roughly 100\,MB of
+dependency for what is a tiled image and a few polylines.
+
+\subsubsection{Offline is the base case}
+
+The launch site has no internet, so \texttt{.mbtiles} files in
+\texttt{assets/maps/} are read directly with the standard library's
+\texttt{sqlite3} and are selected automatically whenever a pack exists.
+Online sources are the convenience, not the other way round.
+
+MBTiles stores rows in TMS order, whose origin is the \emph{bottom} left,
+while slippy-map $y$ counts from the top. The conversion is
+$y_{\mathrm{TMS}} = 2^{z} - 1 - y$ and it is applied in exactly one place.
+Getting it wrong produces a map that is vertically mirrored but otherwise
+entirely plausible, which is the kind of fault that survives a casual look;
+a unit test asserts it in both directions against a generated file.
+
+A tile that cannot be had --- no pack, no network, nothing cached --- is
+drawn as a grey square labelled with its zoom level. A hole in the map must
+read as a hole rather than as the vehicle having flown over blank ground.
+
+\subsubsection{Threading}
+
+The GUI thread never blocks on a tile. Network tiles go through
+\texttt{QNetworkAccessManager}, which is asynchronous on the GUI thread, with
+at most four requests in flight and a \texttt{User-Agent} naming this
+application as providers' usage policies require. MBTiles reads run on a
+\texttt{QThreadPool} as \texttt{QRunnable}s, one \texttt{sqlite3} connection
+per job, because sqlite objects cannot be shared across threads. Decoded
+tiles land in a bounded LRU so a long session cannot grow memory without
+limit. \texttt{paintEvent} cannot raise: it counts failures and keeps the
+frame, because Qt will simply call it again.
+
+Repaints are coalesced to 5\,Hz. Measured with the simulator at 20\,Hz, the
+GUI thread's tick distribution with the map open was indistinguishable from
+the same session with it closed.
+
+\subsubsection{Display}
+
+Vehicles are drawn by \texttt{payload\_type} with a distinct colour
+\emph{and} shape --- a circle for the CanSat, a triangle for the rocket ---
+so the two remain distinguishable in a monochrome screenshot or to a
+colour-blind operator. Each carries a label with GNSS altitude and the age of
+its last fix, which turns red after five seconds. The full track is kept;
+only the drawing is thinned, and never at the endpoints. An optional ground
+station position adds slant range and true bearing to each vehicle and is
+stored in \texttt{map\_settings.json}; with no file and no coordinates
+entered, nothing is drawn and nothing is reported.
+
+\subsubsection{Sources}
+
+Sources are declared in \texttt{map\_sources.json}, which is gitignored
+because it may name an API key's environment variable and local paths; the
+tracked template is \texttt{map\_sources.example.json}. A missing or
+unreadable file is not an error --- the built-in list is used and one line
+goes to the event log.
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Source} & \textbf{Status} \\
+\midrule
+Offline (MBTiles) & Any pack in \texttt{assets/maps/}. Default when present. \\
+ISRO Bhuvan & WMS at \texttt{bhuvan-vec1.nrsc.gov.in}, verified answering
+anonymously with EPSG:3857 tiles. A \emph{vector} server: administrative
+boundaries, not satellite imagery. \\
+OpenStreetMap & Light interactive use only; bulk download refused. \\
+Mappls / MapmyIndia & Shipped disabled. Needs a key, and their terms have
+not been reviewed for this project. \\
+\bottomrule
+\end{tabularx}
+\caption{Map sources. No Google Maps or Google tile server is used anywhere.}
+\end{table}
+
+Any online source necessarily learns which tiles are being viewed, which is
+to say the approximate location and zoom of the launch site. Where that
+matters, build a pack in advance and fly offline.
+
+\subsubsection{Building a pack}
+
+\texttt{tools/fetch\_tiles.py} writes a valid MBTiles file, rate limited to
+two requests per second, resumable (an already-stored tile is skipped, so an
+interrupted run continues), and refusing jobs over 20{,}000 tiles without
+\texttt{-{}-force}. A $5\times5$\,km site at zoom 12--18 is 2{,}218 tiles.
+
+It refuses any source not explicitly marked \texttt{"bulk\_download": true}
+and prints why. Bulk downloading is a sustained load on someone else's
+server and is governed by most providers' terms; the OpenStreetMap
+Foundation's Tile Usage Policy forbids it outright for
+\texttt{tile.openstreetmap.org}. QGIS (\emph{Generate XYZ tiles (MBTiles)})
+and Mobile Atlas Creator are documented alternatives in the README.
+
+\subsection{KML export}
+
+\textbf{EXPORT KML}, next to \textbf{START LOGGING}, writes the session's
+full tracks --- not the thinned drawing data --- through a save dialog,
+defaulting to the \texttt{logs/} folder and the CSV's own
+\texttt{Flight\_<team>\_<timestamp>} naming. It works while logging is
+running. With no fixes recorded it says so and writes nothing, rather than
+leaving an empty file that would look like a failed flight.
+
+\texttt{kml\_export.build\_kml} is pure: tracks and options in, a string out,
+with no Qt, no clock and no file I/O, so the whole document is testable
+without a display or a radio. Everything is serialised through
+\texttt{xml.etree.ElementTree}, so a team ID or vehicle name containing
+\texttt{\&} or \texttt{<} is escaped by the serialiser rather than by hand.
+
+Each vehicle gets a Folder containing a \texttt{gx:Track} whose paired
+\texttt{<when>} and \texttt{<gx:coord>} elements drive Google Earth's time
+slider, with \texttt{ExtendedData} arrays for FSM state, satellite count and
+packet count; an extruded \texttt{LineString} of the same path, visible with
+the slider parked; and Launch, Apogee and Last-known placemarks carrying a
+telemetry table each.
+
+\paragraph{Coordinate order.}
+KML coordinates are \texttt{lon,lat,alt} --- the reverse of the usual
+order --- and \texttt{gx:coord} separates them with spaces while
+\texttt{<coordinates>} uses commas. Both are asserted by tests, because
+either mistake produces a file that parses cleanly and plots in the wrong
+place.
+
+Altitude is \texttt{nav\_alt\_m}, the GNSS height above mean sea level, with
+\texttt{altitudeMode absolute}. The barometric \texttt{altitude\_m} is
+deliberately not used: it is referenced to a fixed 1013.25\,hPa sea level
+with no ground zero-set, so it carries a constant offset that would place the
+entire track at the wrong height. A link transmitting no GNSS altitude ---
+the current raw-CSV firmware, for instance --- produces a
+\texttt{clampToGround} path, and the document description says so rather than
+drawing the flight at a height nobody measured.
+
+Before writing, no-lock and exact $0,0$ fixes are dropped, duplicate packet
+counts are dropped, and single-sample GPS jumps are dropped (default: more
+than 500\,m in under one second, which is 1800\,km/h). All three counts are
+written into the document description, so a shortened path is never silent.
+
+\texttt{tools/csv\_to\_kml.py} converts a flight CSV after the event through
+the same builder and the same filters, reading columns by
+\texttt{CSV\_HEADER} name rather than position, so a post-flight export is
+identical to a live one.
+
 \section{Known Limitations and Future Work}
 \label{sec:limitations}
 %==============================================================================
