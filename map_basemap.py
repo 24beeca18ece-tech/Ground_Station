@@ -38,7 +38,8 @@ RANGE_RINGS_M = (250.0, 500.0, 1000.0, 2000.0)
 
 #: Graticule steps in degrees, coarse to fine. The renderer picks the
 #: finest one that still leaves the labels legible.
-GRATICULE_STEPS = (10.0, 5.0, 2.0, 1.0, 0.5, 0.25, 1 / 12.0, 1 / 30.0,
+GRATICULE_STEPS = (45.0, 30.0, 20.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.25,
+                   1 / 12.0, 1 / 30.0,
                    1 / 60.0, 1 / 120.0, 1 / 300.0, 1 / 600.0, 1 / 1200.0,
                    1 / 3600.0)
 
