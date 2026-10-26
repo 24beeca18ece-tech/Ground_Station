@@ -2049,6 +2049,135 @@ the same builder and the same filters, reading columns by
 \texttt{CSV\_HEADER} name rather than position, so a post-flight export is
 identical to a live one.
 
+\subsection{Working with no network}
+\label{sec:map-offline}
+
+The launch site has no internet, so the map is built on the assumption that
+nothing can be downloaded and nothing is reachable. Opening the map makes no
+outbound request at all: the pack selected on open is always an offline one,
+and online sources are listed last and labelled.
+
+\subsubsection{The grid is the floor, not a failure}
+
+With no pack of any kind the map draws a lat/lon graticule with adaptive
+spacing labelled in degrees and minutes, a scale bar, a north arrow, and ---
+once the ground station position is entered --- range rings at 250\,m,
+500\,m, 1\,km and 2\,km. Those rings answer the question an operator on the
+pad actually has, which is how far away and in which direction, and the
+outer one is the edge of the 2\,km link budget. A line reads ``grid only ---
+no map pack loaded'', so the state is legible as deliberate rather than
+broken.
+
+\subsubsection{Four kinds of pack}
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Kind} & \textbf{Prepared by} \\
+\midrule
+Grid & nothing; always available \\
+Vector (\texttt{*.osmpack.json}) & \texttt{tools/fetch\_osm\_vectors.py}, one
+Overpass request, rendered by this application rather than served as tiles \\
+Tiles (\texttt{*.mbtiles}) & \texttt{tools/fetch\_tiles.py}, QGIS or Mobile
+Atlas Creator \\
+Image (\texttt{NAME.png} + \texttt{NAME.json}) & the operator, from imagery
+they are licensed to use \\
+\bottomrule
+\end{tabularx}
+\caption{Offline base layers. A pack that fails to load falls back to the
+grid with one event-log line, never an exception.}
+\end{table}
+
+A bundled India overview from Natural Earth (public domain, 196\,kB ---
+national outline, 1{,}049 state and union-territory boundary lines, ten
+cities) ships in the repository so a fresh clone shows something sensible
+when zoomed out.
+
+\subsubsection{Overpass, used sparingly}
+
+\texttt{fetch\_osm\_vectors.py} makes exactly one request per run, refuses
+areas over 10\,km a side, and identifies the application and a contact in
+its \texttt{User-Agent}. Overpass is donated infrastructure for small
+extracts; a regional download belongs to a Geofabrik extract converted to
+the same JSON format, which the map also accepts. The data is
+\copyright{} OpenStreetMap contributors under ODbL, and the map shows that
+attribution whenever such a pack is drawn.
+
+\subsubsection{Image overlays}
+
+An image plus a sidecar giving WGS-84 bounds is drawn as the base layer,
+stretched to those bounds, which treats it as Web Mercator aligned. Over an
+area under 10\,km that is a good approximation: the Mercator $y$-scale
+changes by roughly 0.08\% over 10\,km of latitude at $33^{\circ}$N, under
+8\,m across the whole image. Decoding happens on a worker thread and an
+image larger than 4096\,px on its long edge is downsampled there, because a
+large export decoded on the GUI thread would stall it for seconds. The
+licence of a supplied image is the operator's responsibility and the window
+says so.
+
+\subsection{Why a long session used to hang}
+\label{sec:map-soak}
+
+A session left running eventually put the machine into swap. The cause was
+measured rather than guessed, with \texttt{tools/soak\_gui.py}, which drives
+the real dashboard under load and samples resident memory, Python object
+counts, track size, pending requests, thread count, GUI heartbeat latency,
+map paint time and CPU.
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{@{}lrrX@{}}
+\toprule
+\textbf{Retained} & \textbf{Bytes each} & \textbf{Bounded} & \textbf{At 20\,Hz} \\
+\midrule
+\texttt{csv\_logger.\_rows} & 1{,}800 & no & 130\,MB/hour \\
+CSV table model rows & 1{,}789 & yes, 20k & 34\,MB ceiling \\
+\texttt{TrackPoint} objects & 363 & no & 70\,MB per 200k \\
+\bottomrule
+\end{tabularx}
+\caption{Measured growth per retained row or fix. The first line is what
+made a long session fail; its own comment had estimated 250 bytes.}
+\end{table}
+
+The logger kept every row so the newest-first rewrite could reverse them
+without touching the disk. They were never needed in memory: the journal is
+append-only and complete, so the rewrite reads them back from it, making
+that memory transient instead of permanent.
+
+Two display costs were fixed alongside it. The map had been converting the
+whole track to pixels in a Python loop on every frame, after copying the
+entire point list; paint now projects with \texttt{numpy} into a per-zoom
+cache that grows incrementally, clips to the visible rectangle, and drops
+points closer than two screen pixels, so the work is a function of the
+window rather than of the flight. The store keeps parallel columns instead
+of objects, thins a stationary vehicle to one fix every ten seconds, and
+caps a vehicle at 300{,}000 fixes by halving the resolution of the older
+half rather than growing.
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{@{}lrrX@{}}
+\toprule
+\textbf{Track length} & \textbf{Paint before} & \textbf{Paint after} & \textbf{Points drawn} \\
+\midrule
+1{,}000   & 3.82\,ms & 1.73\,ms & 224 \\
+50{,}000  & 7.39\,ms & 2.01\,ms & 351 \\
+200{,}000 & 8.76\,ms & 1.99\,ms & 353 \\
+\bottomrule
+\end{tabularx}
+\caption{Map repaint cost. The ratio from 1{,}000 to 200{,}000 fixes fell
+from 2.3$\times$ to 1.15$\times$, and memory for 200{,}000 fixes from 70\,MB
+to 13.5\,MB.}
+\end{table}
+
+Tile fetching is bounded for the same reason: at most six requests in
+flight, a three-second transfer timeout so a dead socket releases its slot,
+requests aborted when their tile scrolls off screen, a sixty-second negative
+cache so a missing tile is not re-requested on every repaint, and a source
+that fails twelve times running is declared \textsc{offline} in the window
+instead of being retried for the rest of the flight.
+
 \section{Known Limitations and Future Work}
 \label{sec:limitations}
 %==============================================================================

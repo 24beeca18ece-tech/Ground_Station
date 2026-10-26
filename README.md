@@ -92,42 +92,50 @@ open, so opening it mid-flight shows the whole track.
   export are untouched.
 * Tracks reset when START LOGGING begins a new session file, and on
   RESET SENSOR DATA.
-* A tile that cannot be had is drawn as a grey square labelled with its zoom.
-  That is deliberate: a hole in the map must read as a hole, not as the
-  vehicle having flown over blank ground.
 
-### Choosing a source
+**The map works with no network and no files at all.** Nothing is downloaded
+at startup, and the pack selected on open is always an offline one.
 
-The dropdown lists the entries in `map_sources.json`. That file is
-**gitignored** (it may name an API key's environment variable and local
-paths); copy the tracked `map_sources.example.json` to start. A missing or
-unreadable file is not an error - the map falls back to a built-in list and
-writes one line to the event log.
+### Map packs
 
-An offline pack is selected automatically whenever one exists, because the
-launch site has no internet. Shipped entries:
+The **Map pack** dropdown lists everything found in `assets/maps/`, plus the
+grid. Your choice is remembered in `map_settings.json`. A pack that will not
+load falls back to the grid with a line in the event log - never an error
+dialog, never an exception.
 
-| Source | Notes |
-|---|---|
-| **Offline (MBTiles)** | Any `.mbtiles` file in `assets/maps/`. The default when present. Works with no network at all. |
-| **ISRO Bhuvan (admin basemap)** | WMS at `bhuvan-vec1.nrsc.gov.in`. Verified working anonymously - no token, no registration. It is a *vector* server: administrative boundaries, **not** satellite imagery. |
-| **OpenStreetMap** | Light interactive use only. Bulk download is forbidden by the OSMF Tile Usage Policy, and `tools/fetch_tiles.py` refuses it. |
+| Pack kind | What it is | Needs |
+|---|---|---|
+| **Grid only** | Lat/lon graticule labelled in degrees and minutes, scale bar, north arrow, and range rings at 250 m / 500 m / 1 km / 2 km around the ground station. Always available. | nothing |
+| **Vector** (`*.osmpack.json`) | OpenStreetMap roads, buildings, water, rail, landuse and place names, rendered by this application. | `tools/fetch_osm_vectors.py`, once, at home |
+| **Tiles** (`*.mbtiles`) | A raster tile pack. | `tools/fetch_tiles.py`, QGIS or MOBAC |
+| **Image** (`NAME.png` + `NAME.json`) | Your own satellite or scanned-map image, georeferenced. | you supply it |
+| *online sources* | Listed last and labelled `(online)`. The only entries that touch the network. | a connection |
 
-A commented Mappls / MapmyIndia entry sits in `_disabled_examples` in the
-example file. It needs an API key and **their terms have not been checked for
-this project** - read them before enabling it. Keys are read from the
-environment variable named by `key_env`; no key is ever stored in the repo.
+A bundled **India overview** (Natural Earth, public domain, 196 KB) ships in
+`assets/maps/`, so a fresh clone shows the country outline, state boundaries
+and major cities when zoomed out.
 
-No Google Maps or Google tile server is used anywhere in the map. Google
-Earth is only the viewer for the exported KML.
+### Vector pack for your launch site (recommended)
 
-**Privacy note.** Any online source receives the tile coordinates you are
-looking at - which is to say the approximate location and zoom of your launch
-site - along with your IP address and the application's User-Agent. If that
-matters for a given site, build an offline pack beforehand and fly with the
-offline source selected; then nothing leaves the machine.
+One Overpass query, no tiles, a few hundred kilobytes:
 
-### Building an offline tile pack
+```bash
+python tools/fetch_osm_vectors.py \
+    --bbox 74.8305 32.7041 74.8835 32.7491 \
+    --out assets/maps/jammu.osmpack.json
+```
+
+`--dry-run` prints the query and the area without sending anything. Areas
+over 10 km a side are refused: Overpass is donated infrastructure for small
+extracts, not regional downloads - for something larger, take a Geofabrik
+extract and convert it to the same JSON format, which the map also accepts.
+The tool makes exactly **one** request per run and identifies itself; if the
+server rate-limits you, wait rather than retrying in a loop.
+
+Data is © OpenStreetMap contributors, ODbL. The map shows that attribution
+whenever such a pack is drawn; keep it if you redistribute a pack.
+
+### Raster tile pack
 
 ```bash
 # 5 x 5 km around the launch site, zoom 12-18 -> 2,218 tiles
@@ -138,32 +146,94 @@ python tools/fetch_tiles.py \
     --out assets/maps/jammu.mbtiles
 ```
 
-`--dry-run` counts the tiles and checks permissions without downloading. The
-tool is rate limited (2 req/s), resumable (re-run the same command to continue
-an interrupted job), identifies itself by User-Agent, and refuses jobs over
-20,000 tiles without `--force`.
+Rate limited (2 req/s), resumable, refuses jobs over 20,000 tiles without
+`--force`, and **refuses any source not explicitly marked
+`"bulk_download": true`** in `map_sources.json`, naming the reason. The OSMF
+Tile Usage Policy forbids bulk downloading from `tile.openstreetmap.org`, so
+that source is refused by default. Read a provider's terms yourself before
+setting that flag.
 
-It also **refuses any source not explicitly marked `"bulk_download": true`**
-in `map_sources.json`, and says why. Bulk downloading is a sustained load on
-someone else's server and most providers' terms govern it - the OSMF policy
-forbids it outright for `tile.openstreetmap.org`. Read the provider's terms
-yourself before setting that flag.
+**Or build the pack in a GUI**, which is often easier and is the only route
+for providers this tool refuses:
 
-**Or build the pack in a GUI instead**, which is often easier and is the only
-route for providers this tool refuses:
+* **QGIS** - add the layer (Browser -> XYZ Tiles / WMS), zoom to the site,
+  then *Processing -> Toolbox -> Raster tools -> Generate XYZ tiles
+  (MBTiles)*. Set the extent, zoom 12-18, PNG, output into `assets/maps/`.
+* **Mobile Atlas Creator (MOBAC)** - pick the source, select the area, choose
+  **MBTiles SQLite** as the atlas format, add zoom 12-18, create into
+  `assets/maps/`.
 
-* **QGIS** - add the layer (Browser -> XYZ Tiles / WMS), zoom to the launch
-  site, then *Processing -> Toolbox -> Raster tools -> Generate XYZ tiles
-  (MBTiles)*. Set the extent, zoom 12-18, tile format PNG, and write the
-  output into `assets/maps/`.
-* **Mobile Atlas Creator (MOBAC)** - pick the map source, select the area,
-  choose **MBTiles SQLite** as the atlas format, add zoom levels 12-18, and
-  create the atlas into `assets/maps/`.
+Zoom 12 gives a few kilometres of context; 18 is roughly 0.6 m per pixel,
+enough to pick out tracks and buildings for recovery.
 
-Zoom 12 gives context for a few kilometres around the site; 18 is roughly
-0.6 m per pixel, enough to pick out tracks and buildings for recovery.
-Below 12 is rarely useful at a single site, and above 18 is usually not
-available.
+### Your own image overlay
+
+Put an image in `assets/maps/` with a sidecar of the same name:
+
+```
+assets/maps/launchsite.png
+assets/maps/launchsite.json
+```
+```json
+{
+  "name": "Launch site, 2026 survey",
+  "west": 74.8305, "south": 32.7041,
+  "east": 74.8835, "north": 32.7491,
+  "attribution": "My own survey photo"
+}
+```
+
+Produce the image by exporting a view from an imagery source **you are
+allowed to use**, or from QGIS (*Project -> Import/Export -> Export Map to
+Image*, with "Draw annotations" off; QGIS reports the extent you then copy
+into the sidecar). **The image's licence is your responsibility** - the map
+says so on screen, and nothing is downloaded on your behalf.
+
+The image is treated as Web Mercator aligned and stretched to those bounds.
+Over an area under 10 km that is a good approximation: the Mercator y-scale
+changes by about 0.08% over 10 km of latitude at 33°N, under 8 m across the
+whole image. Use the opacity slider to fade it so the tracks stay readable.
+Very large images are downsampled on a worker thread, so the GUI never
+stalls while one loads.
+
+### Offline checklist - do this at home, before you travel
+
+1. **Vector pack for the site, with a 2 km margin.** If the pad is at
+   32.7266 N, 74.8570 E, a 2 km margin is about ±0.022° of latitude and
+   ±0.027° of longitude:
+   ```bash
+   python tools/fetch_osm_vectors.py \
+       --bbox 74.8300 32.7046 74.8840 32.7486 \
+       --out assets/maps/launchsite.osmpack.json
+   ```
+2. **A tile pack**, if you have a source whose terms allow it (see above).
+3. **Your image overlay**, if you have one, plus its sidecar.
+4. **Verify the packs load**, without starting the whole application:
+   ```bash
+   python -c "import map_basemap, os; \
+   [print(f, '->', (lambda p: p.name + ', %d features' % p.feature_count if p else 'FAILED TO LOAD')(map_basemap.load_vector_pack(os.path.join('assets/maps', f)))) \
+    for f in os.listdir('assets/maps') if f.endswith('.osmpack.json')]"
+   ```
+   Every pack must print a feature count. `FAILED TO LOAD` means a corrupt
+   or truncated download - fetch it again while you still have a network.
+5. **The night before: disconnect the network and start the application.**
+   Turn off Wi-Fi and unplug the cable, then:
+   ```bash
+   python main.py
+   ```
+   Open **MAP**. You should see your pack drawn, the scale bar, the north
+   arrow and - once you enter the ground station position - the range rings.
+   The status line must *not* say `OFFLINE`, because nothing should be
+   trying to reach a server. If it does, you have an online source selected:
+   pick an offline pack from the dropdown, and it will be remembered.
+6. **Set the ground station position** in the map window (GS lat / lon,
+   then tick *show*) so range and bearing to each vehicle are live. It is
+   saved to `map_settings.json`, so do it once.
+
+**Privacy note.** Any online source receives the tile coordinates you are
+looking at - the approximate location and zoom of your launch site - along
+with your IP address and the application's User-Agent. The offline packs
+above send nothing at all, which is the other reason to prepare them.
 
 ## KML export for Google Earth
 
