@@ -698,3 +698,103 @@ def test_test_source_runs_off_the_gui_thread_and_reports(qapp, server,
         assert field in text, (field, text)
     window.shutdown()
     window.close()
+
+
+def test_every_failure_mode_together_never_blocks_the_gui_thread(qapp, server,
+                                                                 tmp_path):
+    """All the failure cases at once, through the provider, with a heartbeat.
+
+    Each route gets its own source and provider so every one is genuinely
+    requested; the heartbeat runs on the GUI thread the whole time.
+    """
+    from PyQt5.QtCore import QTimer
+    routes = ["/redirect301", "/redirect302", "/403", "/404", "/429", "/500",
+              "/slow", "/garbage", "/xml", "/ok"]
+    providers = []
+    for index, route in enumerate(routes):
+        provider = _provider(server, route, name="r%d" % index,
+                             read_timeout=1.5,
+                             cache_dir=str(tmp_path / ("c%d" % index)))
+        providers.append(provider)
+
+    gaps = []
+    last = [time.perf_counter()]
+
+    def beat():
+        now = time.perf_counter()
+        gaps.append(now - last[0])
+        last[0] = now
+
+    timer = QTimer()
+    timer.timeout.connect(beat)
+    timer.start(10)
+    for provider in providers:
+        provider.get(13, 4, 4)
+
+    deadline = time.time() + 15
+    while time.time() < deadline and any(p._pending for p in providers):
+        qapp.processEvents()
+        time.sleep(0.005)
+    timer.stop()
+
+    outcome = {route: (len(p._cache), p.last_error_kind)
+               for route, p in zip(routes, providers)}
+    for provider in providers:
+        provider.shutdown()
+
+    # Every case resolved, each with the right outcome.
+    assert outcome["/ok"] == (1, "")
+    assert outcome["/redirect301"] == (1, "")
+    assert outcome["/redirect302"] == (1, "")
+    for route in ("/403", "/404", "/429", "/500"):
+        assert outcome[route] == (0, tf.TileError.HTTP), (route, outcome[route])
+    assert outcome["/slow"] == (0, tf.TileError.TIMEOUT)
+    assert outcome["/garbage"] == (0, tf.TileError.BAD_IMAGE)
+    assert outcome["/xml"] == (0, tf.TileError.BAD_IMAGE)
+
+    worst = max(gaps) if gaps else 0.0
+    assert worst < 0.1, "GUI thread blocked for %.0f ms" % (worst * 1000)
+
+
+def test_an_online_source_shows_its_attribution_not_a_pack_error(qapp,
+                                                                 tmp_path):
+    """Found on the real platform: a working OSM map was captioned "Map pack
+    could not be opened", because online sources travel as pack kind
+    mbtiles. The attribution is a licence condition and must show."""
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    osm = next(s for s in window.sources if s.name == "OpenStreetMap")
+    window.canvas.pack = mw.MapPack(name=osm.name, kind="mbtiles",
+                                    attribution=osm.attribution)
+    window.canvas.set_source(osm, str(tmp_path))
+    text = window.canvas.attribution_text()
+    assert "OpenStreetMap contributors" in text, text
+    assert "could not be opened" not in text
+    window.shutdown()
+    window.close()
+
+
+def test_offline_keeps_the_attribution_and_adds_the_reason(qapp, tmp_path):
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    osm = next(s for s in window.sources if s.name == "OpenStreetMap")
+    window.canvas.pack = mw.MapPack(name=osm.name, kind="mbtiles",
+                                    attribution=osm.attribution)
+    window.canvas.set_source(osm, str(tmp_path))
+    provider = window.canvas.provider
+    provider._consecutive_failures = mw.OFFLINE_AFTER_FAILURES
+    provider.last_error = "host not found (DNS)"
+    text = window.canvas.attribution_text()
+    assert "OpenStreetMap contributors" in text, text
+    assert "OFFLINE" in text and "DNS" in text
+    window.shutdown()
+    window.close()
+
+
+def test_a_missing_offline_pack_still_says_so(qapp, tmp_path):
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    window.canvas.pack = mw.MapPack(name="gone.mbtiles", kind="mbtiles",
+                                    attribution="Offline tile pack")
+    window.canvas.set_source(mw.MapSource(name="gone", type="mbtiles",
+                                          path="nowhere"), str(tmp_path))
+    assert "could not be opened" in window.canvas.attribution_text()
+    window.shutdown()
+    window.close()

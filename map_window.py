@@ -1544,24 +1544,41 @@ class MapCanvas(QWidget):
         painter.drawText(x0, y0 - 8, text)
 
     def _draw_attribution(self, painter: QPainter) -> None:
+        text = self.attribution_text()
+        if not text:
+            return
+        self._paint_attribution(painter, text)
+
+    def attribution_text(self) -> str:
+        """The bottom-corner notice: provider attribution, plus any problem."""
         source = self.provider.source
+        online = source is not None and source.type in ("xyz", "wms")
         text = self.pack.attribution or (source.attribution if source else "")
         if self.vector_pack is not None:
             text = self.vector_pack.attribution
         elif self.overlay is not None:
             text = ("%s — you are responsible for this image's licence"
                     % self.overlay.attribution)
+        elif online:
+            # An online provider's attribution is a condition of its licence
+            # (OpenStreetMap's explicitly), so it is shown whatever else is
+            # going on. Online sources travel as pack kind "mbtiles", which
+            # is why this has to be decided by the source type: testing the
+            # pack kind showed "could not be opened" over a working OSM map.
+            text = source.attribution
         elif self.pack.kind == "mbtiles" and not self.provider.offline_ready:
             text = "Map pack could not be opened — showing the grid"
         if source and source.needs_key:
             text = "%s — set %s to use this source" % (text, source.key_env)
-        if self.provider.is_offline:
-            # Say it once, plainly, instead of retrying a dead server for
-            # the rest of the flight.
-            text = "OFFLINE — %s is not reachable" % (source.name if source
-                                                      else "this source")
-        if not text:
-            return
+        if online and self.provider.is_offline:
+            # The reason, and the attribution, together: replacing the
+            # attribution with an error would drop the licence notice.
+            text = "%s   ·   OFFLINE — %s" % (
+                source.attribution, self.provider.last_error
+                or "not reachable")
+        return text or ""
+
+    def _paint_attribution(self, painter: QPainter, text: str) -> None:
         font = QFont()
         font.setPointSize(8)
         painter.setFont(font)
