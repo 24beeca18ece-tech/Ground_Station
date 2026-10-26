@@ -147,10 +147,12 @@ class CsvLoggerThread(QThread):
         self._journal_path: Optional[str] = None
         #: The newest-first CSV the operator actually opens.
         self._csv_path: Optional[str] = None
-        #: Every row of the current session, oldest-first. Reversed on rewrite.
-        #: ~250 bytes/row, so ~18 MB per hour at 20 Hz -- worth it to avoid
-        #: re-reading the journal on every rebuild.
-        self._rows: List[List[Any]] = []
+        #: How many data rows this session has written. A COUNT, not the rows:
+        #: retaining them cost a measured 1,800 bytes each and never came
+        #: back, which at 20 Hz is 130 MB an hour and is what eventually put
+        #: a long session into swap. The rows live in the journal, which is
+        #: append-only and complete, so the rewrite reads them from there.
+        self._row_count = 0
         self._error_file = None
         self._rows_since_flush = 0
         self._rows_since_rewrite = 0
@@ -290,7 +292,7 @@ class CsvLoggerThread(QThread):
         row[SEQ_COL] = self._seq
         # Journal first: the row is durable before it is anywhere else.
         self._journal_writer.writerow(row)
-        self._rows.append(row)
+        self._row_count += 1
         self.rows_written += 1
         self._rows_since_flush += 1
         self._rows_since_rewrite += 1
@@ -408,8 +410,12 @@ class CsvLoggerThread(QThread):
                 else:
                     return  # could not archive; do not corrupt the old file
 
-            self._rows = self._load_existing_rows(path) if exists else []
-            self._seq = self._highest_seq(self._rows)
+            # Only to continue the sequence numbering of a resumed file; the
+            # rows themselves are released as soon as the scan is done.
+            existing = self._load_existing_rows(path) if exists else []
+            self._row_count = len(existing)
+            self._seq = self._highest_seq(existing)
+            del existing
 
             # The journal is append-only and never re-read during a session, so
             # it is opened in append mode and simply grows.
@@ -428,12 +434,45 @@ class CsvLoggerThread(QThread):
         self._journal_writer = writer
         self._journal_path = journal_path
         self._csv_path = path
-        self._rows_since_rewrite = len(self._rows)
+        self._rows_since_rewrite = self._row_count
         self._last_rewrite = 0.0        # force a rewrite on the next tick
         # Put a header-only (or recovered) file in place immediately, so the
         # path emitted below always names a file that exists and parses.
         self._rewrite_csv()
         self.file_opened.emit(path)
+
+    def _read_journal_rows(self) -> List[List[Any]]:
+        """The session's data rows, oldest-first, read back from the journal.
+
+        The journal is flushed first: a row written but still sitting in the
+        OS buffer would otherwise be missing from the rewritten CSV, which is
+        exactly the row an operator looking at the file mid-flight wants.
+        """
+        if self._journal_path is None:
+            return []
+        if self._journal_file is not None:
+            try:
+                self._journal_file.flush()
+            except (OSError, ValueError):
+                pass
+        try:
+            with open(self._journal_path, "r", newline="",
+                      encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                first = next(reader, None)
+                # The journal starts with the header; anything else means the
+                # file is not what this session wrote, so emit nothing rather
+                # than a CSV with a stray data row at the top.
+                if first is not None and first != CSV_HEADER:
+                    rows = [first]
+                else:
+                    rows = []
+                rows.extend(r for r in reader if r)
+                return rows
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            self.error_occurred.emit(
+                "Could not read the journal to rebuild the CSV: %s" % exc)
+            return []
 
     def _rewrite_csv(self) -> bool:
         """Rebuild the newest-first CSV atomically. Returns True on success.
@@ -447,11 +486,17 @@ class CsvLoggerThread(QThread):
             return False
         tmp = self._csv_path + ".tmp"
         try:
+            # The journal is the source of truth and is already on disk, so
+            # the rows are read back here rather than held in memory for the
+            # whole session. This list is transient: it exists for the
+            # duration of the rewrite and is freed when it returns.
+            rows = self._read_journal_rows()
             with open(tmp, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(CSV_HEADER)
                 # reversed() is a view, not a copy: no second list is built.
-                writer.writerows(reversed(self._rows))
+                writer.writerows(reversed(rows))
+                del rows
                 handle.flush()
                 # The swap is only worth anything once the bytes are down.
                 os.fsync(handle.fileno())
@@ -474,11 +519,11 @@ class CsvLoggerThread(QThread):
         elapsed = time.monotonic() - self._last_rewrite
         # Threshold grows with the log, so cost per row stays roughly constant.
         threshold = max(REWRITE_MIN_ROWS,
-                        len(self._rows) // REWRITE_AMORTIZE_DIVISOR)
+                        self._row_count // REWRITE_AMORTIZE_DIVISOR)
         due = elapsed >= REWRITE_INTERVAL_S and self._rows_since_rewrite >= threshold
         ceiling = min(
             REWRITE_MAX_INTERVAL_S
-            * (1.0 + len(self._rows) / REWRITE_CEILING_SCALE_ROWS),
+            * (1.0 + self._row_count / REWRITE_CEILING_SCALE_ROWS),
             REWRITE_MAX_INTERVAL_CAP_S,
         )
         if due or elapsed >= ceiling:
@@ -558,7 +603,7 @@ class CsvLoggerThread(QThread):
         self._journal_writer = None
         self._journal_path = None
         self._csv_path = None
-        self._rows = []
+        self._row_count = 0
         self._rows_since_rewrite = 0
 
     def _close_files(self) -> None:
