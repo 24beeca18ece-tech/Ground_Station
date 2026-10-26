@@ -48,6 +48,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -61,8 +62,8 @@ from PyQt5.QtCore import (QObject, QPoint, QPointF, QRect, QRunnable, Qt,
 from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
                          QPolygonF)
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                             QHBoxLayout, QLabel, QPushButton, QSlider,
-                             QVBoxLayout, QWidget)
+                             QHBoxLayout, QLabel, QMessageBox, QPushButton,
+                             QSlider, QVBoxLayout, QWidget)
 
 from tile_fetcher import (TileError, TileFetcher, TileResult,
                           fetch_tile)
@@ -173,6 +174,15 @@ def default_user_agent(contact: str) -> str:
 
 #: Kept for callers that predate the configurable contact.
 USER_AGENT = default_user_agent("")
+
+#: The map_settings.json field holding the operator's contact for the
+#: OpenStreetMap User-Agent. Deliberately not a placeholder value: an empty
+#: field is reported on screen and in the log until it is filled in.
+OSM_CONTACT_FIELD = "osm_contact"
+OSM_CONTACT_HELP = ("Your email address or a URL where OpenStreetMap's "
+                    "operations team can reach you. Sent in the User-Agent "
+                    "of every OSM tile request, as their tile usage policy "
+                    "asks.")
 
 #: Used when map_sources.json is missing or unreadable. Offline first.
 BUILTIN_SOURCES: List[Dict[str, Any]] = [
@@ -1574,6 +1584,10 @@ class MapWindow(QDialog):
 
     #: One line for the dashboard's event log.
     log_message = pyqtSignal(str)
+    #: ``(TileResult, url_label)`` from the Test source worker thread. Qt
+    #: queues a signal emitted from another thread onto this one, so the
+    #: dialog is always built on the GUI thread.
+    test_result = pyqtSignal(object)
 
     def __init__(self, store: TrackStore, base_dir: str = ".",
                  parent: Optional[QWidget] = None) -> None:
@@ -1640,6 +1654,23 @@ class MapWindow(QDialog):
         self.clear_btn.clicked.connect(self._on_clear)
         bar.addWidget(self.clear_btn)
 
+        self.retry_btn = QPushButton("RETRY NOW")
+        self.retry_btn.setToolTip(
+            "Forget the OFFLINE verdict and the 60 s negative cache for the "
+            "selected online source, and fetch the visible tiles again.\n"
+            "An offline source also retries by itself every %.0f s."
+            % OFFLINE_RETRY_S)
+        self.retry_btn.clicked.connect(self._on_retry)
+        bar.addWidget(self.retry_btn)
+
+        self.test_btn = QPushButton("TEST SOURCE")
+        self.test_btn.setToolTip(
+            "Fetch one tile for the current view from the selected source, "
+            "bypassing every cache, and show the URL, HTTP status, size, "
+            "time and the exact error if any. Runs off the GUI thread.")
+        self.test_btn.clicked.connect(self._on_test_source)
+        bar.addWidget(self.test_btn)
+
         bar.addStretch(1)
         bar.addWidget(QLabel("GS lat:"))
         self.gs_lat = QDoubleSpinBox()
@@ -1670,6 +1701,16 @@ class MapWindow(QDialog):
         self.status.setStyleSheet("color: %s; font-size: 9pt;" % COL_DIM)
         layout.addWidget(self.status)
         self.canvas.cursor_moved.connect(self._on_cursor)
+
+        # The first failure of each kind, and recovery, reach the event log;
+        # the latest reason is on the status line.
+        self.canvas.provider.log_error.connect(
+            lambda text: self.log_message.emit("Map: %s" % text))
+        self.canvas.provider.recovered.connect(
+            lambda name: self.log_message.emit(
+                "Map: %s is answering again — online." % name))
+        self.test_result.connect(self._show_test_result)
+        self._contact_warned = False
 
         self._load_settings()
         self._populate_packs()
@@ -1763,20 +1804,120 @@ class MapWindow(QDialog):
         self.canvas.invalidate_tracks()
         self.log_message.emit("Map tracks cleared (logs and CSV untouched).")
 
+    # -- online source tools -----------------------------------------------
+
+    def _online_selected(self) -> bool:
+        source = self.canvas.provider.source
+        return (source is not None and source.type in ("xyz", "wms")
+                and self.canvas.pack.kind == "mbtiles"
+                and self.canvas.pack.name == source.name)
+
+    def _on_retry(self) -> None:
+        if not self._online_selected():
+            self.log_message.emit("Map: Retry now applies to an online source; "
+                                  "the selected pack is offline.")
+            return
+        self.canvas.provider.retry_source()
+        self.canvas.request_redraw()
+        self.log_message.emit("Map: retrying %s now."
+                              % self.canvas.provider.source.name)
+
+    def _on_test_source(self) -> None:
+        """Fetch one tile for the centre of the view, off the GUI thread."""
+        if not self._online_selected():
+            QMessageBox.information(
+                self, "Test source",
+                "The selected map pack is offline, so there is no server to "
+                "test.\n\nChoose an online source from the Map pack list "
+                "first.")
+            return
+        canvas = self.canvas
+        z = canvas.zoom
+        x, y = lonlat_to_tile(canvas.center_lon, canvas.center_lat, z)
+        provider = canvas.provider
+        self.test_btn.setEnabled(False)
+        self.test_btn.setText("TESTING…")
+
+        def work():
+            try:
+                result = provider.test_tile(z, x, y)
+            except Exception as exc:                      # noqa: BLE001
+                result = TileResult(key=None, kind=TileError.OTHER,
+                                    reason="%s: %s" % (type(exc).__name__, exc))
+            try:
+                self.test_result.emit(result)
+            except RuntimeError:
+                pass                     # window closed while testing
+
+        threading.Thread(target=work, name="map-test-source",
+                         daemon=True).start()
+
+    def _show_test_result(self, result: TileResult) -> None:
+        self.test_btn.setEnabled(True)
+        self.test_btn.setText("TEST SOURCE")
+        source = self.canvas.provider.source
+        lines = [
+            "Source:  %s" % (source.name if source else "?"),
+            "URL:  %s" % (result.url or "(none)"),
+            "HTTP status:  %s" % (result.status or "no response"),
+            "Bytes:  %d" % (len(result.data) if result.data else 0),
+            "Time:  %.0f ms" % result.elapsed_ms,
+            "User-Agent:  %s" % self.canvas.provider.user_agent,
+            "",
+            "Result:  %s" % ("OK — a valid image tile" if result.ok
+                             else "FAILED — %s" % (result.reason
+                                                   or "unknown error")),
+        ]
+        self.last_test_text = "\n".join(lines)
+        self.log_message.emit("Map: Test source %s — %s" % (
+            source.name if source else "?",
+            "OK, %d bytes in %.0f ms" % (len(result.data), result.elapsed_ms)
+            if result.ok else result.reason))
+        self._present_test_dialog(self.last_test_text, result.ok)
+
+    def _present_test_dialog(self, text: str, ok: bool) -> None:
+        """Show the Test source result. Non-modal, text selectable.
+
+        Separate from the result handling so tests can check everything up
+        to here: Qt's offscreen platform faults inside QMessageBox.show()
+        (measured -- even a plain box), while the real Windows platform
+        shows the same box without trouble.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Test source")
+        box.setIcon(QMessageBox.Information if ok else QMessageBox.Warning)
+        box.setText(text)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        box.setModal(False)
+        box.show()
+        self._last_test_box = box
+
     # -- ground station ----------------------------------------------------
 
     def _settings_path(self) -> str:
         return os.path.join(self.base_dir, SETTINGS_FILE)
 
+    def _apply_contact(self) -> None:
+        """Put the operator's contact into the User-Agent."""
+        self.canvas.provider.user_agent = default_user_agent(self.osm_contact)
+
     def _load_settings(self) -> None:
         self._saved_pack = ""
+        #: An email or URL where the OpenStreetMap operations team can reach
+        #: whoever runs this station. Their tile usage policy asks for it in
+        #: the User-Agent; it is the operator's to fill in, in
+        #: map_settings.json, and is never guessed.
+        self.osm_contact = ""
         try:
             with open(self._settings_path(), "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
+            self._apply_contact()
             return                      # no file, or unreadable: show nothing
         if isinstance(data, dict):
             self._saved_pack = str(data.get("map_pack", "") or "")
+            self.osm_contact = str(data.get(OSM_CONTACT_FIELD, "") or "").strip()
+        self._apply_contact()
         station = data.get("ground_station") if isinstance(data, dict) else None
         if not isinstance(station, dict):
             return
@@ -1795,7 +1936,11 @@ class MapWindow(QDialog):
         payload = {"ground_station": {"lat": self.gs_lat.value(),
                                       "lon": self.gs_lon.value(),
                                       "show": self.gs_check.isChecked()},
-                   "map_pack": getattr(self, "_saved_pack", "")}
+                   "map_pack": getattr(self, "_saved_pack", ""),
+                   # Written back even when empty, so the field is there to
+                   # be found and filled in rather than having to be known.
+                   OSM_CONTACT_FIELD: getattr(self, "osm_contact", ""),
+                   OSM_CONTACT_FIELD + "_help": OSM_CONTACT_HELP}
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
@@ -1836,10 +1981,28 @@ class MapWindow(QDialog):
                 bits.append("image loading…")
             elif self.canvas.overlay.error:
                 bits.append(self.canvas.overlay.error)
-        if self.canvas.provider.is_offline:
-            bits.append("OFFLINE (source unreachable)")
-        if self.canvas.provider.network_errors:
-            bits.append("%d tile errors" % self.canvas.provider.network_errors)
+        provider = self.canvas.provider
+        # The automatic retry rides on this 500 ms timer: one probe tile every
+        # OFFLINE_RETRY_S while offline, never a retry storm.
+        if provider.probe_if_due():
+            self.canvas.request_redraw()
+        reason = provider.status_text
+        if reason:
+            # The real reason, not "source unreachable".
+            bits.append(reason)
+        if provider.network_errors:
+            bits.append("%d tile errors" % provider.network_errors)
+        if (self._online_selected() and not self.osm_contact
+                and "openstreetmap" in (provider.source.url or "").lower()):
+            bits.append("set %s in %s (OSM asks for a contact)"
+                        % (OSM_CONTACT_FIELD, SETTINGS_FILE))
+            if not self._contact_warned:
+                self._contact_warned = True
+                self.log_message.emit(
+                    "Map: OpenStreetMap's tile policy asks for a contact in the "
+                    "User-Agent. Put your email or URL in \"%s\" in %s; until "
+                    "then the project page is sent." % (OSM_CONTACT_FIELD,
+                                                        SETTINGS_FILE))
         if self.canvas.paint_errors:
             bits.append("paint error: %s" % self.canvas._last_paint_error)
         self.status.setText("  ·  ".join(bits))

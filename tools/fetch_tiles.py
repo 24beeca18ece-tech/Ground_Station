@@ -6,7 +6,7 @@ Builds an offline MBTiles pack for a launch site, so the map works with no
 internet at all.
 
     python tools/fetch_tiles.py --bbox 74.80 32.68 74.92 32.78 \
-        --zoom 12 18 --source "ISRO Bhuvan (admin basemap)" \
+        --zoom 12 18 --source "ISRO Bhuvan (boundaries only)" \
         --out assets/maps/jammu.mbtiles
 
 BEFORE YOU RUN THIS

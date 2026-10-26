@@ -34,13 +34,14 @@
     },
 
     {
-      "name": "ISRO Bhuvan (admin basemap)",
+      "name": "ISRO Bhuvan (boundaries only)",
       "type": "wms",
       "url": "https://bhuvan-vec1.nrsc.gov.in/bhuvan/wms",
       "layers": "basemap:admin_group_ntl",
       "attribution": "© ISRO / NRSC Bhuvan",
       "min_zoom": 4,
       "max_zoom": 16,
+      "read_timeout": 12.0,
       "bulk_download": false,
       "_note": [
         "VERIFIED from this machine on 2026-10-26: this endpoint answers",

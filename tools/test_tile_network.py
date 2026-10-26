@@ -63,6 +63,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     """One route per failure mode. Quiet: no stderr log per request."""
 
     slow_seconds = 5.0
+    #: While True, /flaky answers 503; flipped by a test to simulate a
+    #: source that comes back.
+    flaky_down = True
+    #: The User-Agent of the most recent request, for the header tests.
+    last_user_agent = ""
 
     def log_message(self, *args):                       # noqa: A003
         pass
@@ -76,7 +81,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):                                   # noqa: N802
-        path = self.path.split("?")[0]
+        # Route on the first segment only, so /403 and /403/13/1/1.png (what
+        # an xyz source builds) reach the same case.
+        path = "/" + self.path.split("?")[0].lstrip("/").split("/")[0]
         if path.startswith("/ok"):
             self._send(200, PNG)
         elif path == "/redirect301":
@@ -105,6 +112,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/xml":
             # What a WMS sends for an error: HTTP 200 and XML.
             self._send(200, b"<ServiceExceptionReport/>", "text/xml")
+        elif path.startswith("/flaky"):
+            if type(self).flaky_down:
+                self._send(503, b"down", "text/plain")
+            else:
+                self._send(200, PNG)
+        elif path.startswith("/ua"):
+            type(self).last_user_agent = self.headers.get("User-Agent", "")
+            self._send(200, PNG)
         else:
             self._send(404, b"", "text/plain")
 
@@ -402,3 +417,284 @@ def test_tiles_no_longer_on_screen_are_skipped(server):
     assert not result.ok
     assert "no longer on screen" in result.reason
     fetcher.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# The provider: reasons, logging, recovery, probe, User-Agent
+# ---------------------------------------------------------------------------
+
+def _provider(server, route, name="local", read_timeout=8.0, cache_dir=""):
+    provider = mw.TileProvider(cache_dir=cache_dir)
+    provider.set_source(mw.MapSource(name=name, type="xyz",
+                                     url=server + route + "/{z}/{x}/{y}.png",
+                                     min_zoom=0, max_zoom=19,
+                                     read_timeout=read_timeout), ".")
+    return provider
+
+
+def _drain(qapp, provider, seconds=15.0):
+    deadline = time.time() + seconds
+    while time.time() < deadline and provider._pending:
+        qapp.processEvents()
+        time.sleep(0.02)
+    qapp.processEvents()
+
+
+def test_status_shows_the_real_reason_not_unreachable(qapp, server, tmp_path):
+    provider = _provider(server, "/403", name="OpenStreetMap",
+                         cache_dir=str(tmp_path))
+    provider.get(13, 1, 1)
+    _drain(qapp, provider)
+    text = provider.status_text
+    assert text.startswith("OpenStreetMap: HTTP 403"), text
+    assert "User-Agent" in text
+    assert "unreachable" not in text
+    provider.shutdown()
+
+
+def test_timeout_reason_names_the_source_timeout(qapp, server, tmp_path):
+    provider = _provider(server, "/slow", name="Bhuvan", read_timeout=1.0,
+                         cache_dir=str(tmp_path))
+    provider.get(13, 1, 1)
+    _drain(qapp, provider, seconds=10)
+    assert provider.status_text == "Bhuvan: timed out after 1 s", \
+        provider.status_text
+    provider.shutdown()
+
+
+def test_first_error_of_each_kind_is_logged_once(qapp, server, tmp_path):
+    provider = _provider(server, "/403", cache_dir=str(tmp_path))
+    messages = []
+    provider.log_error.connect(messages.append)
+    for i in range(5):
+        provider.get(13, i, 1)
+    _drain(qapp, provider)
+    assert provider.network_errors == 5
+    assert len(messages) == 1, messages
+    assert "HTTP 403" in messages[0]
+    provider.shutdown()
+
+
+def test_offline_shows_the_reason_and_is_not_permanent(qapp, server, tmp_path):
+    """After repeated failures: OFFLINE with the reason, then one probe."""
+    _Handler.flaky_down = True
+    provider = _provider(server, "/flaky", name="Flaky",
+                         cache_dir=str(tmp_path))
+    for i in range(mw.OFFLINE_AFTER_FAILURES):
+        provider.get(13, i, 2)
+    _drain(qapp, provider, seconds=20)
+    assert provider.is_offline
+    assert provider.status_text.startswith("OFFLINE — Flaky: HTTP 503")
+
+    # Offline: get() asks for nothing.
+    provider.get(13, 99, 99)
+    assert provider._pending == {}
+
+    # Not due yet: no probe.
+    provider._last_probe = time.monotonic()
+    assert provider.probe_if_due() is False
+    # Due: exactly one request is let through.
+    provider._last_probe = time.monotonic() - mw.OFFLINE_RETRY_S - 1
+    assert provider.probe_if_due() is True
+    assert provider.is_offline is False
+    provider.shutdown()
+
+
+def test_status_returns_to_online_when_the_source_recovers(qapp, server,
+                                                          tmp_path):
+    _Handler.flaky_down = True
+    provider = _provider(server, "/flaky", name="Flaky",
+                         cache_dir=str(tmp_path))
+    recovered = []
+    provider.recovered.connect(recovered.append)
+    for i in range(mw.OFFLINE_AFTER_FAILURES):
+        provider.get(13, i, 3)
+    _drain(qapp, provider, seconds=20)
+    assert provider.is_offline
+
+    _Handler.flaky_down = False                 # the network comes back
+    provider._last_probe = time.monotonic() - mw.OFFLINE_RETRY_S - 1
+    assert provider.probe_if_due()
+    provider.get(13, 50, 3)
+    _drain(qapp, provider)
+
+    assert provider.is_offline is False
+    assert provider.status_text == ""
+    assert recovered == ["Flaky"]
+    assert len(provider._cache) == 1
+    _Handler.flaky_down = True
+    provider.shutdown()
+
+
+def test_retry_source_clears_offline_immediately(qapp, server, tmp_path):
+    provider = _provider(server, "/403", cache_dir=str(tmp_path))
+    provider._consecutive_failures = mw.OFFLINE_AFTER_FAILURES
+    provider._failed[("local", 13, 1, 1)] = time.monotonic() + 60
+    assert provider.is_offline
+    provider.retry_source()
+    assert provider.is_offline is False
+    assert provider._failed == {}
+    provider.shutdown()
+
+
+def test_the_configured_contact_is_sent_in_the_user_agent(qapp, server,
+                                                          tmp_path):
+    provider = _provider(server, "/ua", cache_dir=str(tmp_path))
+    provider.user_agent = mw.default_user_agent("ops@example.org")
+    provider.get(13, 1, 1)
+    _drain(qapp, provider)
+    sent = _Handler.last_user_agent
+    assert sent.startswith(mw.APP_IDENT), sent
+    assert "ops@example.org" in sent
+    provider.shutdown()
+
+
+def test_an_empty_contact_falls_back_to_the_project_page():
+    agent = mw.default_user_agent("")
+    assert mw.APP_IDENT in agent and mw.PROJECT_URL in agent
+    assert "python" not in agent.lower(), "must not look like a script"
+
+
+def test_test_tile_bypasses_the_cache_and_reports_everything(qapp, server,
+                                                             tmp_path):
+    provider = _provider(server, "/ok", cache_dir=str(tmp_path))
+    # Fill the cache first, so a cached answer would be possible.
+    provider.get(13, 1, 1)
+    _drain(qapp, provider)
+    result = provider.test_tile(13, 1, 1)
+    assert result.ok
+    assert result.from_cache is False, "Test source must hit the server"
+    assert result.status == 200
+    assert len(result.data) == len(PNG)
+    assert result.url.endswith("/ok/13/1/1.png")
+    assert result.elapsed_ms > 0
+    provider.shutdown()
+
+
+def test_test_tile_on_an_offline_pack_says_there_is_nothing_to_test(qapp):
+    provider = mw.TileProvider()
+    provider.set_source(mw.MapSource(name="o", type="mbtiles"), ".")
+    result = provider.test_tile(13, 1, 1)
+    assert not result.ok and "offline" in result.reason
+
+
+def test_disk_cache_serves_the_provider_with_the_network_gone(qapp, server,
+                                                              tmp_path):
+    """A view already looked at must load with no network at all."""
+    cache_dir = str(tmp_path / "cache")
+    provider = _provider(server, "/ok", cache_dir=cache_dir)
+    provider.get(13, 7, 7)
+    _drain(qapp, provider)
+    assert len(provider._cache) == 1
+    url = provider._tile_url(("local", 13, 7, 7))
+    provider.shutdown()
+
+    # A fresh provider pointed at a dead port, same URL key: only the disk
+    # cache can satisfy it.
+    dead = mw.TileProvider(cache_dir=cache_dir)
+    dead.set_source(mw.MapSource(name="local", type="xyz",
+                                 url=server + "/ok/{z}/{x}/{y}.png",
+                                 min_zoom=0, max_zoom=19), ".")
+    dead._ensure_fetcher()
+    blocked = []
+    original = tf.build_opener
+
+    def no_network(*args, **kwargs):
+        blocked.append(1)
+        raise AssertionError("the network was touched")
+    tf.build_opener = no_network
+    try:
+        dead.get(13, 7, 7)
+        _drain(qapp, dead)
+    finally:
+        tf.build_opener = original
+    assert blocked == [], "a cached tile went to the network"
+    assert len(dead._cache) == 1
+    assert dead.cache_hits == 1
+    assert dead._tile_url(("local", 13, 7, 7)) == url
+    dead.shutdown()
+
+
+def test_sources_file_read_timeout_is_honoured(tmp_path):
+    (tmp_path / mw.SOURCES_FILE).write_text(
+        '{"sources": [{"name": "W", "type": "wms", "url": "u", '
+        '"layers": "l", "read_timeout": 15}]}', encoding="utf-8")
+    sources, _ = mw.load_sources(str(tmp_path))
+    assert sources[0].read_timeout == 15.0
+
+
+def test_builtin_bhuvan_is_labelled_boundaries_only():
+    names = [s["name"] for s in mw.BUILTIN_SOURCES]
+    assert "ISRO Bhuvan (boundaries only)" in names
+
+
+# ---------------------------------------------------------------------------
+# The window: buttons and settings
+# ---------------------------------------------------------------------------
+
+def test_window_has_retry_and_test_buttons(qapp, tmp_path):
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    assert window.retry_btn.text() == "RETRY NOW"
+    assert window.test_btn.text() == "TEST SOURCE"
+    window.shutdown()
+    window.close()
+
+
+def test_contact_field_is_written_to_settings_and_used(qapp, tmp_path):
+    import json
+    settings = tmp_path / mw.SETTINGS_FILE
+    settings.write_text(json.dumps({mw.OSM_CONTACT_FIELD: "me@uni.ac.in"}),
+                        encoding="utf-8")
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    assert "me@uni.ac.in" in window.canvas.provider.user_agent
+    window._save_settings()
+    saved = json.loads(settings.read_text(encoding="utf-8"))
+    assert saved[mw.OSM_CONTACT_FIELD] == "me@uni.ac.in"
+    assert mw.OSM_CONTACT_FIELD + "_help" in saved
+    window.shutdown()
+    window.close()
+
+
+def test_an_empty_contact_is_still_written_so_it_can_be_found(qapp, tmp_path):
+    import json
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    window._save_settings()
+    saved = json.loads((tmp_path / mw.SETTINGS_FILE).read_text(
+        encoding="utf-8"))
+    assert saved[mw.OSM_CONTACT_FIELD] == ""
+    window.shutdown()
+    window.close()
+
+
+def test_test_source_runs_off_the_gui_thread_and_reports(qapp, server,
+                                                         tmp_path):
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    source = mw.MapSource(name="local", type="xyz",
+                          url=server + "/ok/{z}/{x}/{y}.png",
+                          min_zoom=0, max_zoom=19)
+    window.canvas.pack = mw.MapPack(name="local", kind="mbtiles")
+    window.canvas.set_source(source, str(tmp_path))
+    got = []
+    window.test_result.connect(got.append)
+    # Qt's offscreen platform faults inside QMessageBox.show() (the real
+    # Windows platform does not), so capture the dialog instead of showing it.
+    shown = []
+    window._present_test_dialog = lambda text, ok: shown.append((text, ok))
+    started = time.perf_counter()
+    window._on_test_source()
+    returned_after = time.perf_counter() - started
+    assert returned_after < 0.1, "the click waited on the network"
+    deadline = time.time() + 10
+    while time.time() < deadline and not got:
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert got and got[0].ok and got[0].status == 200
+    assert window.test_btn.isEnabled()
+    # The dialog shows what the request says it does.
+    assert shown, "no result dialog"
+    text, ok = shown[0]
+    assert ok
+    for field in ("URL:", "HTTP status:  200", "Bytes:", "Time:", "OK"):
+        assert field in text, (field, text)
+    window.shutdown()
+    window.close()

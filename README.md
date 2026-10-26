@@ -142,7 +142,7 @@ whenever such a pack is drawn; keep it if you redistribute a pack.
 python tools/fetch_tiles.py \
     --bbox 74.8305 32.7041 74.8835 32.7491 \
     --zoom 12 18 \
-    --source "ISRO Bhuvan (admin basemap)" \
+    --source "ISRO Bhuvan (boundaries only)" \
     --out assets/maps/jammu.mbtiles
 ```
 
