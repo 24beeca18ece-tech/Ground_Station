@@ -53,9 +53,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+import numpy as np
+
 from PyQt5.QtCore import (QObject, QPoint, QPointF, QRect, QRunnable, Qt,
                           QThreadPool, QTimer, QUrl, pyqtSignal)
-from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
+from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
+                         QPolygonF)
 from PyQt5.QtNetwork import (QNetworkAccessManager, QNetworkDiskCache,
                              QNetworkRequest)
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
@@ -63,7 +66,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                              QWidget)
 
 from track_store import (TrackStore, Track, TrackPoint, bearing_deg,
-                         decimate, haversine_m)
+                         haversine_m)
 
 # --- palette, matched to the rest of the application ------------------------
 COL_BG = "#d7dee8"
@@ -94,14 +97,35 @@ TILE_CACHE_MAX = 400
 #: Concurrent network tile requests. Deliberately small: the tile policies of
 #: free providers ask for exactly this restraint, and a launch-site laptop on
 #: a phone hotspot does not benefit from more.
-MAX_INFLIGHT = 4
+MAX_INFLIGHT = 6
+
+#: Connect and read timeout for a tile request. With no network at the site,
+#: the OS default would leave a socket hanging for tens of seconds and the
+#: in-flight slots full the whole time; three seconds frees them promptly.
+TILE_TIMEOUT_MS = 3000
+
+#: How long a tile that failed is not asked for again. Without this, every
+#: repaint re-requests every missing tile -- which with no network is a
+#: request storm that never ends and never succeeds.
+NEGATIVE_CACHE_S = 60.0
+
+#: Consecutive failures after which a source is declared offline and stops
+#: being asked at all until the operator changes source or it is retried.
+OFFLINE_AFTER_FAILURES = 12
 
 #: A fix older than this makes the vehicle label turn red.
 STALE_FIX_S = 5.0
 
-#: Points drawn per track. The full list stays in the store for the KML and
-#: the distance readouts; this is only what gets stroked.
-MAX_DRAWN_POINTS = 2000
+#: Minimum pixel separation between drawn track points. Two points closer
+#: than this land on the same stroke, so drawing both costs time and shows
+#: nothing. This is what keeps paint cost a function of the SCREEN, not of
+#: how long the flight has been.
+MIN_POINT_SPACING_PX = 2.0
+
+#: Hard ceiling on points in one polyline after thinning. A 2 px spacing
+#: already bounds this to roughly (width + height) / 2 for a space-filling
+#: path; the cap is a backstop for a pathological zoom.
+MAX_DRAWN_POINTS = 4000
 
 #: Where sources and the ground-station position live. Both are gitignored:
 #: the first may carry an API key's environment-variable name and local file
@@ -192,6 +216,22 @@ def tile_bounds_3857(x: int, y: int, zoom: int) -> Tuple[float, float, float, fl
     north = ORIGIN_SHIFT - y * span
     south = north - span
     return west, south, east, north
+
+
+def lonlat_to_world_array(lons: "np.ndarray", lats: "np.ndarray",
+                          zoom: int) -> "tuple":
+    """Vectorised :func:`lonlat_to_world` for whole columns at once.
+
+    One numpy expression instead of a Python call per fix. This is what
+    makes a 200,000-point track cost about the same to project as a
+    1,000-point one, and it is why the store keeps columns.
+    """
+    size = TILE_PX * (2 ** zoom)
+    x = (lons + 180.0) / 360.0 * size
+    clamped = np.clip(lats, -85.05112878, 85.05112878)
+    sin_lat = np.sin(np.radians(clamped))
+    y = (0.5 - np.log((1 + sin_lat) / (1 - sin_lat)) / (4 * np.pi)) * size
+    return x, y
 
 
 def metres_per_pixel(lat: float, zoom: int) -> float:
@@ -377,8 +417,16 @@ class TileProvider(QObject):
         super().__init__(parent)
         self.source: Optional[MapSource] = None
         self._cache: "OrderedDict[Any, QImage]" = OrderedDict()
-        self._pending: set = set()
-        self._failed: set = set()
+        #: key -> the reply still in flight for it, so a tile that scrolls
+        #: off screen can have its request aborted rather than finishing to
+        #: fill a cache nobody is looking at.
+        self._pending: Dict[Any, Any] = {}
+        #: key -> monotonic time the failure expires. A plain set would mean
+        #: a tile that failed once is never retried in the whole session,
+        #: which is wrong when the network comes back; no expiry at all means
+        #: re-requesting every missing tile on every repaint.
+        self._failed: Dict[Any, float] = {}
+        self._consecutive_failures = 0
         self._mbtiles_paths: List[str] = []
         self._pool = QThreadPool(self)
         # Two readers is enough to keep the visible grid filled without
@@ -388,6 +436,10 @@ class TileProvider(QObject):
         self._net.finished.connect(self._on_reply)
         self._inflight = 0
         self._queue: List[Any] = []
+        #: Bumped whenever the drawable tile set changes, so the canvas can
+        #: tell "nothing changed" from "a tile arrived" without comparing
+        #: the cache itself.
+        self.generation = 0
         self.network_errors = 0
         self.tiles_drawn = 0
 
@@ -396,8 +448,9 @@ class TileProvider(QObject):
     def set_source(self, source: MapSource, base_dir: str = ".") -> None:
         self.source = source
         self._cache.clear()
-        self._pending.clear()
+        self.abort_pending()
         self._failed.clear()
+        self._consecutive_failures = 0
         self._queue.clear()
         self._mbtiles_paths = []
         if source.type == "mbtiles":
@@ -413,6 +466,44 @@ class TileProvider(QObject):
     def offline_ready(self) -> bool:
         return bool(self._mbtiles_paths)
 
+    @property
+    def is_offline(self) -> bool:
+        """True when this source has failed enough to stop asking it.
+
+        A source that cannot be reached must say so once, not retry forever:
+        at the launch site there is no network, and a map that spends every
+        repaint starting requests that will time out is both useless and the
+        thing making the application slow.
+        """
+        return (self.source is not None and self.source.type != "mbtiles"
+                and self._consecutive_failures >= OFFLINE_AFTER_FAILURES)
+
+    def retry_source(self) -> None:
+        """Forget the offline verdict and the negative cache, and try again."""
+        self._failed.clear()
+        self._consecutive_failures = 0
+
+    def abort_pending(self, keep: Optional[set] = None) -> None:
+        """Abort in-flight requests, except those for tiles in *keep*.
+
+        Panning away from a tile makes its request worthless; finishing it
+        holds one of the few in-flight slots that the tiles now on screen
+        need.
+        """
+        for key, reply in list(self._pending.items()):
+            if keep is not None and key in keep:
+                continue
+            self._pending.pop(key, None)
+            if reply is not None:
+                try:
+                    reply.abort()
+                except RuntimeError:
+                    pass
+        if keep is None:
+            self._queue.clear()
+        else:
+            self._queue = [k for k in self._queue if k in keep]
+
     # -- lookup ------------------------------------------------------------
 
     def get(self, z: int, x: int, y: int) -> Optional[QImage]:
@@ -427,14 +518,21 @@ class TileProvider(QObject):
         if image is not None:
             self._cache.move_to_end(key)
             return image
-        if key in self._pending or key in self._failed:
+        if key in self._pending:
+            return None
+        expiry = self._failed.get(key)
+        if expiry is not None:
+            if time.monotonic() < expiry:
+                return None
+            del self._failed[key]            # the window has passed; retry
+        if self.is_offline:
             return None
         self._request(key)
         return None
 
     def _request(self, key) -> None:
         source = self.source
-        self._pending.add(key)
+        self._pending[key] = None
         if source.type == "mbtiles":
             job = _MbtilesJob(key, self._mbtiles_paths)
             job.signals.done.connect(self._on_mbtiles)
@@ -443,13 +541,22 @@ class TileProvider(QObject):
         if source.needs_key:
             # No key in the environment: fail quietly rather than send a
             # request that will be rejected, and let the grey tile say so.
-            self._pending.discard(key)
-            self._failed.add(key)
+            self._pending.pop(key, None)
+            self._mark_failed(key)
             return
         if self._inflight >= MAX_INFLIGHT:
-            self._queue.append(key)
+            if key not in self._queue:
+                self._queue.append(key)
             return
         self._send(key)
+
+    def _mark_failed(self, key) -> None:
+        self._failed[key] = time.monotonic() + NEGATIVE_CACHE_S
+        # Keep the negative cache from becoming its own leak over a long
+        # session of panning: drop whatever has already expired.
+        if len(self._failed) > 4096:
+            now = time.monotonic()
+            self._failed = {k: v for k, v in self._failed.items() if v > now}
 
     def _send(self, key) -> None:
         url = self._tile_url(key)
@@ -461,8 +568,14 @@ class TileProvider(QObject):
         request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))
         request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)
         request.setAttribute(QNetworkRequest.User, key)
+        try:
+            # Qt 5.15; on older builds the attribute is absent and the OS
+            # default applies, which is only slower, not wrong.
+            request.setTransferTimeout(TILE_TIMEOUT_MS)
+        except AttributeError:
+            pass
         self._inflight += 1
-        self._net.get(request)
+        self._pending[key] = self._net.get(request)
 
     def _tile_url(self, key) -> str:
         source = self.source
@@ -495,7 +608,7 @@ class TileProvider(QObject):
     # -- completion --------------------------------------------------------
 
     def _on_mbtiles(self, key, data) -> None:
-        self._pending.discard(key)
+        self._pending.pop(key, None)
         self._store(key, data)
 
     def _on_reply(self, reply) -> None:
@@ -522,23 +635,28 @@ class TileProvider(QObject):
         finally:
             reply.deleteLater()
         if key is not None:
-            self._pending.discard(key)
+            self._pending.pop(key, None)
             self._store(key, data)
         while self._queue and self._inflight < MAX_INFLIGHT:
             self._send(self._queue.pop(0))
 
     def _store(self, key, data) -> None:
         if not data:
-            self._failed.add(key)
+            self._mark_failed(key)
+            self._consecutive_failures += 1
+            self.generation += 1
             self.tile_ready.emit()
             return
         image = QImage()
         if not image.loadFromData(data):
-            self._failed.add(key)
+            self._mark_failed(key)
+            self._consecutive_failures += 1
             self.tile_ready.emit()
             return
+        self._consecutive_failures = 0
         self._cache[key] = image
         self._cache.move_to_end(key)
+        self.generation += 1
         while len(self._cache) > TILE_CACHE_MAX:
             self._cache.popitem(last=False)
         self.tile_ready.emit()
@@ -546,8 +664,10 @@ class TileProvider(QObject):
     def clear_failures(self) -> None:
         """Let previously missing tiles be retried (e.g. network returned)."""
         self._failed.clear()
+        self._consecutive_failures = 0
 
     def shutdown(self) -> None:
+        self.abort_pending()
         self._queue.clear()
         try:
             self._pool.clear()
@@ -559,6 +679,44 @@ class TileProvider(QObject):
 # ---------------------------------------------------------------------------
 # Canvas
 # ---------------------------------------------------------------------------
+
+class _TrackProjection:
+    """World-pixel coordinates for one track at one zoom, grown in place.
+
+    Projecting is the expensive part and the result only changes when the
+    zoom changes or new fixes arrive, neither of which happens on most
+    repaints. Panning does not invalidate it: world pixels are absolute, so
+    a pan is a subtraction at draw time.
+    """
+
+    __slots__ = ("zoom", "revision", "wx", "wy")
+
+    def __init__(self, zoom: int) -> None:
+        self.zoom = zoom
+        self.revision = -1
+        self.wx = np.empty(0, dtype=np.float64)
+        self.wy = np.empty(0, dtype=np.float64)
+
+    def update(self, track: Track) -> None:
+        """Project whatever is new. Existing points are never redone."""
+        n = len(track)
+        have = self.wx.shape[0]
+        if self.revision == track.revision and have == n:
+            return
+        if n < have:
+            # The track was thinned or cleared: the old projection no longer
+            # corresponds to anything, so redo it.
+            have = 0
+        if have == 0:
+            self.wx, self.wy = lonlat_to_world_array(track.lons, track.lats,
+                                                     self.zoom)
+        elif n > have:
+            new_x, new_y = lonlat_to_world_array(
+                track.lons[have:], track.lats[have:], self.zoom)
+            self.wx = np.concatenate((self.wx, new_x))
+            self.wy = np.concatenate((self.wy, new_y))
+        self.revision = track.revision
+
 
 class MapCanvas(QWidget):
     """The map itself: tiles, tracks, vehicles, scale bar, attribution."""
@@ -585,6 +743,14 @@ class MapCanvas(QWidget):
         self._drag_origin: Optional[QPoint] = None
         self._drag_center: Tuple[float, float] = (0.0, 0.0)
 
+        #: vehicle -> projected world pixels at the current zoom.
+        self._projections: Dict[str, _TrackProjection] = {}
+        #: vehicle -> (cache key, QPolygonF) for the thinned, clipped line.
+        self._polylines: Dict[str, Tuple[Any, QPolygonF]] = {}
+        #: Last paint's view, so an unchanged view can skip the work.
+        self._last_view: Any = None
+        self.last_paint_ms = 0.0
+
         # Redraw coalescing: intake sets a flag, the timer repaints.
         self._dirty = False
         self._timer = QTimer(self)
@@ -598,20 +764,47 @@ class MapCanvas(QWidget):
         """Mark the view stale. O(1); the timer does the actual painting."""
         self._dirty = True
 
+    def _view_key(self) -> Tuple:
+        """Everything a frame depends on, cheaply comparable.
+
+        The vehicle labels count seconds, so the age is part of the key --
+        at whole-second resolution, which is all the label shows. Without
+        that the map would repaint five times a second to redraw an
+        identical frame.
+        """
+        revisions = tuple(sorted((v, t.revision)
+                                 for v, t in self.store.tracks.items()))
+        last_epoch = 0.0
+        for track in self.store.tracks.values():
+            if len(track):
+                last_epoch = max(last_epoch, float(track.epoch[len(track) - 1]))
+        age_s = int(time.time() - last_epoch) if last_epoch else 0
+        source = self.provider.source
+        return (round(self.center_lat, 9), round(self.center_lon, 9),
+                self.zoom, self.width(), self.height(), revisions, age_s,
+                self.ground_station, source.name if source else None,
+                self.provider.is_offline, self.provider.generation)
+
     def _tick(self) -> None:
         if self.follow:
             track = self.store.get(self.follow)
-            if track and track.last:
-                self.center_lat, self.center_lon = track.last.lat, track.last.lon
-                self._dirty = True
-        # A stale label counts up in seconds, so repaint while anything is
-        # on screen even if no packet arrived.
-        if self._dirty or self.store.total_points:
+            if track and len(track):
+                last = track.last
+                self.center_lat, self.center_lon = last.lat, last.lon
+        key = self._view_key()
+        if self._dirty or key != self._last_view:
             self._dirty = False
+            self._last_view = key
             self.update()
 
     def set_source(self, source: MapSource, base_dir: str = ".") -> None:
         self.provider.set_source(source, base_dir)
+        self.request_redraw()
+
+    def invalidate_tracks(self) -> None:
+        """Drop the projection and polyline caches (the store was cleared)."""
+        self._projections.clear()
+        self._polylines.clear()
         self.request_redraw()
 
     def set_zoom(self, zoom: int, anchor: Optional[QPoint] = None) -> None:
@@ -719,6 +912,7 @@ class MapCanvas(QWidget):
 
     def paintEvent(self, event) -> None:          # noqa: N802
         painter = QPainter()
+        started = time.perf_counter()
         try:
             painter.begin(self)
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -739,6 +933,7 @@ class MapCanvas(QWidget):
         finally:
             if painter.isActive():
                 painter.end()
+            self.last_paint_ms = (time.perf_counter() - started) * 1000.0
 
     def _draw_tiles(self, painter: QPainter) -> None:
         ox, oy = self._origin()
@@ -750,6 +945,17 @@ class MapCanvas(QWidget):
         font = QFont()
         font.setPointSize(8)
         painter.setFont(font)
+
+        wanted = set()
+        source_name = self.provider.source.name if self.provider.source else ""
+        for row in range(rows):
+            for col in range(cols):
+                tx, ty = first_x + col, first_y + row
+                if 0 <= ty < span:
+                    wanted.add((source_name, self.zoom, tx % span, ty))
+        # Anything still in flight that is no longer on screen is wasted
+        # work holding one of the few request slots.
+        self.provider.abort_pending(keep=wanted)
 
         for row in range(rows):
             for col in range(cols):
@@ -775,24 +981,90 @@ class MapCanvas(QWidget):
                     painter.drawText(rect, Qt.AlignCenter,
                                      "no tile\nz%d" % self.zoom)
 
+    def _polyline_for(self, track: Track) -> Optional[QPolygonF]:
+        """The track as screen-space points: projected, clipped, thinned.
+
+        Three steps, all vectorised and all cached:
+
+        1. project to world pixels once per zoom, appending only new fixes
+           (:class:`_TrackProjection`);
+        2. keep only what is inside the view, padded by a margin so the line
+           still enters and leaves the edge correctly;
+        3. drop points closer together than :data:`MIN_POINT_SPACING_PX`,
+           since they land on the same stroke.
+
+        After this the number of points handed to Qt depends on the size of
+        the window, not on the length of the flight.
+        """
+        projection = self._projections.get(track.vehicle)
+        if projection is None or projection.zoom != self.zoom:
+            projection = _TrackProjection(self.zoom)
+            self._projections[track.vehicle] = projection
+        projection.update(track)
+        if projection.wx.shape[0] < 2:
+            return None
+
+        ox, oy = self._origin()
+        cache_key = (self.zoom, round(ox, 1), round(oy, 1), self.width(),
+                     self.height(), track.revision)
+        cached = self._polylines.get(track.vehicle)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        sx = projection.wx - ox
+        sy = projection.wy - oy
+
+        # Clip, with a margin so a segment crossing the edge is still drawn.
+        margin = 256.0
+        visible = ((sx >= -margin) & (sx <= self.width() + margin)
+                   & (sy >= -margin) & (sy <= self.height() + margin))
+        if not visible.any():
+            polygon = QPolygonF()
+            self._polylines[track.vehicle] = (cache_key, polygon)
+            return polygon
+        # Widen the kept run by one on each side so the line enters and
+        # leaves the edge rather than stopping short of it.
+        indices = np.flatnonzero(visible)
+        lo = max(0, int(indices[0]) - 1)
+        hi = min(sx.shape[0], int(indices[-1]) + 2)
+        sx = sx[lo:hi]
+        sy = sy[lo:hi]
+
+        if sx.shape[0] > 2:
+            # Thin by pixel distance from the last KEPT point. cumsum on the
+            # step distances is an approximation of that and is one pass;
+            # exactness is not needed to decide which sub-pixel points to
+            # drop.
+            step = np.hypot(np.diff(sx), np.diff(sy))
+            travelled = np.concatenate(([0.0], np.cumsum(step)))
+            buckets = np.floor(travelled / MIN_POINT_SPACING_PX)
+            keep = np.concatenate(([True], np.diff(buckets) > 0))
+            keep[-1] = True                     # never drop the live end
+            sx = sx[keep]
+            sy = sy[keep]
+            if sx.shape[0] > MAX_DRAWN_POINTS:
+                stride = int(np.ceil(sx.shape[0] / MAX_DRAWN_POINTS))
+                sx = np.concatenate((sx[::stride], sx[-1:]))
+                sy = np.concatenate((sy[::stride], sy[-1:]))
+
+        polygon = QPolygonF([QPointF(float(x), float(y))
+                             for x, y in zip(sx, sy)])
+        self._polylines[track.vehicle] = (cache_key, polygon)
+        return polygon
+
     def _draw_tracks(self, painter: QPainter) -> None:
         for track in self.store.non_empty():
+            polygon = self._polyline_for(track)
+            if polygon is None or polygon.size() < 2:
+                continue
             colour = QColor(VEHICLE_COLOURS.get(track.vehicle,
                                                 VEHICLE_COLOURS["GENERIC"]))
-            points = decimate(track.points, MAX_DRAWN_POINTS)
-            if len(points) < 2:
-                continue
-            path = QPainterPath()
-            first = self._lonlat_to_pixel(points[0].lon, points[0].lat)
-            path.moveTo(first)
-            for point in points[1:]:
-                path.lineTo(self._lonlat_to_pixel(point.lon, point.lat))
             pen = QPen(colour, 2.6)
             pen.setJoinStyle(Qt.RoundJoin)
             pen.setCapStyle(Qt.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawPath(path)
+            painter.drawPolyline(polygon)
 
     def _draw_ground_station(self, painter: QPainter) -> None:
         if self.ground_station is None:
@@ -891,6 +1163,11 @@ class MapCanvas(QWidget):
             text = "No .mbtiles file in %s" % MAPS_DIR
         if source and source.needs_key:
             text = "%s — set %s to use this source" % (text, source.key_env)
+        if self.provider.is_offline:
+            # Say it once, plainly, instead of retrying a dead server for
+            # the rest of the flight.
+            text = "OFFLINE — %s is not reachable" % (source.name if source
+                                                      else "this source")
         if not text:
             return
         font = QFont()
@@ -1034,7 +1311,7 @@ class MapWindow(QDialog):
 
     def _on_clear(self) -> None:
         self.canvas.store.clear()
-        self.canvas.request_redraw()
+        self.canvas.invalidate_tracks()
         self.log_message.emit("Map tracks cleared (logs and CSV untouched).")
 
     # -- ground station ----------------------------------------------------
@@ -1098,6 +1375,8 @@ class MapWindow(QDialog):
         source = self.canvas.provider.source
         if source and source.type == "mbtiles" and not self.canvas.provider.offline_ready:
             bits.append("no offline pack in %s" % MAPS_DIR)
+        if self.canvas.provider.is_offline:
+            bits.append("OFFLINE (source unreachable)")
         if self.canvas.provider.network_errors:
             bits.append("%d tile errors" % self.canvas.provider.network_errors)
         if self.canvas.paint_errors:

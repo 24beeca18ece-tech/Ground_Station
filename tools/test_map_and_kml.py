@@ -248,7 +248,7 @@ def test_shipped_example_sources_file_parses_and_has_no_google():
 def test_unusable_fixes_are_rejected(packet, reason):
     assert is_usable_fix(packet) is False, reason
     store = TrackStore()
-    assert store.add_packet(packet) is None
+    assert store.add_packet(packet) is False
     assert store.total_points == 0
 
 
@@ -345,7 +345,7 @@ def make_track(vehicle="CANSAT", n=5, with_alt=True, start_epoch=1_700_000_000.0
                    packet_count=i + 1, sats=11, fsm_state="ASCENT",
                    has_alt=with_alt)
         for i in range(n)]
-    return Track(vehicle=vehicle, points=points)
+    return Track.from_points(vehicle, points)
 
 
 def test_kml_parses_as_xml():
@@ -354,9 +354,13 @@ def test_kml_parses_as_xml():
 
 
 def test_kml_coordinate_order_is_lon_lat_alt():
-    track = make_track(n=1)
-    track.points[0].lat, track.points[0].lon = 11.5, 77.25
-    track.points[0].alt_m = 123.0
+    # Three different numbers, so a transposition cannot pass by luck.
+    # (A Track stores columns; .points builds values on demand, so the
+    # coordinates have to be given at construction, not patched after.)
+    point = TrackPoint(lat=11.5, lon=77.25, alt_m=123.0, epoch=1_700_000_000.0,
+                       mission_time_s=0.0, packet_count=1, sats=11,
+                       fsm_state="ASCENT", has_alt=True)
+    track = Track.from_points("CANSAT", [point])
     root = ET.fromstring(build_kml([track], {"team_id": "T"}))
     line = root.find(".//k:LineString/k:coordinates", KML_NS).text.strip()
     lon, lat, alt = (float(v) for v in line.split(","))

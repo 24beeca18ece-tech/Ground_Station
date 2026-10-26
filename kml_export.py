@@ -250,6 +250,8 @@ def build_kml(tracks: Sequence[Track], options: Optional[Dict[str, Any]] = None)
     total = sum(len(t.points) for t in usable)
     jumps = sum(t.jumps_dropped for t in tracks)
     dupes = sum(t.duplicates_dropped for t in tracks)
+    stationary = sum(getattr(t, "stationary_dropped", 0) for t in tracks)
+    thinned = sum(getattr(t, "thinned", 0) for t in tracks)
     no_alt = [t.vehicle for t in usable if not t.has_altitude]
 
     lines = [
@@ -266,6 +268,16 @@ def build_kml(tracks: Sequence[Track], options: Optional[Dict[str, Any]] = None)
         % (jumps, float(options.get("jump_m", DEFAULT_JUMP_M)),
            float(options.get("jump_window_s", DEFAULT_JUMP_WINDOW_S)), dupes),
     ]
+    if stationary:
+        lines.append(
+            "%d fixes were not stored because the vehicle had not moved more "
+            "than 1 m for over a minute; one fix every 10 s was kept while it "
+            "was stationary." % stationary)
+    if thinned:
+        lines.append(
+            "%d older fixes were thinned 2:1 after the track reached the "
+            "300,000-point cap. The most recent half is at full resolution."
+            % thinned)
     if no_alt:
         lines.append(
             "No GNSS altitude was transmitted for: %s. Those paths are "

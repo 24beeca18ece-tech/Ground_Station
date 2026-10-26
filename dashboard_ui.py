@@ -3282,7 +3282,7 @@ class Dashboard(QMainWindow):
             # A new Flight_*.csv is a new session: the map's tracks belong to
             # the run being recorded, not to whatever was on screen before.
             self.track_store.clear()
-            self.map_window.canvas.request_redraw()
+            self.map_window.canvas.invalidate_tracks()
             self.log_path_label.setText("CSV: waiting for first packet (TEAM_ID)…")
             self.log_path_label.setToolTip("")
             self.append_event(
@@ -3302,7 +3302,7 @@ class Dashboard(QMainWindow):
         """
         self.clear_session()
         self.track_store.clear()
-        self.map_window.canvas.request_redraw()
+        self.map_window.canvas.invalidate_tracks()
         self.latest = None
         self._last_fsm = None
 
