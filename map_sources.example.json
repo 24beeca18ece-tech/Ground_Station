@@ -1,0 +1,102 @@
+{
+  "_comment": [
+    "Copy this file to map_sources.json to change the map's tile sources.",
+    "map_sources.json is gitignored: it may name an environment variable",
+    "holding an API key, and it may contain local file paths. A missing or",
+    "unreadable file is not an error -- the map falls back to the built-in",
+    "list in map_window.py and writes one line to the event log.",
+    "",
+    "Fields: name, type (mbtiles | xyz | wms), url or path, attribution,",
+    "min_zoom, max_zoom, optional key_env (NAME of an environment variable",
+    "holding the key -- never the key itself), optional key_param (the query",
+    "parameter the provider expects it in, default 'key'), and bulk_download",
+    "(true only where the provider's terms permit tools/fetch_tiles.py to",
+    "download a tile pack).",
+    "",
+    "NO GOOGLE MAPS OR GOOGLE TILE SERVERS. Google Earth is only the viewer",
+    "for the exported KML."
+  ],
+
+  "sources": [
+    {
+      "name": "Offline (MBTiles)",
+      "type": "mbtiles",
+      "path": "assets/maps",
+      "attribution": "Offline tile pack",
+      "min_zoom": 0,
+      "max_zoom": 19,
+      "_note": [
+        "Reads every .mbtiles file in this directory, newest match wins.",
+        "This is the default whenever a pack exists, because the launch site",
+        "has no internet. Build one with tools/fetch_tiles.py, QGIS or Mobile",
+        "Atlas Creator -- see the README."
+      ]
+    },
+
+    {
+      "name": "ISRO Bhuvan (admin basemap)",
+      "type": "wms",
+      "url": "https://bhuvan-vec1.nrsc.gov.in/bhuvan/wms",
+      "layers": "basemap:admin_group_ntl",
+      "attribution": "© ISRO / NRSC Bhuvan",
+      "min_zoom": 4,
+      "max_zoom": 16,
+      "bulk_download": false,
+      "_note": [
+        "VERIFIED from this machine on 2026-10-26: this endpoint answers",
+        "anonymously (no token, no registration) and returns real 256 px",
+        "EPSG:3857 PNG tiles for several basemap:* layers.",
+        "",
+        "It is a VECTOR server: this layer draws administrative boundaries,",
+        "not satellite imagery. The documented 'Bhuvan_satellite' layer does",
+        "NOT exist on it, and the imagery hosts were unreachable from here",
+        "(bhuvan-ras2 -> HTTP 404, bhuvan-vec2 -> read timeout). See the",
+        "README for what was and was not confirmed.",
+        "",
+        "Other layers that answered with real tiles, if you want to try them:",
+        "  basemap:inida_state_ql_new   (state outlines; spelling is theirs)",
+        "  basemap:waterbody_DEM        (water bodies)",
+        "  cadastral:cad_india"
+      ]
+    },
+
+    {
+      "name": "OpenStreetMap",
+      "type": "xyz",
+      "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      "attribution": "© OpenStreetMap contributors",
+      "min_zoom": 1,
+      "max_zoom": 19,
+      "bulk_download": false,
+      "_note": [
+        "Light interactive use only. The OSMF Tile Usage Policy forbids bulk",
+        "downloading, so tools/fetch_tiles.py refuses this source and says",
+        "why. The application sends a User-Agent naming itself, as the policy",
+        "requires. For an offline pack, use a provider whose terms allow it,",
+        "or render your own from an OSM extract."
+      ]
+    }
+
+  ],
+
+  "_disabled_examples": [
+    {
+      "_why_disabled": [
+        "MapmyIndia / Mappls needs an API key from them and their terms have",
+        "NOT been checked for this project. Enable it only after reading",
+        "those terms yourself. The key is read from the environment variable",
+        "named in key_env and is never stored in this file or in the repo.",
+        "Move this entry up into 'sources' and set MAPPLS_API_KEY to use it."
+      ],
+      "name": "Mappls (MapmyIndia)",
+      "type": "xyz",
+      "url": "https://apis.mappls.com/advancedmaps/v1/{key}/still_map/{z}/{x}/{y}.png",
+      "attribution": "© MapmyIndia / Mappls",
+      "min_zoom": 1,
+      "max_zoom": 18,
+      "key_env": "MAPPLS_API_KEY",
+      "key_param": "key",
+      "bulk_download": false
+    }
+  ]
+}

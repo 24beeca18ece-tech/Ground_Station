@@ -1,0 +1,2 @@
+# Offline tile packs are large binaries built locally, not source.
+# Build one with tools/fetch_tiles.py, QGIS or Mobile Atlas Creator.

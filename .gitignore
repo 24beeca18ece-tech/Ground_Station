@@ -68,6 +68,24 @@ logs/*.tmp
 !assets/
 !assets/**
 
+# --- Map configuration and offline tile packs --------------------------------
+# NOTE ON ORDER: these rules must stay BELOW the "!assets/**" negation above,
+# or that negation would re-include the tile packs. Git applies the last
+# matching pattern, so a later rule is what makes these stick.
+#
+# map_sources.json may name an environment variable holding an API key and may
+# carry machine-specific file paths, so the working copy is local. The tracked
+# template is map_sources.example.json; copy it to start.
+map_sources.json
+# The ground station's own coordinates: a physical location, and operator
+# preference rather than source.
+map_settings.json
+# Offline tile packs: tens to hundreds of MB of provider imagery built
+# locally, and in most cases not ours to redistribute. The directory itself
+# stays tracked via assets/maps/.gitkeep so the app has somewhere to look.
+assets/maps/*.mbtiles
+*.mbtiles
+
 # --- Editor / IDE ------------------------------------------------------------
 .vscode/
 .idea/
