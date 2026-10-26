@@ -62,9 +62,12 @@ from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
 from PyQt5.QtNetwork import (QNetworkAccessManager, QNetworkDiskCache,
                              QNetworkRequest)
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                             QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
-                             QWidget)
+                             QHBoxLayout, QLabel, QPushButton, QSlider,
+                             QVBoxLayout, QWidget)
 
+from map_basemap import (ImageOverlay, VectorPack, draw_graticule,
+                          draw_north_arrow, draw_range_rings,
+                          load_image_overlay, load_vector_pack)
 from track_store import (TrackStore, Track, TrackPoint, bearing_deg,
                          haversine_m)
 
@@ -320,6 +323,61 @@ def load_sources(base_dir: str = ".") -> Tuple[List[MapSource], str]:
     if not sources:
         sources = [MapSource(**{k: v for k, v in BUILTIN_SOURCES[0].items()})]
     return sources, note
+
+
+@dataclass
+class MapPack:
+    """One thing the map can draw underneath the tracks.
+
+    Four kinds, all offline: the always-available grid, an MBTiles tile
+    pack, an OSM vector pack this application renders itself, and a
+    georeferenced image the operator supplies.
+    """
+
+    name: str
+    kind: str                 # "grid" | "mbtiles" | "vector" | "image"
+    path: str = ""
+    attribution: str = ""
+    error: str = ""
+
+
+#: Always present, always works, needs nothing.
+GRID_PACK = MapPack(name="Grid only (no map data)", kind="grid",
+                    attribution="Lat/lon grid — no map pack loaded, see README")
+
+
+def find_packs(base_dir: str = ".") -> List[MapPack]:
+    """Every pack in assets/maps/, plus the grid. Never raises.
+
+    The grid is always first so there is something that works even if the
+    directory is missing, unreadable or full of rubbish.
+    """
+    packs = [GRID_PACK]
+    directory = os.path.join(base_dir, MAPS_DIR)
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return packs
+    for entry in names:
+        path = os.path.join(directory, entry)
+        lower = entry.lower()
+        if lower.endswith(".mbtiles"):
+            packs.append(MapPack(name="%s (tiles)" % entry, kind="mbtiles",
+                                 path=path, attribution="Offline tile pack"))
+        elif lower.endswith(".osmpack.json"):
+            packs.append(MapPack(
+                name="%s (vector)" % entry[:-len(".osmpack.json")],
+                kind="vector", path=path,
+                attribution="© OpenStreetMap contributors, ODbL"))
+        elif lower.endswith(".json"):
+            # A sidecar for an image overlay, if the image is beside it.
+            base = os.path.splitext(path)[0]
+            if any(os.path.isfile(base + ext)
+                   for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG")):
+                packs.append(MapPack(name="%s (image)" % entry[:-5],
+                                     kind="image", path=path,
+                                     attribution="Operator-supplied image"))
+    return packs
 
 
 def find_mbtiles(directory: str) -> List[str]:
@@ -680,6 +738,47 @@ class TileProvider(QObject):
 # Canvas
 # ---------------------------------------------------------------------------
 
+class _ImageSignals(QObject):
+    done = pyqtSignal(str, object, str)
+
+
+class _ImageLoadJob(QRunnable):
+    """Decodes a georeferenced image, and shrinks it if it is huge.
+
+    A 10,000 x 10,000 px export is 400 MB as ARGB and would stall the GUI
+    thread for seconds if decoded there. Nothing on screen can show more
+    than a few thousand pixels across, so it is scaled down once, here.
+    """
+
+    #: Longest edge kept. Above this the image is scaled down on load.
+    MAX_EDGE = 4096
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = _ImageSignals()
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        image, error = None, ""
+        try:
+            loaded = QImage(self.path)
+            if loaded.isNull():
+                error = "could not decode %s" % os.path.basename(self.path)
+            else:
+                if max(loaded.width(), loaded.height()) > self.MAX_EDGE:
+                    loaded = loaded.scaled(
+                        self.MAX_EDGE, self.MAX_EDGE, Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation)
+                image = loaded
+        except Exception as exc:                          # noqa: BLE001
+            error = "%s: %s" % (type(exc).__name__, exc)
+        try:
+            self.signals.done.emit(self.path, image, error)
+        except RuntimeError:
+            pass
+
+
 class _TrackProjection:
     """World-pixel coordinates for one track at one zoom, grown in place.
 
@@ -743,6 +842,14 @@ class MapCanvas(QWidget):
         self._drag_origin: Optional[QPoint] = None
         self._drag_center: Tuple[float, float] = (0.0, 0.0)
 
+        #: The base layer under the tracks. None means the grid, which is
+        #: the default and needs nothing: no file, no server, no network.
+        self.pack: MapPack = GRID_PACK
+        self.vector_pack: Optional[VectorPack] = None
+        self.overlay: Optional[ImageOverlay] = None
+        self.overlay_opacity = 1.0
+        self.show_rings = True
+
         #: vehicle -> projected world pixels at the current zoom.
         self._projections: Dict[str, _TrackProjection] = {}
         #: vehicle -> (cache key, QPolygonF) for the thinned, clipped line.
@@ -757,6 +864,11 @@ class MapCanvas(QWidget):
         self._timer.setInterval(int(1000 / REDRAW_HZ))
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+
+        # One worker for image decoding, separate from the tile pool so a
+        # slow image cannot starve the tiles.
+        self._pool_image = QThreadPool(self)
+        self._pool_image.setMaxThreadCount(1)
 
     # -- state -------------------------------------------------------------
 
@@ -799,6 +911,66 @@ class MapCanvas(QWidget):
 
     def set_source(self, source: MapSource, base_dir: str = ".") -> None:
         self.provider.set_source(source, base_dir)
+        self.request_redraw()
+
+    def set_pack(self, pack: MapPack, base_dir: str = ".") -> str:
+        """Switch the base layer. Returns "" or a message for the event log.
+
+        A pack that will not load falls back to the grid rather than
+        raising: an unreadable file must not be able to take the map away
+        from an operator who is watching a flight.
+        """
+        self.pack = pack
+        self.vector_pack = None
+        self.overlay = None
+        note = ""
+        if pack.kind == "mbtiles":
+            source = MapSource(name=pack.name, type="mbtiles", path=pack.path,
+                               attribution=pack.attribution,
+                               min_zoom=0, max_zoom=19)
+            self.provider.set_source(source, base_dir)
+            if not self.provider.offline_ready:
+                note = ("Map pack %r could not be opened; showing the grid."
+                        % pack.name)
+                self.pack = GRID_PACK
+        elif pack.kind == "vector":
+            self.vector_pack = load_vector_pack(pack.path)
+            self.provider.set_source(
+                MapSource(name="none", type="mbtiles", path=""), base_dir)
+            if self.vector_pack is None:
+                note = ("Map pack %r is not a readable vector pack; showing "
+                        "the grid." % pack.name)
+                self.pack = GRID_PACK
+        elif pack.kind == "image":
+            self.overlay = load_image_overlay(pack.path)
+            self.provider.set_source(
+                MapSource(name="none", type="mbtiles", path=""), base_dir)
+            if self.overlay is None:
+                note = ("Map pack %r has no readable image or bounds; "
+                        "showing the grid." % pack.name)
+                self.pack = GRID_PACK
+            else:
+                self._start_overlay_load()
+        else:
+            self.provider.set_source(
+                MapSource(name="none", type="mbtiles", path=""), base_dir)
+        self.request_redraw()
+        return note
+
+    def _start_overlay_load(self) -> None:
+        """Decode the image off the GUI thread; it may be very large."""
+        overlay = self.overlay
+        if overlay is None:
+            return
+        job = _ImageLoadJob(overlay.path)
+        job.signals.done.connect(self._on_overlay_loaded)
+        self._pool_image.start(job)
+
+    def _on_overlay_loaded(self, path: str, image, error: str) -> None:
+        if self.overlay is None or self.overlay.path != path:
+            return                      # the operator changed pack meanwhile
+        self.overlay.image = image
+        self.overlay.error = error
         self.request_redraw()
 
     def invalidate_tracks(self) -> None:
@@ -917,7 +1089,7 @@ class MapCanvas(QWidget):
             painter.begin(self)
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.fillRect(self.rect(), QColor(COL_BG))
-            self._draw_tiles(painter)
+            self._draw_base(painter)
             self._draw_tracks(painter)
             self._draw_ground_station(painter)
             self._draw_vehicles(painter)
@@ -934,6 +1106,43 @@ class MapCanvas(QWidget):
             if painter.isActive():
                 painter.end()
             self.last_paint_ms = (time.perf_counter() - started) * 1000.0
+
+    def _draw_base(self, painter: QPainter) -> None:
+        """The layer under the tracks, whichever kind of pack is selected.
+
+        The grid is drawn under every kind, so an image or vector pack that
+        does not cover the whole view still has a readable background with
+        coordinates rather than a blank one.
+        """
+        self._draw_grid(painter)
+        if self.pack.kind == "mbtiles":
+            self._draw_tiles(painter)
+        elif self.pack.kind == "vector" and self.vector_pack is not None:
+            try:
+                self.vector_pack.draw(
+                    painter, self.zoom, self._origin(), self.width(),
+                    self.height(), lonlat_to_world_array)
+            except Exception:                              # noqa: BLE001
+                # A malformed pack must cost the frame, not the window.
+                self.vector_pack = None
+        elif self.pack.kind == "image" and self.overlay is not None:
+            self.overlay.draw(painter, self._lonlat_to_pixel,
+                              self.overlay_opacity)
+
+    def _draw_grid(self, painter: QPainter) -> None:
+        """Graticule, north arrow and range rings: always available."""
+        top_left = self._pixel_to_lonlat(QPoint(0, 0))
+        bottom_right = self._pixel_to_lonlat(QPoint(self.width(), self.height()))
+        draw_graticule(painter, self.width(), self.height(),
+                       (top_left[0], top_left[1]),
+                       (bottom_right[0], bottom_right[1]),
+                       lambda lon, lat: self._lonlat_to_pixel(lon, lat))
+        draw_north_arrow(painter, self.width(), self.height())
+        if self.ground_station is not None and self.show_rings:
+            lat, lon = self.ground_station
+            draw_range_rings(painter, lat, lon,
+                             lambda a, b: self._lonlat_to_pixel(a, b),
+                             metres_per_pixel(self.center_lat, self.zoom))
 
     def _draw_tiles(self, painter: QPainter) -> None:
         ox, oy = self._origin()
@@ -974,8 +1183,9 @@ class MapCanvas(QWidget):
                 else:
                     # A visible hole, not a plausible-looking blank: the
                     # operator must be able to tell "no map here" from
-                    # "nothing is there".
-                    painter.fillRect(rect, QColor(COL_MISSING))
+                    # "nothing is there". Semi-transparent so the grid
+                    # underneath still gives coordinates.
+                    painter.fillRect(rect, QColor(198, 206, 217, 210))
                     painter.setPen(QColor(COL_DIM))
                     painter.drawRect(rect.adjusted(0, 0, -1, -1))
                     painter.drawText(rect, Qt.AlignCenter,
@@ -1158,9 +1368,14 @@ class MapCanvas(QWidget):
 
     def _draw_attribution(self, painter: QPainter) -> None:
         source = self.provider.source
-        text = source.attribution if source else ""
-        if source and source.type == "mbtiles" and not self.provider.offline_ready:
-            text = "No .mbtiles file in %s" % MAPS_DIR
+        text = self.pack.attribution or (source.attribution if source else "")
+        if self.vector_pack is not None:
+            text = self.vector_pack.attribution
+        elif self.overlay is not None:
+            text = ("%s — you are responsible for this image's licence"
+                    % self.overlay.attribution)
+        elif self.pack.kind == "mbtiles" and not self.provider.offline_ready:
+            text = "Map pack could not be opened — showing the grid"
         if source and source.needs_key:
             text = "%s — set %s to use this source" % (text, source.key_env)
         if self.provider.is_offline:
@@ -1218,12 +1433,17 @@ class MapWindow(QDialog):
         bar = QHBoxLayout()
         bar.setSpacing(6)
 
-        bar.addWidget(QLabel("Source:"))
-        self.source_combo = QComboBox()
-        for source in self.sources:
-            self.source_combo.addItem(source.name)
-        self.source_combo.currentIndexChanged.connect(self._on_source)
-        bar.addWidget(self.source_combo)
+        bar.addWidget(QLabel("Map pack:"))
+        self.pack_combo = QComboBox()
+        self.pack_combo.setToolTip(
+            "Everything found in %s, plus the grid.\n\n"
+            "Grid only needs nothing and always works: a lat/lon graticule, "
+            "scale bar, north arrow and range rings.\n"
+            "Tiles (.mbtiles), vector (.osmpack.json) and image overlays "
+            "are all offline. Online sources are listed last and are the "
+            "only ones that touch the network." % MAPS_DIR)
+        self.pack_combo.currentIndexChanged.connect(self._on_pack)
+        bar.addWidget(self.pack_combo)
 
         bar.addWidget(QLabel("Follow:"))
         self.follow_combo = QComboBox()
@@ -1234,6 +1454,17 @@ class MapWindow(QDialog):
         self.fit_btn = QPushButton("FIT ALL")
         self.fit_btn.clicked.connect(self.canvas.fit_all)
         bar.addWidget(self.fit_btn)
+
+        self.opacity_label = QLabel("Opacity:")
+        self.opacity = QSlider(Qt.Horizontal)
+        self.opacity.setRange(10, 100)
+        self.opacity.setValue(100)
+        self.opacity.setFixedWidth(90)
+        self.opacity.setToolTip(
+            "Fade the image overlay so the tracks stay readable over it.")
+        self.opacity.valueChanged.connect(self._on_opacity)
+        bar.addWidget(self.opacity_label)
+        bar.addWidget(self.opacity)
 
         self.clear_btn = QPushButton("CLEAR TRACKS")
         self.clear_btn.setToolTip(
@@ -1274,7 +1505,7 @@ class MapWindow(QDialog):
         self.canvas.cursor_moved.connect(self._on_cursor)
 
         self._load_settings()
-        self._select_initial_source()
+        self._populate_packs()
 
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
@@ -1282,28 +1513,79 @@ class MapWindow(QDialog):
 
     # -- sources -----------------------------------------------------------
 
-    def _select_initial_source(self) -> None:
-        """Prefer an offline pack: it is the one that works in the field."""
-        chosen = 0
-        for index, source in enumerate(self.sources):
-            if source.type == "mbtiles":
-                directory = source.path or MAPS_DIR
-                if not os.path.isabs(directory):
-                    directory = os.path.join(self.base_dir, directory)
-                if os.path.isfile(directory) or find_mbtiles(directory):
-                    chosen = index
-                    break
-        self.source_combo.setCurrentIndex(chosen)
-        self._on_source(chosen)
+    def _populate_packs(self) -> None:
+        """List the offline packs first, then any online source.
 
-    def _on_source(self, index: int) -> None:
-        if 0 <= index < len(self.sources):
-            source = self.sources[index]
+        Nothing here touches the network: the entry selected at startup is
+        always an offline one, so opening the map at the launch site makes
+        no outbound request at all.
+        """
+        self.packs = find_packs(self.base_dir)
+        self._online_offset = len(self.packs)
+        self.pack_combo.blockSignals(True)
+        self.pack_combo.clear()
+        for pack in self.packs:
+            self.pack_combo.addItem(pack.name)
+        for source in self.sources:
+            if source.type != "mbtiles":
+                self.pack_combo.addItem("%s  (online)" % source.name)
+        self.pack_combo.blockSignals(False)
+
+        # The remembered choice, if it is still there; otherwise the first
+        # real pack; otherwise the grid. Never an online source by default.
+        wanted = self._saved_pack
+        index = 0
+        if wanted:
+            for i, pack in enumerate(self.packs):
+                if pack.name == wanted:
+                    index = i
+                    break
+        if index == 0 and len(self.packs) > 1 and not wanted:
+            index = 1
+        self.pack_combo.setCurrentIndex(index)
+        self._on_pack(index)
+
+    def _on_pack(self, index: int) -> None:
+        if index < 0:
+            return
+        if index < len(self.packs):
+            pack = self.packs[index]
+            note = self.canvas.set_pack(pack, self.base_dir)
+            if note:
+                self.log_message.emit("Map: %s" % note)
+            self._saved_pack = self.canvas.pack.name
+            self._update_opacity_visibility()
+            self._save_settings()
+            return
+        # An online source: the only path that makes a network request, and
+        # only because the operator chose it.
+        source_index = index - len(self.packs)
+        online = [s for s in self.sources if s.type != "mbtiles"]
+        if 0 <= source_index < len(online):
+            source = online[source_index]
+            self.canvas.pack = MapPack(name=source.name, kind="mbtiles",
+                                       attribution=source.attribution)
+            self.canvas.vector_pack = None
+            self.canvas.overlay = None
             self.canvas.set_source(source, self.base_dir)
+            self.canvas.provider.retry_source()
+            self.log_message.emit(
+                "Map source %r selected: this one uses the network, and the "
+                "provider sees which tiles you view." % source.name)
             if source.needs_key:
                 self.log_message.emit(
                     "Map source %r needs an API key: set the %s environment "
                     "variable." % (source.name, source.key_env))
+        self._update_opacity_visibility()
+
+    def _update_opacity_visibility(self) -> None:
+        showing_image = self.canvas.overlay is not None
+        self.opacity_label.setVisible(showing_image)
+        self.opacity.setVisible(showing_image)
+
+    def _on_opacity(self, value: int) -> None:
+        self.canvas.overlay_opacity = value / 100.0
+        self.canvas.request_redraw()
 
     def _on_follow(self, text: str) -> None:
         self.canvas.follow = "" if text == "Off" else text
@@ -1320,11 +1602,14 @@ class MapWindow(QDialog):
         return os.path.join(self.base_dir, SETTINGS_FILE)
 
     def _load_settings(self) -> None:
+        self._saved_pack = ""
         try:
             with open(self._settings_path(), "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
             return                      # no file, or unreadable: show nothing
+        if isinstance(data, dict):
+            self._saved_pack = str(data.get("map_pack", "") or "")
         station = data.get("ground_station") if isinstance(data, dict) else None
         if not isinstance(station, dict):
             return
@@ -1342,7 +1627,8 @@ class MapWindow(QDialog):
     def _save_settings(self) -> None:
         payload = {"ground_station": {"lat": self.gs_lat.value(),
                                       "lon": self.gs_lon.value(),
-                                      "show": self.gs_check.isChecked()}}
+                                      "show": self.gs_check.isChecked()},
+                   "map_pack": getattr(self, "_saved_pack", "")}
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
@@ -1372,9 +1658,17 @@ class MapWindow(QDialog):
             bits.append("%s %d fixes" % (track.vehicle, len(track.points)))
         if not store.non_empty():
             bits.append("no fixes yet")
-        source = self.canvas.provider.source
-        if source and source.type == "mbtiles" and not self.canvas.provider.offline_ready:
-            bits.append("no offline pack in %s" % MAPS_DIR)
+        if self.canvas.pack.kind == "grid":
+            bits.append("grid only — no map pack loaded, see README")
+        elif self.canvas.vector_pack is not None:
+            bits.append("%s: %d features"
+                        % (self.canvas.vector_pack.name,
+                           self.canvas.vector_pack.feature_count))
+        elif self.canvas.overlay is not None:
+            if self.canvas.overlay.image is None:
+                bits.append("image loading…")
+            elif self.canvas.overlay.error:
+                bits.append(self.canvas.overlay.error)
         if self.canvas.provider.is_offline:
             bits.append("OFFLINE (source unreachable)")
         if self.canvas.provider.network_errors:

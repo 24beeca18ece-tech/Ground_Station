@@ -85,6 +85,13 @@ map_settings.json
 # stays tracked via assets/maps/.gitkeep so the app has somewhere to look.
 assets/maps/*.mbtiles
 *.mbtiles
+# Operator-supplied image overlays and their sidecars are local data.
+assets/maps/*.png
+assets/maps/*.jpg
+assets/maps/*.jpeg
+# ...but the bundled India overview IS source: a few hundred KB of public
+# domain Natural Earth data, so a fresh clone has something on the map.
+!assets/maps/india_overview.osmpack.json
 
 # --- Editor / IDE ------------------------------------------------------------
 .vscode/
