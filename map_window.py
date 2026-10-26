@@ -24,8 +24,9 @@ THREADING
 ---------
 The GUI thread never blocks on a tile:
 
-* network tiles go through ``QNetworkAccessManager``, which is asynchronous
-  on the GUI thread and calls back when the reply lands;
+* network tiles go through :mod:`tile_fetcher`, a bounded pool of urllib
+  workers using Python's own TLS and the Windows certificate store, which
+  hands decoded results back by signal;
 * MBTiles reads run on ``QThreadPool`` as ``QRunnable``, one sqlite
   connection per worker (sqlite objects are not shareable across threads);
 * decoded tiles land in a bounded LRU, so a long session cannot grow memory
@@ -56,15 +57,15 @@ from urllib.parse import quote
 import numpy as np
 
 from PyQt5.QtCore import (QObject, QPoint, QPointF, QRect, QRunnable, Qt,
-                          QThreadPool, QTimer, QUrl, pyqtSignal)
+                          QThreadPool, QTimer, pyqtSignal)
 from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
                          QPolygonF)
-from PyQt5.QtNetwork import (QNetworkAccessManager, QNetworkDiskCache,
-                             QNetworkRequest)
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                              QHBoxLayout, QLabel, QPushButton, QSlider,
                              QVBoxLayout, QWidget)
 
+from tile_fetcher import (TileError, TileFetcher, TileResult,
+                          fetch_tile)
 from map_basemap import (ImageOverlay, VectorPack, draw_graticule,
                           draw_north_arrow, draw_range_rings,
                           load_image_overlay, load_vector_pack)
@@ -102,10 +103,17 @@ TILE_CACHE_MAX = 400
 #: a phone hotspot does not benefit from more.
 MAX_INFLIGHT = 6
 
-#: Connect and read timeout for a tile request. With no network at the site,
-#: the OS default would leave a socket hanging for tens of seconds and the
-#: in-flight slots full the whole time; three seconds frees them promptly.
-TILE_TIMEOUT_MS = 3000
+#: Connect timeout. With no network at the site the OS default would leave
+#: a socket hanging for tens of seconds with an in-flight slot held.
+TILE_CONNECT_TIMEOUT_S = 3.0
+
+#: Default read timeout, separate and longer: Bhuvan renders a WMS tile on
+#: demand and a first request legitimately takes several seconds.
+#: Overridable per source with "read_timeout" in map_sources.json.
+TILE_READ_TIMEOUT_S = 8.0
+
+#: While a source is offline, one probe tile is tried this often.
+OFFLINE_RETRY_S = 30.0
 
 #: How long a tile that failed is not asked for again. Without this, every
 #: repaint re-requests every missing tile -- which with no network is a
@@ -115,6 +123,11 @@ NEGATIVE_CACHE_S = 60.0
 #: Consecutive failures after which a source is declared offline and stops
 #: being asked at all until the operator changes source or it is retried.
 OFFLINE_AFTER_FAILURES = 12
+
+#: Fetched tiles kept between runs, capped at 500 MB, least recently used
+#: removed first. The OSM tile usage policy permits caching, and it is what
+#: makes a view already looked at work with the network gone.
+TILE_CACHE_DIR = os.path.join("logs", "tile_cache")
 
 #: A fix older than this makes the vehicle label turn red.
 STALE_FIX_S = 5.0
@@ -137,10 +150,29 @@ SOURCES_FILE = "map_sources.json"
 SETTINGS_FILE = "map_settings.json"
 MAPS_DIR = os.path.join("assets", "maps")
 
-#: Sent on every outbound tile request. Providers' usage policies require an
-#: application to identify itself rather than impersonate a browser.
-USER_AGENT = ("CU-Jammu-Astro-GroundStation/1.0 "
-              "(+https://github.com/24beeca18ece-tech/Ground_Station)")
+#: Application name and version for the User-Agent. Providers' usage
+#: policies (OpenStreetMap's explicitly) require an application to identify
+#: itself and give a way to contact its operator, not impersonate a browser.
+APP_IDENT = "CU-Jammu-Astro-GroundStation/1.0"
+
+#: The project page, used when no contact has been configured.
+PROJECT_URL = "https://github.com/24beeca18ece-tech/Ground_Station"
+
+
+def default_user_agent(contact: str) -> str:
+    """The User-Agent sent on every tile request.
+
+    *contact* is the ``osm_contact`` field from map_settings.json -- an email
+    or URL where the OSM operations team can reach whoever is running this
+    station. With it empty, the project page is used, which identifies the
+    software but not the person; the map says so and asks for it.
+    """
+    contact = (contact or "").strip()
+    return "%s (+%s)" % (APP_IDENT, contact or PROJECT_URL)
+
+
+#: Kept for callers that predate the configurable contact.
+USER_AGENT = default_user_agent("")
 
 #: Used when map_sources.json is missing or unreadable. Offline first.
 BUILTIN_SOURCES: List[Dict[str, Any]] = [
@@ -153,13 +185,19 @@ BUILTIN_SOURCES: List[Dict[str, Any]] = [
         "max_zoom": 19,
     },
     {
-        "name": "ISRO Bhuvan (admin basemap)",
+        # "boundaries only" in the name, so nobody expects imagery or roads
+        # from it: this layer draws administrative boundaries and nothing
+        # else, and the imagery hosts were unreachable when it was set up.
+        "name": "ISRO Bhuvan (boundaries only)",
         "type": "wms",
         "url": "https://bhuvan-vec1.nrsc.gov.in/bhuvan/wms",
         "layers": "basemap:admin_group_ntl",
         "attribution": "© ISRO / NRSC Bhuvan",
         "min_zoom": 4,
         "max_zoom": 16,
+        # A WMS renders on demand; first tiles measured at 0.9-1.3 s here
+        # and can be far slower under load.
+        "read_timeout": 12.0,
     },
     {
         "name": "OpenStreetMap",
@@ -262,6 +300,9 @@ class MapSource:
     #: False marks a provider whose terms forbid bulk tile download, which is
     #: what tools/fetch_tiles.py refuses to do.
     bulk_download: bool = False
+    #: Seconds to wait for a tile body. Per source because a WMS that renders
+    #: on demand is far slower than a static tile server.
+    read_timeout: float = TILE_READ_TIMEOUT_S
 
     @property
     def api_key(self) -> str:
@@ -319,6 +360,8 @@ def load_sources(base_dir: str = ".") -> Tuple[List[MapSource], str]:
             key_env=str(entry.get("key_env", "")),
             key_param=str(entry.get("key_param", "key")),
             bulk_download=bool(entry.get("bulk_download", False)),
+            read_timeout=float(entry.get("read_timeout",
+                                         TILE_READ_TIMEOUT_S)),
         ))
     if not sources:
         sources = [MapSource(**{k: v for k, v in BUILTIN_SOURCES[0].items()})]
@@ -467,21 +510,29 @@ class _MbtilesJob(QRunnable):
 # ---------------------------------------------------------------------------
 
 class TileProvider(QObject):
-    """Fetches tiles for the active source and caches the decoded images."""
+    """Fetches tiles for the active source and caches the decoded images.
+
+    Network tiles go through :class:`tile_fetcher.TileFetcher` -- a bounded
+    pool of urllib workers using Python's own TLS and the Windows
+    certificate store -- and MBTiles reads through a QThreadPool. The GUI
+    thread only ever enqueues work and receives results by signal.
+    """
 
     tile_ready = pyqtSignal()
     #: ``(message,)`` the first time each distinct problem is seen, so the
     #: event log records a cause once rather than once per tile.
     log_error = pyqtSignal(str)
+    #: ``(source name,)`` when a source that was failing delivers a tile.
+    recovered = pyqtSignal(str)
 
-    def __init__(self, parent: Optional[QObject] = None) -> None:
+    def __init__(self, parent: Optional[QObject] = None,
+                 user_agent: str = "", cache_dir: str = "") -> None:
         super().__init__(parent)
         self.source: Optional[MapSource] = None
         self._cache: "OrderedDict[Any, QImage]" = OrderedDict()
-        #: key -> the reply still in flight for it, so a tile that scrolls
-        #: off screen can have its request aborted rather than finishing to
-        #: fill a cache nobody is looking at.
-        self._pending: Dict[Any, Any] = {}
+        #: key -> url still being fetched. A tile that scrolls off screen is
+        #: dropped from here and its worker skips it before connecting.
+        self._pending: Dict[Any, str] = {}
         #: key -> monotonic time the failure expires. A plain set would mean
         #: a tile that failed once is never retried in the whole session,
         #: which is wrong when the network comes back; no expiry at all means
@@ -489,21 +540,52 @@ class TileProvider(QObject):
         self._failed: Dict[Any, float] = {}
         self._consecutive_failures = 0
         self._handler_faults: set = set()
+        self._reported_kinds: set = set()
         self._mbtiles_paths: List[str] = []
         self._pool = QThreadPool(self)
         # Two readers is enough to keep the visible grid filled without
         # competing with the serial and logger threads for CPU.
         self._pool.setMaxThreadCount(2)
-        self._net = QNetworkAccessManager(self)
-        self._net.finished.connect(self._on_reply)
-        self._inflight = 0
         self._queue: List[Any] = []
+        self._user_agent = user_agent or default_user_agent("")
+        self._cache_dir = cache_dir
+        self._fetcher: Optional[TileFetcher] = None
+        self._last_probe = 0.0
+        #: The most recent failure, in plain words, and its kind.
+        self.last_error = ""
+        self.last_error_kind = ""
         #: Bumped whenever the drawable tile set changes, so the canvas can
         #: tell "nothing changed" from "a tile arrived" without comparing
         #: the cache itself.
         self.generation = 0
         self.network_errors = 0
         self.tiles_drawn = 0
+        self.cache_hits = 0
+
+    # -- configuration -----------------------------------------------------
+
+    @property
+    def user_agent(self) -> str:
+        return self._user_agent
+
+    @user_agent.setter
+    def user_agent(self, value: str) -> None:
+        self._user_agent = value
+        if self._fetcher is not None:
+            self._fetcher.user_agent = value
+
+    def _ensure_fetcher(self) -> TileFetcher:
+        if self._fetcher is None:
+            cache_dir = self._cache_dir or os.path.join(".", TILE_CACHE_DIR)
+            self._fetcher = TileFetcher(cache_dir=cache_dir,
+                                        user_agent=self._user_agent,
+                                        workers=MAX_INFLIGHT, parent=self)
+            self._fetcher.finished.connect(self._on_fetched)
+        return self._fetcher
+
+    @property
+    def _inflight(self) -> int:
+        return self._fetcher.in_flight if self._fetcher is not None else 0
 
     # -- source ------------------------------------------------------------
 
@@ -513,8 +595,13 @@ class TileProvider(QObject):
         self.abort_pending()
         self._failed.clear()
         self._consecutive_failures = 0
+        self._reported_kinds.clear()
+        self.last_error = ""
+        self.last_error_kind = ""
         self._queue.clear()
         self._mbtiles_paths = []
+        if not self._cache_dir:
+            self._cache_dir = os.path.join(base_dir, TILE_CACHE_DIR)
         if source.type == "mbtiles":
             directory = source.path or MAPS_DIR
             if not os.path.isabs(directory):
@@ -530,41 +617,73 @@ class TileProvider(QObject):
 
     @property
     def is_offline(self) -> bool:
-        """True when this source has failed enough to stop asking it.
+        """True when this source has failed often enough to stop asking it.
 
-        A source that cannot be reached must say so once, not retry forever:
-        at the launch site there is no network, and a map that spends every
-        repaint starting requests that will time out is both useless and the
-        thing making the application slow.
+        Not permanent: :meth:`probe_if_due` tries one tile every
+        :data:`OFFLINE_RETRY_S`, and the first success clears it.
         """
         return (self.source is not None and self.source.type != "mbtiles"
                 and self._consecutive_failures >= OFFLINE_AFTER_FAILURES)
+
+    @property
+    def status_text(self) -> str:
+        """The most recent problem in plain words, or "" when healthy.
+
+        "source unreachable" was not a diagnosis; this says which source and
+        what actually happened -- "OpenStreetMap: HTTP 403 (blocked ...)",
+        "ISRO Bhuvan (boundaries only): timed out after 8 s".
+        """
+        if not self.last_error:
+            return ""
+        name = self.source.name if self.source else "tile source"
+        prefix = "OFFLINE — " if self.is_offline else ""
+        reason = self.last_error
+        if self.last_error_kind == TileError.TIMEOUT and self.source is not None:
+            reason = "timed out after %g s" % self.source.read_timeout
+        return "%s%s: %s" % (prefix, name, reason)
 
     def retry_source(self) -> None:
         """Forget the offline verdict and the negative cache, and try again."""
         self._failed.clear()
         self._consecutive_failures = 0
+        self._last_probe = time.monotonic()
+
+    def probe_if_due(self) -> bool:
+        """While offline, allow one probe tile every OFFLINE_RETRY_S.
+
+        Giving up for good is wrong at a launch site: a hotspot comes back,
+        a proxy starts answering. Dropping the counter to one below the
+        threshold lets exactly one request through; if it fails the source
+        is offline again, and if it succeeds the counter resets to zero.
+        """
+        if not self.is_offline:
+            return False
+        now = time.monotonic()
+        if now - self._last_probe < OFFLINE_RETRY_S:
+            return False
+        self._last_probe = now
+        self._failed.clear()
+        self._consecutive_failures = OFFLINE_AFTER_FAILURES - 1
+        return True
 
     def abort_pending(self, keep: Optional[set] = None) -> None:
-        """Abort in-flight requests, except those for tiles in *keep*.
+        """Forget queued and in-flight tiles, except those in *keep*.
 
-        Panning away from a tile makes its request worthless; finishing it
-        holds one of the few in-flight slots that the tiles now on screen
-        need.
+        Panning away from a tile makes its request worthless. A worker that
+        has not yet connected checks the wanted set and skips the tile; one
+        mid-transfer finishes, which is cheaper than tearing down a TLS
+        connection, and its result is simply cached.
         """
-        for key, reply in list(self._pending.items()):
+        for key in list(self._pending):
             if keep is not None and key in keep:
                 continue
             self._pending.pop(key, None)
-            if reply is not None:
-                try:
-                    reply.abort()
-                except RuntimeError:
-                    pass
         if keep is None:
             self._queue.clear()
         else:
             self._queue = [k for k in self._queue if k in keep]
+        if self._fetcher is not None:
+            self._fetcher.set_wanted(keep if keep is not None else set())
 
     # -- lookup ------------------------------------------------------------
 
@@ -594,26 +713,42 @@ class TileProvider(QObject):
 
     def _request(self, key) -> None:
         source = self.source
-        self._pending[key] = None
         if source.type == "mbtiles":
+            self._pending[key] = ""
             job = _MbtilesJob(key, self._mbtiles_paths)
             job.signals.done.connect(self._on_mbtiles)
             self._pool.start(job)
             return
         if source.needs_key:
-            # No key in the environment: fail quietly rather than send a
-            # request that will be rejected, and let the grey tile say so.
-            self._pending.pop(key, None)
+            # No key in the environment: do not send a request that will be
+            # rejected. Say why, once.
             self._mark_failed(key)
+            self._note_failure(TileError.HTTP, "needs an API key: set the %s "
+                               "environment variable" % source.key_env)
             return
         if self._inflight >= MAX_INFLIGHT:
             if key not in self._queue:
                 self._queue.append(key)
+            self._pending[key] = ""
             return
         self._send(key)
 
+    def _send(self, key) -> None:
+        url = self._tile_url(key)
+        if not url:
+            self._pending.pop(key, None)
+            self._mark_failed(key)
+            return
+        fetcher = self._ensure_fetcher()
+        fetcher.connect_timeout = TILE_CONNECT_TIMEOUT_S
+        fetcher.read_timeout = float(getattr(self.source, "read_timeout",
+                                             TILE_READ_TIMEOUT_S))
+        fetcher.user_agent = self._user_agent
+        self._pending[key] = url
+        fetcher.submit(key, url)
+
     def _report_handler_fault(self, exc: BaseException) -> None:
-        """Log a fault inside the reply handler once, by type."""
+        """Log a fault inside the result handler once, by type."""
         label = "%s: %s" % (type(exc).__name__, exc)
         if label in self._handler_faults:
             return
@@ -629,24 +764,15 @@ class TileProvider(QObject):
             now = time.monotonic()
             self._failed = {k: v for k, v in self._failed.items() if v > now}
 
-    def _send(self, key) -> None:
-        url = self._tile_url(key)
-        if not url:
-            self._pending.discard(key)
-            self._failed.add(key)
-            return
-        request = QNetworkRequest(QUrl(url))
-        request.setRawHeader(b"User-Agent", USER_AGENT.encode("ascii"))
-        request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)
-        request.setAttribute(QNetworkRequest.User, key)
-        try:
-            # Qt 5.15; on older builds the attribute is absent and the OS
-            # default applies, which is only slower, not wrong.
-            request.setTransferTimeout(TILE_TIMEOUT_MS)
-        except AttributeError:
-            pass
-        self._inflight += 1
-        self._pending[key] = self._net.get(request)
+    def _note_failure(self, kind: str, reason: str) -> None:
+        """Record the latest reason; log the first of each kind once."""
+        self.last_error = reason or "unknown error"
+        self.last_error_kind = kind
+        if kind not in self._reported_kinds:
+            self._reported_kinds.add(kind)
+            self.log_error.emit("%s: %s" % (
+                self.source.name if self.source else "tile source",
+                self.last_error))
 
     def _tile_url(self, key) -> str:
         source = self.source
@@ -682,53 +808,56 @@ class TileProvider(QObject):
         self._pending.pop(key, None)
         self._store(key, data)
 
-    def _on_reply(self, reply) -> None:
-        self._inflight = max(0, self._inflight - 1)
-        key = reply.request().attribute(QNetworkRequest.User)
-        data = None
+    def _on_fetched(self, result: TileResult) -> None:
+        """A network worker finished. GUI thread, via the fetcher's signal.
+
+        Nothing here may raise silently: a fault in this handler is exactly
+        what made a working network look dead, so it is caught, logged once
+        as a bug, and the tile is counted -- never swallowed.
+        """
         try:
-            if reply.error() == 0:
-                payload = bytes(reply.readAll())
-                # A WMS answers an error with XML and HTTP 200, so the
-                # content type is what decides whether this is a tile.
-                # header() returns a str; bytes(str) raises TypeError, which
-                # the except below used to swallow -- turning EVERY tile that
-                # arrived perfectly well into a counted failure, and twelve of
-                # those into "OFFLINE (source unreachable)".
-                ctype = str(reply.header(QNetworkRequest.ContentTypeHeader)
-                            or "")
-                if payload and (not ctype or ctype.startswith("image")):
-                    data = payload
-                else:
-                    self.network_errors += 1
+            self._pending.pop(result.key, None)
+            if result.ok:
+                if result.from_cache:
+                    self.cache_hits += 1
+                was_failing = bool(self.last_error) or self.is_offline
+                self.last_error = ""
+                self.last_error_kind = ""
+                if not self._store(result.key, result.data):
+                    self._note_failure(TileError.BAD_IMAGE,
+                                       "a tile arrived but would not decode")
+                elif was_failing:
+                    self._reported_kinds.clear()
+                    self.recovered.emit(self.source.name if self.source
+                                        else "tile source")
             else:
                 self.network_errors += 1
+                self._note_failure(result.kind, result.reason)
+                self._store(result.key, None)
         except Exception as exc:                          # noqa: BLE001
-            # Never silent again: a bug in this handler looked exactly like
-            # a dead network for as long as it went unreported.
             self.network_errors += 1
             self._report_handler_fault(exc)
         finally:
-            reply.deleteLater()
-        if key is not None:
-            self._pending.pop(key, None)
-            self._store(key, data)
-        while self._queue and self._inflight < MAX_INFLIGHT:
-            self._send(self._queue.pop(0))
+            while self._queue and self._inflight < MAX_INFLIGHT:
+                key = self._queue.pop(0)
+                if key in self._pending:
+                    self._send(key)
 
-    def _store(self, key, data) -> None:
+    def _store(self, key, data) -> bool:
+        """Decode and cache. True when a usable tile was stored."""
         if not data:
             self._mark_failed(key)
             self._consecutive_failures += 1
             self.generation += 1
             self.tile_ready.emit()
-            return
+            return False
         image = QImage()
         if not image.loadFromData(data):
             self._mark_failed(key)
             self._consecutive_failures += 1
+            self.generation += 1
             self.tile_ready.emit()
-            return
+            return False
         self._consecutive_failures = 0
         self._cache[key] = image
         self._cache.move_to_end(key)
@@ -736,15 +865,35 @@ class TileProvider(QObject):
         while len(self._cache) > TILE_CACHE_MAX:
             self._cache.popitem(last=False)
         self.tile_ready.emit()
+        return True
 
     def clear_failures(self) -> None:
         """Let previously missing tiles be retried (e.g. network returned)."""
         self._failed.clear()
         self._consecutive_failures = 0
 
+    def test_tile(self, z: int, x: int, y: int) -> TileResult:
+        """Fetch one tile for the current source, bypassing every cache.
+
+        Runs synchronously and is meant to be called from a worker; it is
+        what the Test source button runs, so it must report exactly what the
+        server said rather than what the cache remembers.
+        """
+        source = self.source
+        if source is None or source.type == "mbtiles":
+            return TileResult(key=None, kind=TileError.OTHER,
+                              reason="the selected pack is offline; there is "
+                                     "nothing to test over the network")
+        url = self._tile_url((source.name, z, x, y))
+        return fetch_tile((source.name, z, x, y), url, self._user_agent,
+                          TILE_CONNECT_TIMEOUT_S, source.read_timeout,
+                          cache=None)
+
     def shutdown(self) -> None:
         self.abort_pending()
         self._queue.clear()
+        if self._fetcher is not None:
+            self._fetcher.shutdown()
         try:
             self._pool.clear()
             self._pool.waitForDone(3000)
