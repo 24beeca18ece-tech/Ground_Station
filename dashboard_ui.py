@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
     QTabWidget,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -64,6 +65,9 @@ from PyQt5.QtWidgets import (
 from attitude_widget import ATTITUDE_RENDER_HZ, AttitudeWidget
 from altitude_callout import VoiceCallout, TTS_AVAILABLE
 from csv_logger import CsvLoggerThread
+from kml_export import build_kml, kml_filename
+from map_window import MapWindow
+from track_store import TrackStore
 from csv_table_window import CsvTableWindow
 from diagnostics_window import DiagnosticsWindow, RawPacketStrip
 from packet_merger import PacketMerger
@@ -1114,6 +1118,13 @@ class Dashboard(QMainWindow):
         # Live tabular view of the session CSV. Fed from the logger's
         # row_written signal, never by re-reading the file.
         self.csv_table = CsvTableWindow(self)
+        # Every position fix of this session, filled from on_packet whether
+        # or not the map window is open -- so opening it mid-flight shows the
+        # whole track, and the KML export has the full path to write.
+        self.track_store = TrackStore()
+        self.map_window = MapWindow(self.track_store, base_dir=os.getcwd(),
+                                    parent=self)
+        self.map_window.log_message.connect(self.append_event)
 
         self._wire_signals()
 
@@ -1426,6 +1437,24 @@ class Dashboard(QMainWindow):
             "per logged packet, with a filter box."
         )
         layout.addWidget(self.csv_table_btn)
+
+        self.map_btn = QPushButton("MAP")
+        _fit(self.map_btn)
+        self.map_btn.setToolTip(
+            "Open the live map: every GNSS fix of this session, per vehicle, "
+            "over offline tiles from assets/maps/ (or an online source).\n\n"
+            "Fixes are recorded whether or not this window is open."
+        )
+        layout.addWidget(self.map_btn)
+
+        self.kml_btn = QPushButton("EXPORT KML")
+        _fit(self.kml_btn)
+        self.kml_btn.setToolTip(
+            "Write this session's tracks to a KML file for Google Earth, "
+            "with a time slider, launch/apogee/last-known markers and GNSS "
+            "altitude.\n\nWorks while logging is running."
+        )
+        layout.addWidget(self.kml_btn)
 
         self.log_path_label = QLabel("CSV: not started")
         self.log_path_label.setSizePolicy(QSizePolicy.Ignored,
@@ -2161,6 +2190,8 @@ class Dashboard(QMainWindow):
         self.eject_btn.clicked.connect(self.on_eject_clicked)
         self.diag_btn.clicked.connect(self.toggle_diagnostics)
         self.csv_table_btn.clicked.connect(self.toggle_csv_table)
+        self.map_btn.clicked.connect(self.toggle_map)
+        self.kml_btn.clicked.connect(self.export_kml)
 
     # ==================================================================
     # Slots — connection control
@@ -2536,6 +2567,9 @@ class Dashboard(QMainWindow):
 
             if packet.has_fix:
                 self.gps_plot.add_fix(packet.lat, packet.lon)
+            # The map and the KML share one store, filled here so a fix is
+            # never missed because a window happened to be closed. O(1).
+            self.track_store.add_packet(packet)
 
             if (getattr(packet, "has_fsm_data", True)
                     and packet.fsm_state != self._last_fsm):
@@ -2765,6 +2799,60 @@ class Dashboard(QMainWindow):
         self.csv_table.raise_()
         self.csv_table.activateWindow()
         self.append_event("CSV table window opened.")
+
+    def toggle_map(self) -> None:
+        """Show or hide the live map window."""
+        if self.map_window.isVisible():
+            self.map_window.hide()
+            self.append_event("Map window closed.")
+            return
+        self.map_window.show()
+        self.map_window.raise_()
+        self.map_window.activateWindow()
+        self.append_event("Map window opened.")
+
+    def export_kml(self) -> None:
+        """Write this session's tracks to a KML file for Google Earth."""
+        tracks = self.track_store.non_empty()
+        if not tracks:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "No GNSS fix has been recorded this session, so there is no "
+                "track to export.\n\nThe KML needs at least one packet with "
+                "a valid fix (has_fix true, non-zero coordinates)."
+            )
+            self.append_event("KML export: no fixes recorded, nothing written.")
+            return
+
+        team_id = self.latest.team_id if self.latest is not None else TEAM_ID_FALLBACK
+        default = os.path.join(self.csv_logger.log_dir, kml_filename(team_id))
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export KML for Google Earth", default,
+            "Google Earth KML (*.kml)")
+        if not path:
+            self.append_event("KML export cancelled.")
+            return
+
+        try:
+            text = build_kml(tracks, {
+                "team_id": team_id,
+                "session_date": datetime.fromtimestamp(
+                    self.session_start).strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "live session",
+                "jump_m": self.track_store.jump_m,
+                "jump_window_s": self.track_store.jump_window_s,
+            })
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            QMessageBox.warning(self, "KML export failed",
+                                "Could not write %s:\n\n%s" % (path, exc))
+            self.append_event("KML export FAILED: %s" % exc)
+            return
+
+        counts = ", ".join("%s %d" % (t.vehicle, len(t.points)) for t in tracks)
+        self.append_event("KML exported: %s (%s)" % (path, counts))
+        self.csv_logger.log_note("KML exported: %s (%s)" % (path, counts))
 
     def toggle_diagnostics(self) -> None:
         """Show or hide the raw diagnostics table window."""
@@ -3191,6 +3279,10 @@ class Dashboard(QMainWindow):
             # previous one and stamps the next with the time of this press, so
             # runs can never be overwritten or mixed together.
             self.csv_logger.begin_session()
+            # A new Flight_*.csv is a new session: the map's tracks belong to
+            # the run being recorded, not to whatever was on screen before.
+            self.track_store.clear()
+            self.map_window.canvas.request_redraw()
             self.log_path_label.setText("CSV: waiting for first packet (TEAM_ID)…")
             self.log_path_label.setToolTip("")
             self.append_event(
@@ -3209,6 +3301,8 @@ class Dashboard(QMainWindow):
         between bench runs must never cost recorded telemetry.
         """
         self.clear_session()
+        self.track_store.clear()
+        self.map_window.canvas.request_redraw()
         self.latest = None
         self._last_fsm = None
 
@@ -3288,6 +3382,10 @@ class Dashboard(QMainWindow):
             self.attitude_timer.stop()
             self.diagnostics.close()
             self.csv_table.close()
+            # Stops the map's redraw timer and drains its tile thread pool,
+            # so no worker outlives the window it reports to.
+            self.map_window.shutdown()
+            self.map_window.close()
             if self.chart_overlay.is_open:
                 # Put the chart back before teardown so the grid owns it.
                 self.chart_overlay.close_overlay()
