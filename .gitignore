@@ -31,6 +31,9 @@ logs/*.txt
 # atomic newest-first rewrite swaps in. Both are runtime state, never source.
 logs/*.journal
 logs/*.tmp
+# The map's on-disk tile cache: up to 500 MB of provider tiles, rebuilt on
+# demand, and not ours to redistribute.
+logs/tile_cache/
 
 # --- LaTeX build artefacts ---------------------------------------------------
 # docs/*.tex and the compiled docs/*.pdf are tracked deliverables; everything

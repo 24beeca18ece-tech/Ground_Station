@@ -115,6 +115,62 @@ A bundled **India overview** (Natural Earth, public domain, 196 KB) ships in
 `assets/maps/`, so a fresh clone shows the country outline, state boundaries
 and major cities when zoomed out.
 
+### Online sources
+
+Two are built in: **OpenStreetMap** and **ISRO Bhuvan (boundaries only)**.
+The second is a WMS layer of administrative boundaries - over most of a
+launch site it draws nothing but a faint "bhuvan" watermark, which is
+correct, not a fault. It has no imagery or roads.
+
+**Before using OpenStreetMap, put your contact in `map_settings.json`.**
+OSM's tile usage policy asks every application to identify itself with a
+way to reach whoever runs it. The field is written into the file the first
+time the map opens, empty, with a help line beside it:
+
+```json
+"osm_contact": "you@example.org",
+```
+
+Use an email address or a web page that reaches you. Until it is filled in
+the project page is sent instead, and the map's status line and the event
+log both remind you.
+
+Tiles are fetched by a small pool of background workers using Python's own
+TLS and the Windows certificate store, so they do not depend on the OpenSSL
+files bundled with Qt. Redirects are followed and the system proxy is used.
+Connect timeout is 3 s; read timeout is 8 s by default and can be set per
+source with `"read_timeout"` in `map_sources.json` (Bhuvan uses 12 s, since
+it renders each tile on demand).
+
+**Fetched tiles are kept on disk** under `logs/tile_cache/`, up to 500 MB,
+oldest-used removed first. OpenStreetMap's policy permits this, and it means
+a view you have already looked at at home keeps working with no network.
+Delete the folder to clear it.
+
+**When something fails, the status line says what.** Instead of a generic
+"unreachable" you get the source and the actual reason, for example:
+
+| You see | It means |
+|---|---|
+| `OpenStreetMap: HTTP 403 (blocked ...; check the User-Agent ...)` | the provider refused this client - fill in `osm_contact` |
+| `HTTP 429 (rate limited ...)` | too many requests; wait, or use an offline pack |
+| `ISRO Bhuvan (boundaries only): timed out after 12 s` | the server is slow or unreachable |
+| `host not found (DNS)` | no network, or the name is wrong |
+| `certificate not trusted (...)` | check the PC clock, or a proxy that intercepts HTTPS |
+| `not an image (...)` | a captive portal or proxy answered instead of the tile server |
+
+The first failure of each kind is also written once to the event log.
+
+After twelve failures in a row the status says **OFFLINE** with the reason.
+That is not permanent: one probe tile is tried every 30 s, and the first
+success switches back to online by itself. **RETRY NOW** tries immediately.
+
+**TEST SOURCE** fetches one tile for the centre of the view from the
+selected online source, bypassing every cache, and shows the URL, HTTP
+status, size, time in milliseconds, the User-Agent sent and the exact error
+if any. Use it on the field laptop to tell "no network" from "blocked" from
+"slow server" in one click.
+
 ### Vector pack for your launch site (recommended)
 
 One Overpass query, no tiles, a few hundred kilobytes:
