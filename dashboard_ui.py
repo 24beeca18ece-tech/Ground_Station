@@ -34,6 +34,7 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
@@ -94,6 +95,11 @@ STATUS_HZ = 5                  # link-status (staleness, rate) refresh rate
 STALE_AFTER_S = 2.0            # telemetry considered stale after this gap
 RATE_WINDOW_S = 3.0            # averaging window for packets/sec
 MAX_PLOT_POINTS = 40000        # hard cap per series (~33 min at 20 Hz)
+
+#: Headroom above MAX_PLOT_POINTS so the window is compacted once every
+#: _COMPACT_SLACK samples rather than shifting the whole array on every
+#: packet. Amortised, the move costs O(1) per sample.
+_COMPACT_SLACK = 4000
 DEFAULT_WINDOW_S = 60          # visible strip-chart width in seconds
 DEFAULT_VOLTAGE_WARN = 7.0     # battery warning threshold, volts
 #: A mission time this much lower than the previous sample is treated as a
@@ -766,12 +772,19 @@ class StripChart(pg.PlotWidget):
         #: stationary -- see _autoscale_y().
         self.min_y_span = float(min_y_span)
         self._last_y_autoscale = 0.0
-        self._x: List[float] = []
+        # Columns, not lists. See _append_sample: redraw hands pyqtgraph a
+        # numpy VIEW of these, which allocates nothing, where slicing a
+        # Python list allocated a fresh 40,000-element list per series per
+        # frame.
+        self._n = 0
+        self._cap = 4096
+        self._x = np.empty(self._cap, dtype=np.float64)
         #: Count of samples whose x had to be clamped to keep the series
         #: non-decreasing. Non-zero means a caller passed an unordered clock.
         self.bad_x = 0
         self._series_names: List[str] = [name for name, _ in series]
-        self._y: Dict[str, List[float]] = {name: [] for name, _ in series}
+        self._y: Dict[str, Any] = {name: np.empty(self._cap, dtype=np.float64)
+                                   for name, _ in series}
         self._curves: Dict[str, pg.PlotDataItem] = {}
 
         if len(series) > 1 and legend:
@@ -808,29 +821,57 @@ class StripChart(pg.PlotWidget):
         """
         if not math.isfinite(x):
             self.bad_x += 1
-            x = self._x[-1] if self._x else 0.0
-        elif self._x and x < self._x[-1]:
+            x = self._x[self._n - 1] if self._n else 0.0
+        elif self._n and x < self._x[self._n - 1]:
             self.bad_x += 1
-            x = self._x[-1]
-        self._x.append(x)
+            x = self._x[self._n - 1]
+
+        # Compact on the DISPLAY cap, not on capacity: the arrays are
+        # deliberately larger than the window so compaction is amortised,
+        # but the series itself must still hold at most MAX_PLOT_POINTS.
+        if self._n >= self._cap or self._n > MAX_PLOT_POINTS + _COMPACT_SLACK:
+            self._make_room()
+        i = self._n
+        self._x[i] = x
         for name in self._series_names:
             value = values.get(name, float("nan"))
             if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
                 value = float("nan")
-            self._y[name].append(float(value))
+            self._y[name][i] = float(value)
+        self._n = i + 1
 
-        if len(self._x) > MAX_PLOT_POINTS:
-            drop = len(self._x) - MAX_PLOT_POINTS
-            del self._x[:drop]
+    def _make_room(self) -> None:
+        """Grow, or compact the window down to MAX_PLOT_POINTS.
+
+        Compaction moves the newest MAX_PLOT_POINTS to the front in one
+        memmove rather than dropping one sample per append, which would be
+        O(n) on every packet once the cap is reached.
+        """
+        if self._n <= MAX_PLOT_POINTS and self._cap < MAX_PLOT_POINTS + _COMPACT_SLACK:
+            self._cap = min(MAX_PLOT_POINTS + _COMPACT_SLACK,
+                            max(4096, self._cap * 2))
+            grown = np.empty(self._cap, dtype=np.float64)
+            grown[:self._n] = self._x[:self._n]
+            self._x = grown
             for name in self._series_names:
-                del self._y[name][:drop]
+                grown = np.empty(self._cap, dtype=np.float64)
+                grown[:self._n] = self._y[name][:self._n]
+                self._y[name] = grown
+            return
+        keep = MAX_PLOT_POINTS
+        start = self._n - keep
+        self._x[:keep] = self._x[start:self._n]
+        for name in self._series_names:
+            self._y[name][:keep] = self._y[name][start:self._n]
+        self._n = keep
 
     def clear_data(self) -> None:
-        self._x.clear()
+        self._n = 0
         self.bad_x = 0
         self._last_y_autoscale = 0.0
+        # _n = 0 is the clear: the arrays are reused, so clearing costs
+        # nothing and the next session does not reallocate them.
         for name in self._series_names:
-            self._y[name].clear()
             self._curves[name].setData([], [])
 
     # -- click to enlarge ---------------------------------------------------
@@ -882,23 +923,25 @@ class StripChart(pg.PlotWidget):
 
     def redraw(self, window_s: float, autoscale_y: bool = True) -> None:
         """Redraw the trailing *window_s* seconds of data."""
-        if not self._x:
+        if not self._n:
             return
-        latest = self._x[-1]
+        latest = float(self._x[self._n - 1])
         # Before the buffer holds a full window, show everything from the first
         # sample rather than padding the view with empty pre-launch time.
-        cutoff = max(latest - float(window_s), self._x[0])
+        cutoff = max(latest - float(window_s), float(self._x[0]))
         # bisect is valid because add_point guarantees _x is non-decreasing.
         # Without that guarantee this search returns a meaningless index and
         # pyqtgraph's clipToView (which also assumes sorted x) mis-slices the
         # series, scattering the trace.
-        start = bisect.bisect_left(self._x, cutoff)
-        if start >= len(self._x):
-            start = max(0, len(self._x) - 1)
+        start = int(np.searchsorted(self._x[:self._n], cutoff, side="left"))
+        if start >= self._n:
+            start = max(0, self._n - 1)
 
-        xs = self._x[start:]
+        # Views, not copies: numpy slicing allocates nothing, so a redraw
+        # costs no memory however long the series is.
+        xs = self._x[start:self._n]
         for name in self._series_names:
-            self._curves[name].setData(xs, self._y[name][start:])
+            self._curves[name].setData(xs, self._y[name][start:self._n])
 
         self.setXRange(cutoff, max(latest, cutoff + 1e-3), padding=0.01)
         if autoscale_y:
@@ -929,13 +972,15 @@ class StripChart(pg.PlotWidget):
         lo = None
         hi = None
         for name in self._series_names:
-            for value in self._y[name][start:]:
-                if not math.isfinite(value):
-                    continue
-                if lo is None or value < lo:
-                    lo = value
-                if hi is None or value > hi:
-                    hi = value
+            window = self._y[name][start:self._n]
+            if window.size == 0:
+                continue
+            finite = window[np.isfinite(window)]
+            if finite.size == 0:
+                continue
+            low, high = float(finite.min()), float(finite.max())
+            lo = low if lo is None else min(lo, low)
+            hi = high if hi is None else max(hi, high)
 
         if lo is None:                      # nothing finite in view
             self.enableAutoRange(axis="y")

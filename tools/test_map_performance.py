@@ -384,3 +384,66 @@ def test_mbtiles_source_is_never_declared_offline(qapp, tmp_path):
     assert provider.is_offline is False
     window.shutdown()
     window.close()
+
+
+# ---------------------------------------------------------------------------
+# Chart series storage
+# ---------------------------------------------------------------------------
+
+def test_chart_series_are_numpy_and_redraw_hands_out_views(qapp):
+    """A redraw must not allocate: pyqtgraph gets a view, not a new list.
+
+    Slicing a Python list of 40,000 floats allocates a fresh list every
+    frame; sixteen series at 15 Hz was measured as the dominant remaining
+    source of heap churn after the logger fix.
+    """
+    import numpy as _np
+    from dashboard_ui import MAX_PLOT_POINTS, StripChart
+    chart = StripChart("t", "u", [("a", "#ff0000"), ("b", "#00ff00")])
+    for i in range(500):
+        chart.add_point(i * 0.05, {"a": float(i), "b": float(i) * 2})
+    assert isinstance(chart._x, _np.ndarray)
+    assert isinstance(chart._y["a"], _np.ndarray)
+    view = chart._x[10:chart._n]
+    assert view.base is not None, "slicing copied instead of viewing"
+
+
+def test_chart_series_respects_its_cap(qapp):
+    from dashboard_ui import MAX_PLOT_POINTS, _COMPACT_SLACK, StripChart
+    chart = StripChart("t", "u", [("a", "#ff0000")])
+    for i in range(MAX_PLOT_POINTS + _COMPACT_SLACK * 3):
+        chart.add_point(i * 0.05, {"a": float(i)})
+    assert chart._n <= MAX_PLOT_POINTS + _COMPACT_SLACK
+    # The newest sample must survive compaction: it is the live edge.
+    assert chart._x[chart._n - 1] == pytest.approx(
+        (MAX_PLOT_POINTS + _COMPACT_SLACK * 3 - 1) * 0.05)
+
+
+def test_chart_x_stays_non_decreasing_through_compaction(qapp):
+    import numpy as _np
+    from dashboard_ui import MAX_PLOT_POINTS, StripChart
+    chart = StripChart("t", "u", [("a", "#ff0000")])
+    for i in range(MAX_PLOT_POINTS + 9000):
+        chart.add_point(i * 0.05, {"a": float(i)})
+    window = chart._x[:chart._n]
+    assert _np.all(_np.diff(window) >= 0), "compaction scrambled the x series"
+
+
+def test_chart_clear_resets_without_reallocating(qapp):
+    from dashboard_ui import StripChart
+    chart = StripChart("t", "u", [("a", "#ff0000")])
+    for i in range(1000):
+        chart.add_point(i * 0.05, {"a": float(i)})
+    before = chart._x
+    chart.clear_data()
+    assert chart._n == 0
+    assert chart._x is before, "clear reallocated the buffer"
+
+
+def test_the_dashboard_constructs(qapp, tmp_path):
+    """Nothing else in the suite builds a Dashboard, and a missing import
+    in it was therefore invisible until the application was run."""
+    from dashboard_ui import Dashboard
+    window = Dashboard(log_dir=str(tmp_path))
+    assert window.chart_alt._n == 0
+    window.close()
