@@ -470,6 +470,9 @@ class TileProvider(QObject):
     """Fetches tiles for the active source and caches the decoded images."""
 
     tile_ready = pyqtSignal()
+    #: ``(message,)`` the first time each distinct problem is seen, so the
+    #: event log records a cause once rather than once per tile.
+    log_error = pyqtSignal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -485,6 +488,7 @@ class TileProvider(QObject):
         #: re-requesting every missing tile on every repaint.
         self._failed: Dict[Any, float] = {}
         self._consecutive_failures = 0
+        self._handler_faults: set = set()
         self._mbtiles_paths: List[str] = []
         self._pool = QThreadPool(self)
         # Two readers is enough to keep the visible grid filled without
@@ -608,6 +612,15 @@ class TileProvider(QObject):
             return
         self._send(key)
 
+    def _report_handler_fault(self, exc: BaseException) -> None:
+        """Log a fault inside the reply handler once, by type."""
+        label = "%s: %s" % (type(exc).__name__, exc)
+        if label in self._handler_faults:
+            return
+        self._handler_faults.add(label)
+        self.log_error.emit("tile handler fault (this is a bug, not the "
+                            "network): %s" % label)
+
     def _mark_failed(self, key) -> None:
         self._failed[key] = time.monotonic() + NEGATIVE_CACHE_S
         # Keep the negative cache from becoming its own leak over a long
@@ -678,18 +691,23 @@ class TileProvider(QObject):
                 payload = bytes(reply.readAll())
                 # A WMS answers an error with XML and HTTP 200, so the
                 # content type is what decides whether this is a tile.
-                ctype = bytes(reply.header(QNetworkRequest.ContentTypeHeader)
-                              or b"")
-                if isinstance(ctype, bytes):
-                    ctype = ctype.decode("ascii", "replace")
+                # header() returns a str; bytes(str) raises TypeError, which
+                # the except below used to swallow -- turning EVERY tile that
+                # arrived perfectly well into a counted failure, and twelve of
+                # those into "OFFLINE (source unreachable)".
+                ctype = str(reply.header(QNetworkRequest.ContentTypeHeader)
+                            or "")
                 if payload and (not ctype or ctype.startswith("image")):
                     data = payload
                 else:
                     self.network_errors += 1
             else:
                 self.network_errors += 1
-        except Exception:
+        except Exception as exc:                          # noqa: BLE001
+            # Never silent again: a bug in this handler looked exactly like
+            # a dead network for as long as it went unreported.
             self.network_errors += 1
+            self._report_handler_fault(exc)
         finally:
             reply.deleteLater()
         if key is not None:

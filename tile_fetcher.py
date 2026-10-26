@@ -93,18 +93,25 @@ class TileResult:
         return self.data is not None and self.kind == TileError.NONE
 
 
-def _is_image(content_type: str, payload: bytes) -> bool:
-    """True when this really is an image.
+#: Leading bytes of the formats a tile server may legitimately send.
+_IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",        # PNG
+    b"\xff\xd8\xff",              # JPEG
+    b"GIF87a", b"GIF89a",         # GIF
+    b"RIFF",                      # WebP (RIFF....WEBP)
+)
 
-    A WMS answers an error with XML and HTTP 200, so the status alone does
-    not settle it. The content type is checked first, and the magic bytes
-    second, because some servers send an image with no type at all.
+
+def _is_image(content_type: str, payload: bytes) -> bool:
+    """True when this really is an image, judged by its bytes.
+
+    The Content-Type header is not enough either way. A WMS reports errors
+    as XML with HTTP 200, and a captive portal or a broken proxy will serve
+    an HTML page labelled image/png -- the test server does exactly that,
+    and trusting the header let it through as a tile. Some servers send a
+    real tile with no type at all. So the magic bytes decide, always.
     """
-    if content_type and content_type.split(";")[0].strip().startswith("image"):
-        return True
-    if content_type:
-        return False
-    return payload[:8] == b"\x89PNG\r\n\x1a\n" or payload[:3] == b"\xff\xd8\xff"
+    return any(payload.startswith(magic) for magic in _IMAGE_MAGIC)
 
 
 def classify(exc: BaseException) -> Tuple[str, str]:
