@@ -76,6 +76,34 @@
         "requires. For an offline pack, use a provider whose terms allow it,",
         "or render your own from an OSM extract."
       ]
+    },
+
+    {
+      "name": "Sentinel-2 cloudless 2023 (EOX)",
+      "type": "xyz",
+      "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg",
+      "attribution": "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2023)",
+      "min_zoom": 0,
+      "max_zoom": 14,
+      "bulk_download": true,
+      "rate_limit": 1.0,
+      "max_tiles": 4000,
+      "_note": [
+        "Satellite imagery, about 10 m per pixel; past z14 the map overzooms.",
+        "CC BY-NC-SA 4.0: NON-COMMERCIAL use only, share alike, attribution",
+        "shown whenever the imagery is. EOX permits offline packs inside an",
+        "application, not redistribution of the raw tiles -- so the pack is",
+        "gitignored and rebuilt locally (see the README).",
+        "",
+        "URL VERIFIED 2026-10-27 from WMTSCapabilities.xml: layer",
+        "s2cloudless-2023_3857, TileMatrixSet g, template",
+        ".../{TileMatrixSet}/{TileMatrix}/{TileRow}/{TileCol}.jpg, i.e. z, y,",
+        "x. Note the y before x. The file says http://, which redirects to",
+        "this https:// address.",
+        "",
+        "rate_limit (requests/s) and max_tiles (per job, not liftable with",
+        "--force) apply to tools/fetch_tiles.py."
+      ]
     }
 
   ],

@@ -184,6 +184,27 @@ OSM_CONTACT_HELP = ("Your email address or a URL where OpenStreetMap's "
                     "of every OSM tile request, as their tile usage policy "
                     "asks.")
 
+#: The map_settings.json field holding a contact for bulk tile downloads
+#: (tools/fetch_tiles.py puts it in the User-Agent). Empty until filled in.
+TILE_CONTACT_FIELD = "tile_contact"
+TILE_CONTACT_HELP = ("Your email address or a URL where a tile provider can "
+                     "reach you. Sent in the User-Agent when tools/"
+                     "fetch_tiles.py downloads an offline pack.")
+
+#: Sentinel-2 cloudless by EOX. CC BY-NC-SA 4.0: non-commercial use only,
+#: share alike, and this attribution whenever the imagery is shown.
+S2CLOUDLESS_NAME = "Sentinel-2 cloudless 2023 (EOX)"
+S2CLOUDLESS_ATTRIBUTION = ("Sentinel-2 cloudless - https://s2maps.eu by EOX IT "
+                           "Services GmbH (Contains modified Copernicus "
+                           "Sentinel data 2023)")
+#: Verified against https://tiles.maps.eox.at/wmts/1.0.0/WMTSCapabilities.xml
+#: on 2026-10-27: layer s2cloudless-2023_3857, TileMatrixSet "g" (Web
+#: Mercator, 256 px, 2^z x 2^z), ResourceURL template
+#: .../{TileMatrixSet}/{TileMatrix}/{TileRow}/{TileCol}.jpg -- z, then y,
+#: then x. The file gives http://; that answers 302 to the https:// form.
+S2CLOUDLESS_URL = ("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/"
+                   "default/g/{z}/{y}/{x}.jpg")
+
 #: Used when map_sources.json is missing or unreadable. Offline first.
 BUILTIN_SOURCES: List[Dict[str, Any]] = [
     {
@@ -217,6 +238,21 @@ BUILTIN_SOURCES: List[Dict[str, Any]] = [
         "min_zoom": 1,
         "max_zoom": 19,
         "bulk_download": False,
+    },
+    {
+        "name": S2CLOUDLESS_NAME,
+        "type": "xyz",
+        "url": S2CLOUDLESS_URL,
+        "attribution": S2CLOUDLESS_ATTRIBUTION,
+        "min_zoom": 0,
+        # About 10 m per pixel; z14 is ~9.5 m/px at the launch site. Deeper
+        # is overzoomed from z14 by the map rather than fetched.
+        "max_zoom": 14,
+        # EOX permits offline packs inside an application for non-commercial
+        # use; tools/fetch_tiles.py may build one, gently.
+        "bulk_download": True,
+        "rate_limit": 1.0,
+        "max_tiles": 4000,
     },
 ]
 
@@ -313,6 +349,10 @@ class MapSource:
     #: Seconds to wait for a tile body. Per source because a WMS that renders
     #: on demand is far slower than a static tile server.
     read_timeout: float = TILE_READ_TIMEOUT_S
+    #: Most requests per second tools/fetch_tiles.py may make; 0 = its default.
+    rate_limit: float = 0.0
+    #: Hard cap on tiles per fetch_tiles job, not overridable; 0 = none.
+    max_tiles: int = 0
 
     @property
     def api_key(self) -> str:
@@ -372,6 +412,8 @@ def load_sources(base_dir: str = ".") -> Tuple[List[MapSource], str]:
             bulk_download=bool(entry.get("bulk_download", False)),
             read_timeout=float(entry.get("read_timeout",
                                          TILE_READ_TIMEOUT_S)),
+            rate_limit=float(entry.get("rate_limit", 0.0) or 0.0),
+            max_tiles=int(entry.get("max_tiles", 0) or 0),
         ))
     if not sources:
         sources = [MapSource(**{k: v for k, v in BUILTIN_SOURCES[0].items()})]
