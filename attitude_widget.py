@@ -55,9 +55,13 @@ fail to start because a 3D toy could not initialise.
 
 from __future__ import annotations
 
+import itertools
+import json
 import math
 import os
-from typing import List, Optional, Sequence, Tuple
+import time
+from collections import deque
+from typing import Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt5.QtCore import Qt, QPointF, QRectF
@@ -198,7 +202,9 @@ def _model_shader():
 # Tunables
 # ---------------------------------------------------------------------------
 
-ATTITUDE_RENDER_HZ = 20
+#: Render tick. The model is drawn from the playback clock, not from packet
+#: arrival, so this is the frame rate of the motion itself.
+ATTITUDE_RENDER_HZ = 30
 
 #: Default camera framing, chosen at the MAXIMISED window size, which is how
 #: this dashboard is run.
@@ -237,10 +243,39 @@ ACCEL_GATE_HI = 1.25
 
 GRAVITY_MS2 = 9.80665
 
-#: Clamp on the integration step.  After a link dropout the next packet can
-#: carry a timestamp seconds later; integrating that in one step would spin the
-#: model wildly, so the gap is capped.
-MAX_DT_S = 0.25
+# --- packet timing ------------------------------------------------------------
+# The flight computer sends a frame every 300 ms and routes them by
+# packet_count % 3: 1 to RX1, 2 to RX2, 0 to LoRa, which this station does not
+# ingest. So two of every three frames arrive and the gaps alternate 300 ms and
+# 600 ms; one lost frame makes a 900 ms gap, two lost in a row 1.2 s. All of
+# those are ordinary SIMO operation and must be integrated in full -- the old
+# 0.25 s clamp cut every one of them short, by 17 % on a 300 ms gap and 58 % on
+# a 600 ms gap, so the apparent spin rate alternated with the gap pattern.
+
+#: Longest step integrated as it is: covers the 300/600 ms SIMO pattern and
+#: up to two lost frames in a row (1.2 s). A gap between this and
+#: DROPOUT_GAP_S is integrated as MAX_DT_S.
+MAX_DT_S = 1.2
+#: A gap longer than this is a link dropout, not a SIMO gap. The body rate over
+#: it is unknown, so only the last normal interval is integrated -- one stale
+#: rate held for seconds would spin the model.
+DROPOUT_GAP_S = 1.5
+#: Frame period of the flight computer, used as the "last normal interval"
+#: before one has been seen.
+NOMINAL_FRAME_S = 0.3
+
+# --- smooth playback ----------------------------------------------------------
+#: The model is shown this far behind the newest packet, so there is always a
+#: newer keyframe to interpolate towards. Must exceed the longest regular gap
+#: (600 ms) with margin; one lost frame (900 ms) holds briefly instead.
+PLAYBACK_DELAY_S = 0.8
+#: Playback-clock error tolerated before it is corrected.
+PLAYBACK_DRIFT_S = 0.3
+#: Correction is a rate change of at most this fraction -- never a jump.
+PLAYBACK_MAX_RATE_ADJUST = 0.05
+#: Keyframes retained for playback. ~20 s at two frames per 0.9 s; bounded so
+#: a long session costs the same memory as a short one.
+KEYFRAME_HISTORY = 48
 
 # --- gyro bias estimation ---------------------------------------------------
 # A real MEMS gyro reads a constant non-zero rate when it is perfectly still --
@@ -252,15 +287,17 @@ MAX_DT_S = 0.25
 # The fix is what every flight computer does: while the vehicle is demonstrably
 # stationary, average the gyro and subtract that average from then on.
 
-#: EMA weight for the running bias estimate. ~150 samples (7.5 s at 20 Hz) to
-#: converge -- slow enough that a genuine slow rotation is not absorbed as bias.
-BIAS_ALPHA = 0.02
+#: Time constant of the running bias estimate, seconds. Applied per unit time
+#: (alpha = 1 - exp(-dt / tau)), so it converges equally fast at 20 Hz or at
+#: the ~2.2 packets/s this station receives. Slow enough that a genuine slow
+#: rotation is not absorbed as bias.
+BIAS_TAU_S = 7.5
 #: Body rate below which the vehicle may be considered at rest, deg/s.
 BIAS_MAX_RATE_DPS = 6.0
 #: Specific-force window for "at rest", in g.
 BIAS_ACCEL_LO, BIAS_ACCEL_HI = 0.85, 1.15
-#: Samples of stationary averaging before the estimate is reported as settled.
-BIAS_SETTLE_SAMPLES = 60
+#: Accumulated time at rest before the estimate is reported as settled.
+BIAS_SETTLE_S = 5.0
 
 # Palette, matched to dashboard_ui.py.
 COL_PANEL = "#e9edf3"   # daylight: light plot ground
@@ -339,6 +376,45 @@ def quat_to_euler_deg(q: np.ndarray) -> Tuple[float, float, float]:
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
+def quat_from_rotvec(phi: np.ndarray) -> np.ndarray:
+    """Exponential map: the unit quaternion of rotation vector *phi* (rad).
+
+    Exact for any angle, including half a turn or more in one step, which a
+    first-order ``q + q_dot * dt`` is not.
+    """
+    theta = float(np.linalg.norm(phi))
+    if theta < 1e-12:
+        # sin(theta/2)/theta -> 1/2; renormalised anyway.
+        return quat_normalise(np.array([1.0, *(0.5 * phi)]))
+    half = 0.5 * theta
+    return np.array([math.cos(half), *(math.sin(half) / theta * phi)])
+
+
+def quat_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    """Smallest rotation angle between two orientations, degrees."""
+    dot = abs(float(np.dot(a, b)))
+    return math.degrees(2.0 * math.acos(min(1.0, dot)))
+
+
+def quat_slerp(a: np.ndarray, b: np.ndarray, u: float) -> np.ndarray:
+    """Spherical linear interpolation, shortest path, *u* in [0, 1].
+
+    Returns copies of *a* and *b* themselves at the end points, exactly.
+    """
+    if u <= 0.0:
+        return a.copy()
+    if u >= 1.0:
+        return b.copy()
+    dot = float(np.dot(a, b))
+    if dot < 0.0:
+        b, dot = -b, -dot
+    if dot > 0.9995:
+        return quat_normalise(a + u * (b - a))
+    theta = math.acos(min(1.0, dot))
+    return ((math.sin((1.0 - u) * theta) * a + math.sin(u * theta) * b)
+            / math.sin(theta))
+
+
 # ---------------------------------------------------------------------------
 # Estimator
 # ---------------------------------------------------------------------------
@@ -358,80 +434,140 @@ class AttitudeEstimator:
       bounding their drift.  This term comes from the accelerometer, so while it
       is enabled the model can move even with the gyro at zero.
 
+    Each step integrates the trapezoid mean of the previous and the current
+    bias-corrected rate over the interval, through the exact exponential map,
+    and appends a keyframe to a short bounded history that
+    :class:`AttitudePlayback` interpolates for a smooth display.
+
     Pure computation, no Qt.  Kept separate from the widget so it can be unit
     tested and so a future firmware-side estimator could replace it without
     touching the rendering code.
     """
 
-    __slots__ = ("q", "_last_t", "accel_valid", "samples", "corrected",
+    __slots__ = ("q", "_last_t", "_last_recv", "_prev_raw", "_last_normal_dt",
+                 "accel_valid", "samples", "corrected", "dropouts",
                  "use_accel_reference", "auto_bias", "bias", "bias_samples",
-                 "at_rest")
+                 "rest_time_s", "at_rest", "timeline_s", "keyframes", "epoch")
 
     def __init__(self, use_accel_reference: bool = False,
                  auto_bias: bool = True) -> None:
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])
-        self._last_t: Optional[float] = None
-        self.accel_valid = False   # was the last sample inside the gravity gate
-        self.samples = 0
-        self.corrected = 0
         #: When False the estimate is a pure integral of the telemetry gyro.
         self.use_accel_reference = bool(use_accel_reference)
         #: Subtract an auto-learned turn-on bias from the raw gyro.
         self.auto_bias = bool(auto_bias)
-        #: Running gyro bias estimate, deg/s, one per axis.
-        self.bias = np.zeros(3)
-        self.bias_samples = 0
-        self.at_rest = False
+        #: ``(time_s, q, rotvec)`` per update, oldest first. *rotvec* is the
+        #: body-frame rotation since the previous keyframe (None after a reset
+        #: or a dropout), so interpolation can follow the integrated path even
+        #: through a step of more than half a turn.
+        self.keyframes: Deque[Tuple[float, np.ndarray, Optional[np.ndarray]]] = \
+            deque(maxlen=KEYFRAME_HISTORY)
+        #: Bumped on every discontinuity (reset, cleared history, dropout), so
+        #: a playback clock knows to re-anchor rather than glide.
+        self.epoch = 0
+        self.reset()
 
     def reset(self) -> None:
-        """Re-zero the estimate (clears accumulated drift).
+        """Re-zero the estimate (clears accumulated drift) and the history.
 
         Deliberately leaves :attr:`use_accel_reference` alone -- resetting the
         orientation should not silently change the filter mode.
         """
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
-        self._last_t = None
-        self.accel_valid = False
+        self._last_t: Optional[float] = None
+        self._last_recv: Optional[float] = None
+        self._prev_raw: Optional[np.ndarray] = None
+        self._last_normal_dt = NOMINAL_FRAME_S
+        self.accel_valid = False   # was the last sample inside the gravity gate
         self.samples = 0
         self.corrected = 0
+        self.dropouts = 0
         # Re-arm bias learning: RESET is what an operator presses between bench
         # runs, which is exactly when a fresh zero should be taken.
+        #: Running gyro bias estimate, deg/s, one per axis.
         self.bias = np.zeros(3)
         self.bias_samples = 0
+        #: Seconds of rest that have gone into :attr:`bias`.
+        self.rest_time_s = 0.0
         self.at_rest = False
+        #: Playback time axis: the mission time while it advances, carried on
+        #: by receive time when it does not, so it never runs backwards.
+        self.timeline_s: Optional[float] = None
+        self.clear_history()
+
+    def clear_history(self) -> None:
+        """Drop the keyframes but keep the orientation (new logging session)."""
+        self.keyframes.clear()
+        self.epoch += 1
 
     @property
     def bias_settled(self) -> bool:
-        """True once enough stationary samples have been averaged to trust it."""
-        return self.bias_samples >= BIAS_SETTLE_SAMPLES
+        """True once enough time at rest has been averaged to trust it."""
+        return self.rest_time_s >= BIAS_SETTLE_S
+
+    def _elapsed(self, timestamp_s: float,
+                 recv_s: Optional[float]) -> Optional[float]:
+        """Time since the previous sample, or None if it cannot be known.
+
+        Mission time first. If it is not finite or does not advance -- a
+        flight-computer reboot restarts it -- the ground receive time stands in.
+        """
+        elapsed = None
+        if (self._last_t is not None and math.isfinite(timestamp_s)
+                and timestamp_s > self._last_t):
+            elapsed = timestamp_s - self._last_t
+        elif (recv_s is not None and self._last_recv is not None
+              and math.isfinite(recv_s) and recv_s > self._last_recv):
+            elapsed = recv_s - self._last_recv
+        if math.isfinite(timestamp_s):
+            self._last_t = timestamp_s
+        if recv_s is not None and math.isfinite(recv_s):
+            self._last_recv = recv_s
+        return elapsed
 
     def update(self, gyro_dps: Tuple[float, float, float],
                accel_ms2: Tuple[float, float, float],
-               timestamp_s: float) -> None:
+               timestamp_s: float, recv_s: Optional[float] = None) -> None:
         """Advance the estimate using one telemetry sample.
 
         *timestamp_s* is the packet mission time; dt is derived from successive
         packets so the estimate stays correct regardless of GUI frame rate.
+        *recv_s* is the ground receive time, used only when the mission time
+        gives no interval.
         """
         gx, gy, gz = (v if math.isfinite(v) else 0.0 for v in gyro_dps)
-
-        if self._last_t is None or not math.isfinite(timestamp_s):
-            self._last_t = timestamp_s if math.isfinite(timestamp_s) else None
-            return
-        dt = timestamp_s - self._last_t
-        self._last_t = timestamp_s
-        if dt <= 0.0:
-            # Non-monotonic or duplicated timestamp: nothing sensible to do.
-            return
-        dt = min(dt, MAX_DT_S)
-
-        self.samples += 1
-
         # Body rate straight from the telemetry, and nothing else.  In the
         # default (pure gyro) mode this is the *only* term that reaches the
         # integrator, so zero on all three axes means the orientation is held
         # exactly still and the rotation rate tracks GYRO_X/Y/Z one to one.
         raw = np.array([gx, gy, gz])
+
+        first = self.timeline_s is None
+        elapsed = self._elapsed(timestamp_s, recv_s)
+        if first:
+            self.timeline_s = timestamp_s if math.isfinite(timestamp_s) else 0.0
+            self._prev_raw = raw
+            self.keyframes.append((self.timeline_s, self.q.copy(), None))
+            return
+        if elapsed is None:
+            # Duplicated or non-monotonic, and no receive time to fall back
+            # on: nothing sensible to integrate.
+            return
+
+        dropout = elapsed > DROPOUT_GAP_S
+        if dropout:
+            # The rate over the gap is unknown. Integrate one normal interval
+            # on the newest rate only, and tell the playback to re-anchor.
+            dt = self._last_normal_dt
+            prev_raw = raw
+            self.dropouts += 1
+            self.epoch += 1
+        else:
+            dt = min(elapsed, MAX_DT_S)
+            self._last_normal_dt = dt
+            prev_raw = self._prev_raw if self._prev_raw is not None else raw
+        self._prev_raw = raw
+        self.timeline_s += elapsed
+        self.samples += 1
 
         ax, ay, az = (v if math.isfinite(v) else 0.0 for v in accel_ms2)
         accel = np.array([ax, ay, az])
@@ -442,18 +578,23 @@ class AttitudeEstimator:
         # Learn only while the vehicle is demonstrably at rest: gravity-only
         # specific force AND a body rate small enough that it cannot be real
         # motion. In flight neither holds, so the estimate freezes at whatever
-        # was learned on the pad -- which is the value that matters.
+        # was learned on the pad -- which is the value that matters. Weighted
+        # by time rather than by sample, so the packet rate does not matter.
         g_ratio = norm / GRAVITY_MS2 if norm > 1e-6 else 0.0
         self.at_rest = (
             BIAS_ACCEL_LO <= g_ratio <= BIAS_ACCEL_HI
             and float(np.max(np.abs(raw - self.bias))) < BIAS_MAX_RATE_DPS
         )
         if self.auto_bias and self.at_rest:
-            self.bias += BIAS_ALPHA * (raw - self.bias)
+            alpha = 1.0 - math.exp(-dt / BIAS_TAU_S)
+            self.bias += alpha * (raw - self.bias)
             self.bias_samples += 1
+            self.rest_time_s += dt
 
-        corrected_dps = raw - self.bias if self.auto_bias else raw
-        omega = np.radians(corrected_dps)
+        bias = self.bias if self.auto_bias else np.zeros(3)
+        # Trapezoid rule: the mean of the rate at the start and at the end of
+        # the interval, both corrected with the current bias estimate.
+        omega = np.radians(0.5 * ((prev_raw - bias) + (raw - bias)))
 
         # --- optional gravity reference (Mahony proportional correction) -----
         # Off by default.  This term is derived from the accelerometer, not the
@@ -471,14 +612,20 @@ class AttitudeEstimator:
                 predicted = quat_to_matrix(self.q).T @ np.array([0.0, 0.0, 1.0])
                 # Rotation error as a vector; small-angle => cross product.
                 error = np.cross(measured, predicted)
-                omega = omega + MAHONY_KP * error
+                # Per unit time: over dt the correction removes the fraction
+                # 1 - exp(-Kp * dt) of the error whatever the packet rate. A
+                # plain Kp * error * dt overshoots once Kp * dt > 1, which a
+                # 900 ms gap reaches.
+                gain = (1.0 - math.exp(-MAHONY_KP * dt)) / dt
+                omega = omega + gain * error
                 self.accel_valid = True
                 self.corrected += 1
 
-        # --- quaternion integration ----------------------------------------
-        # q_dot = 0.5 * q (x) [0, omega]
-        q_dot = 0.5 * quat_multiply(self.q, np.array([0.0, *omega]))
-        self.q = quat_normalise(self.q + q_dot * dt)
+        # --- quaternion integration: the exact rotation increment ------------
+        phi = omega * dt
+        self.q = quat_normalise(quat_multiply(self.q, quat_from_rotvec(phi)))
+        self.keyframes.append((self.timeline_s, self.q.copy(),
+                               None if dropout else phi))
 
     # -- outputs -----------------------------------------------------------
 
@@ -489,6 +636,105 @@ class AttitudeEstimator:
     @property
     def euler_deg(self) -> Tuple[float, float, float]:
         return quat_to_euler_deg(self.q)
+
+
+# ---------------------------------------------------------------------------
+# Playback
+# ---------------------------------------------------------------------------
+
+class AttitudePlayback:
+    """Turns about two keyframes a second into continuous motion.
+
+    A playback clock runs :data:`PLAYBACK_DELAY_S` behind the newest keyframe
+    and advances with the wall clock; the displayed attitude is interpolated
+    between the keyframes either side of it. Its target is the newest
+    keyframe's time, plus the wall time since that keyframe arrived, minus the
+    delay -- a line advancing at wall rate between packets rather than a
+    staircase that steps 300 or 600 ms on each one.
+
+    * Drift beyond :data:`PLAYBACK_DRIFT_S` is corrected by running the clock
+      up to :data:`PLAYBACK_MAX_RATE_ADJUST` fast or slow, never by a jump.
+    * It jumps only when the estimator reports a discontinuity: a reset, a
+      cleared history or a link dropout.
+    * It never passes the newest keyframe, so when packets stop the model
+      holds the last attitude. Nothing is extrapolated.
+
+    Pure computation: the caller supplies the wall clock.
+    """
+
+    def __init__(self, delay_s: float = PLAYBACK_DELAY_S) -> None:
+        self.delay_s = delay_s
+        #: Re-anchoring jumps so far (reset, dropout), for diagnostics.
+        self.jumps = 0
+        self.reset()
+
+    def reset(self) -> None:
+        self.clock: Optional[float] = None
+        self.rate = 1.0
+        self._last_wall: Optional[float] = None
+        self._arrival_wall = 0.0
+        self._arrival_time: Optional[float] = None
+        self._epoch: Optional[int] = None
+
+    def sample(self, estimator: AttitudeEstimator, wall_s: float) -> np.ndarray:
+        """The attitude to display at wall time *wall_s*."""
+        keyframes = estimator.keyframes
+        if not keyframes:
+            self.reset()
+            return estimator.q.copy()
+        newest_t = keyframes[-1][0]
+        if self._arrival_time != newest_t:
+            # A keyframe that is new since the last frame arrived about now.
+            self._arrival_time = newest_t
+            self._arrival_wall = wall_s
+        target = newest_t + (wall_s - self._arrival_wall) - self.delay_s
+
+        if self.clock is None or self._epoch != estimator.epoch:
+            if self.clock is not None:
+                self.jumps += 1
+            self.clock = target
+            self.rate = 1.0
+            self._epoch = estimator.epoch
+        else:
+            self.clock += max(0.0, wall_s - self._last_wall) * self.rate
+            error = target - self.clock
+            if abs(error) > PLAYBACK_DRIFT_S:
+                self.rate = 1.0 + math.copysign(PLAYBACK_MAX_RATE_ADJUST, error)
+            elif abs(error) < 0.25 * PLAYBACK_DRIFT_S:
+                self.rate = 1.0
+        self._last_wall = wall_s
+        # Hold, never extrapolate.
+        self.clock = min(self.clock, newest_t)
+        return interpolate_keyframes(keyframes, self.clock)
+
+
+def interpolate_keyframes(keyframes, t: float) -> np.ndarray:
+    """Attitude at time *t* from ``(time, q, rotvec)`` keyframes.
+
+    Before the first keyframe it is the first, after the last the last. In
+    between it follows that interval's integrated rotation, scaled by the
+    fraction of the interval -- which is exactly the slerp between the two
+    keyframes whenever the step is under half a turn, and still turns the
+    right way when a fast spin makes it more (plain slerp would take the
+    short way round, backwards).
+    """
+    first_t, first_q, _ = keyframes[0]
+    if t <= first_t:
+        return first_q.copy()
+    previous = keyframes[0]
+    for frame in itertools.islice(keyframes, 1, None):
+        t1, q1, phi = frame
+        if t <= t1:
+            t0, q0, _ = previous
+            span = t1 - t0
+            u = (t - t0) / span if span > 0.0 else 1.0
+            if u >= 1.0:
+                return q1.copy()
+            if phi is None:
+                return quat_slerp(q0, q1, u)
+            return quat_normalise(quat_multiply(q0, quat_from_rotvec(u * phi)))
+        previous = frame
+    return keyframes[-1][1].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -1140,10 +1386,10 @@ class AttitudeWidget(QWidget):
         if not est.auto_bias:
             state = "auto-zero OFF"
         elif est.bias_settled:
-            state = "settled (%d stationary samples)" % est.bias_samples
+            state = "settled (%.1f s at rest)" % est.rest_time_s
         elif est.bias_samples:
-            state = "learning (%d/%d samples)" % (est.bias_samples,
-                                                  BIAS_SETTLE_SAMPLES)
+            state = "learning (%.1f / %.1f s at rest)" % (est.rest_time_s,
+                                                          BIAS_SETTLE_S)
         else:
             state = "not learned yet - hold the vehicle still"
         self.rpy_label.setToolTip(
