@@ -1156,8 +1156,9 @@ class MapCanvas(QWidget):
         #: (name, lat, lon) of the launch pad, or None. Marked on the map,
         #: and the range origin whenever no ground station is set.
         self.launch_pad: Optional[Tuple[str, float, float]] = None
-        #: Set by the paint that drew the launch-pad marker (for tests).
+        #: Set by the paint that drew the launch-pad marker / rings (tests).
         self.pad_drawn = False
+        self.rings_drawn = False
         self.paint_errors = 0
         self._last_paint_error = ""
 
@@ -1432,6 +1433,7 @@ class MapCanvas(QWidget):
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.fillRect(self.rect(), QColor(COL_BG))
             self._draw_base(painter)
+            self._draw_rings(painter)
             self._draw_tracks(painter)
             self._draw_launch_pad(painter)
             self._draw_ground_station(painter)
@@ -1481,12 +1483,22 @@ class MapCanvas(QWidget):
                        (bottom_right[0], bottom_right[1]),
                        lambda lon, lat: self._lonlat_to_pixel(lon, lat))
         draw_north_arrow(painter, self.width(), self.height())
+
+    def _draw_rings(self, painter: QPainter) -> None:
+        """Range rings around the ground station, or the launch pad.
+
+        Drawn above the base layer, not with the grid beneath it: under a
+        tile pack or an image they were simply painted over.
+        """
         origin = self.range_origin
-        if origin is not None and self.show_rings:
-            lat, lon = origin
-            draw_range_rings(painter, lat, lon,
-                             lambda a, b: self._lonlat_to_pixel(a, b),
-                             metres_per_pixel(self.center_lat, self.zoom))
+        if origin is None or not self.show_rings:
+            return
+        lat, lon = origin
+        draw_range_rings(painter, lat, lon,
+                         lambda a, b: self._lonlat_to_pixel(a, b),
+                         metres_per_pixel(self.center_lat, self.zoom),
+                         halo=self.pack.kind in ("mbtiles", "image"))
+        self.rings_drawn = True
 
     def _draw_tiles(self, painter: QPainter) -> None:
         ox, oy = self._origin()
@@ -1535,6 +1547,10 @@ class MapCanvas(QWidget):
                     # underneath still gives coordinates.
                     painter.fillRect(rect, QColor(198, 206, 217, 210))
                     painter.setPen(QColor(COL_DIM))
+                    # Outline only. drawRect also fills with whatever brush
+                    # the previous layer left set (the north arrow's), which
+                    # painted every missing tile dark over the graticule.
+                    painter.setBrush(Qt.NoBrush)
                     painter.drawRect(rect.adjusted(0, 0, -1, -1))
                     painter.drawText(rect, Qt.AlignCenter,
                                      "no tile\nz%d" % self.zoom)
@@ -1734,6 +1750,11 @@ class MapCanvas(QWidget):
                 break
         width = int(nice / mpp)
         x0, y0 = 12, self.height() - 18
+        # A pale backing, as the attribution has: over satellite imagery a
+        # bare dark line and label are close to invisible.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 200))
+        painter.drawRect(x0 - 6, y0 - 22, width + 12, 30)
         painter.setPen(QPen(QColor(COL_TEXT), 2))
         painter.drawLine(x0, y0, x0 + width, y0)
         painter.drawLine(x0, y0 - 5, x0, y0 + 2)
@@ -1957,8 +1978,12 @@ class MapWindow(QDialog):
                 self.pack_combo.addItem("%s  (online)" % source.name)
         self.pack_combo.blockSignals(False)
 
+        # Signals blocked: this is the startup default, not the operator's
+        # choice, and must not be remembered as one.
         index = self._default_pack_index()
+        self.pack_combo.blockSignals(True)
         self.pack_combo.setCurrentIndex(index)
+        self.pack_combo.blockSignals(False)
         self._on_pack(index)
 
     def _default_pack_index(self) -> int:

@@ -188,11 +188,14 @@ def draw_north_arrow(painter: QPainter, width: int, height: int) -> None:
 
 def draw_range_rings(painter: QPainter, lat: float, lon: float,
                      to_pixel, metres_per_px: float,
-                     rings: Sequence[float] = RANGE_RINGS_M) -> None:
+                     rings: Sequence[float] = RANGE_RINGS_M,
+                     halo: bool = False) -> None:
     """Range rings around the ground station, labelled in metres.
 
     The operator's real question on the pad is "how far away is it, and
-    which way", and a ring answers the first at a glance.
+    which way", and a ring answers the first at a glance. *halo* adds a pale
+    outline under each ring and label, for drawing over imagery, where a
+    thin dashed line alone disappears into fields and rivers.
     """
     if metres_per_px <= 0 or not math.isfinite(metres_per_px):
         return
@@ -207,11 +210,19 @@ def draw_range_rings(painter: QPainter, lat: float, lon: float,
         radius = metres / metres_per_px
         if radius < 18 or radius > 6000:
             continue           # too small to read, or far off the screen
+        label = "%d m" % metres if metres < 1000 else "%g km" % (metres / 1000.0)
+        at = QPointF(centre.x() + 3, centre.y() - radius - 3)
+        if halo:
+            painter.setPen(QPen(QColor(255, 255, 255, 170), 3.0))
+            painter.drawEllipse(centre, radius, radius)
+            metrics = painter.fontMetrics()
+            painter.fillRect(int(at.x()) - 2, int(at.y()) - metrics.ascent(),
+                             metrics.horizontalAdvance(label) + 4,
+                             metrics.height(), QColor(255, 255, 255, 200))
         painter.setPen(pen)
         painter.drawEllipse(centre, radius, radius)
         painter.setPen(QColor(GRID_LABEL))
-        label = "%d m" % metres if metres < 1000 else "%g km" % (metres / 1000.0)
-        painter.drawText(QPointF(centre.x() + 3, centre.y() - radius - 3), label)
+        painter.drawText(at, label)
 
 
 # ---------------------------------------------------------------------------

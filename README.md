@@ -99,13 +99,28 @@ at startup, and the pack selected on open is always an offline one.
 ### Map packs
 
 The **Map pack** dropdown lists everything found in `assets/maps/`, plus the
-grid. Your choice is remembered in `map_settings.json`. A pack that will not
-load falls back to the grid with a line in the event log - never an error
-dialog, never an exception.
+grid. A pack you pick from the list is remembered in `map_settings.json`;
+until you pick one, the map opens on the best offline map it has - a tile
+pack covering the launch pad, then any tile pack, then a vector or image
+pack, and only then the grid. A pack that will not load falls back to the
+grid with a line in the event log - never an error dialog, never an
+exception.
+
+**Launch pad.** `map_settings.json` holds
+`"launch_pad": {"name": "Launch pad", "lat": 26.720028, "lon": 84.304583}`
+(26° 43' 12.1" N, 84° 18' 16.5" E), written on first run; edit it there. The
+pad is drawn as a labelled orange diamond, the map opens over it, and while
+no ground station position is set (GS **show** unticked) the range rings and
+each vehicle's distance and bearing are measured from the pad.
+
+**Overzoom.** Zooming past the deepest level a pack or source has draws the
+parent tile scaled up - up to 3 levels beyond it - instead of grey squares,
+and the status bar says `overzoomed x2 from z14` (x4, x8). Further than that
+it shows grey and says so. Scaled tiles live in memory only.
 
 | Pack kind | What it is | Needs |
 |---|---|---|
-| **Grid only** | Lat/lon graticule labelled in degrees and minutes, scale bar, north arrow, and range rings at 250 m / 500 m / 1 km / 2 km around the ground station. Always available. | nothing |
+| **Grid only** | Lat/lon graticule labelled in degrees and minutes, scale bar, north arrow, and range rings at 250 m / 500 m / 1 km / 2 km around the ground station (or the launch pad when none is set). Always available. | nothing |
 | **Vector** (`*.osmpack.json`) | OpenStreetMap roads, buildings, water, rail, landuse and place names, rendered by this application. | `tools/fetch_osm_vectors.py`, once, at home |
 | **Tiles** (`*.mbtiles`) | A raster tile pack. | `tools/fetch_tiles.py`, QGIS or MOBAC |
 | **Image** (`NAME.png` + `NAME.json`) | Your own satellite or scanned-map image, georeferenced. | you supply it |
@@ -202,12 +217,43 @@ python tools/fetch_tiles.py \
     --out assets/maps/jammu.mbtiles
 ```
 
-Rate limited (2 req/s), resumable, refuses jobs over 20,000 tiles without
-`--force`, and **refuses any source not explicitly marked
+Rate limited (2 req/s, or a source's own `rate_limit` if lower), one request
+at a time, resumable, backs off on HTTP 429/503, refuses jobs over 20,000
+tiles without `--force` (and over a source's own `max_tiles` even with it),
+and **refuses any source not explicitly marked
 `"bulk_download": true`** in `map_sources.json`, naming the reason. The OSMF
 Tile Usage Policy forbids bulk downloading from `tile.openstreetmap.org`, so
 that source is refused by default. Read a provider's terms yourself before
-setting that flag.
+setting that flag. The User-Agent carries `tile_contact` from
+`map_settings.json` - **fill it in** with an email or URL where a provider
+can reach you.
+
+### Satellite pack for the launch pad (Sentinel-2 cloudless)
+
+100 km x 100 km around the launch pad (50 km each way), zoom 8-14, from
+EOX's *Sentinel-2 cloudless 2023* (about 10 m per pixel; the map overzooms
+past z14):
+
+```bash
+python tools/fetch_tiles.py \
+    --bbox 83.8012 26.2704 84.8080 27.1697 \
+    --zoom 8 14 \
+    --source "Sentinel-2 cloudless 2023 (EOX)" \
+    --name "Launch pad 100 km - Sentinel-2 cloudless 2023" \
+    --out assets/maps/launchpad_s2.mbtiles
+```
+
+3,016 tiles (z8 4, z9 6, z10 16, z11 49, z12 156, z13 576, z14 2,209) at
+1 request per second: **about 50 minutes**, giving a file of about
+@@SIZE@@. Interrupt it whenever you like; the same command resumes. The map
+picks the pack automatically when it is present.
+
+**Licence: CC BY-NC-SA 4.0 - non-commercial use only, share alike, and the
+attribution shown whenever the imagery is.** The map shows
+"Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (Contains
+modified Copernicus Sentinel data 2023)". EOX allows offline packs inside an
+application but not redistribution of the raw tiles, so the `.mbtiles` is
+gitignored: build it on each machine with the command above.
 
 **Or build the pack in a GUI**, which is often easier and is the only route
 for providers this tool refuses:
