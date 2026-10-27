@@ -39,10 +39,19 @@ Roll and pitch are bounded by the gravity reference and do not drift.
 THREADING
 ---------
 Consistent with the rest of the application: :meth:`AttitudeWidget.on_packet`
-is a plain slot called from the GUI thread, does only cheap arithmetic, and
-sets a dirty flag.  The 3D scene is redrawn by a timer at
-:data:`ATTITUDE_RENDER_HZ`, so a 20 Hz packet rate or a burst after a dropout
-costs the same number of redraws.
+is a plain slot called from the GUI thread and does only cheap arithmetic.
+The scene is redrawn by a timer at :data:`ATTITUDE_RENDER_HZ`, so a burst of
+packets after a dropout costs the same number of redraws as a steady stream.
+
+SMOOTH PLAYBACK
+---------------
+Packets arrive about twice a second (two of every three 300 ms frames; see
+:data:`MAX_DT_S`), and drawing each one as it lands moves the model in steps.
+With SMOOTH on, :class:`AttitudePlayback` shows the model
+:data:`PLAYBACK_DELAY_S` behind the newest packet and interpolates between
+keyframes on a wall-clock driven playback clock, so it moves continuously at
+the true rate. It holds the last attitude when packets stop; it never
+extrapolates.
 
 GRACEFUL DEGRADATION
 --------------------
@@ -67,6 +76,7 @@ import numpy as np
 from PyQt5.QtCore import Qt, QPointF, QRectF
 from PyQt5.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -1088,12 +1098,25 @@ class _AttitudeFallbackView(QWidget):
 class AttitudeWidget(QWidget):
     """Vehicle attitude panel: 3D model, axis overlay, readouts and reset."""
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None,
+                 settings_path: Optional[str] = None,
+                 use_gl: bool = True) -> None:
         super().__init__(parent)
         self.estimator = AttitudeEstimator()
+        self.playback = AttitudePlayback()
+        #: Wall clock for the playback. Replaceable so tests can drive time.
+        self.clock = time.monotonic
+        #: The settings file the SMOOTH choice is kept in, if it exists.
+        self.settings_path = settings_path
+        self.smooth = self._load_smooth_setting()
+        #: The quaternion currently on screen; a frame is drawn only when the
+        #: one to display differs from it.
+        self.shown_q: Optional[np.ndarray] = None
+        self.frames_drawn = 0
         self._dirty = False
         self._payload_type = ""
         self._mesh_kind = ""
+        self._use_gl = bool(use_gl)
         self.gl_available = False
 
         self.view = None            # GLViewWidget, when available
@@ -1115,7 +1138,7 @@ class AttitudeWidget(QWidget):
 
     def _build_view(self) -> QWidget:
         """Create the 3D view, or the 2D fallback if OpenGL is unavailable."""
-        if _GL_IMPORT_OK:
+        if _GL_IMPORT_OK and self._use_gl:
             try:
                 view = gl.GLViewWidget()
                 view.setCameraPosition(distance=CAMERA_DISTANCE,
@@ -1155,6 +1178,8 @@ class AttitudeWidget(QWidget):
                 return view
             except Exception as exc:  # pragma: no cover - driver dependent
                 reason = str(exc)
+        elif not self._use_gl:
+            reason = "OpenGL view disabled"
         else:
             reason = _GL_IMPORT_ERROR or "pyqtgraph.opengl unavailable"
 
@@ -1224,6 +1249,22 @@ class AttitudeWidget(QWidget):
         )
         self.reset_btn.clicked.connect(self.reset_orientation)
         row.addWidget(self.reset_btn)
+
+        self.smooth_check = QCheckBox("SMOOTH")
+        self.smooth_check.setFont(ref_font)
+        self.smooth_check.setFixedHeight(BUTTON_H)
+        self.smooth_check.setChecked(self.smooth)
+        self.smooth_check.setToolTip(
+            "Smooth playback (default on).\n\n"
+            "Packets reach this station about twice a second (300 / 600 ms\n"
+            "gaps), so the model is shown %.1f s behind the newest packet and\n"
+            "moves continuously between them. That adds a delay of %.1f s.\n\n"
+            "Unchecked: the newest packet's attitude is shown immediately,\n"
+            "with no delay, stepping once per packet (the old behaviour)."
+            % (PLAYBACK_DELAY_S, PLAYBACK_DELAY_S)
+        )
+        self.smooth_check.toggled.connect(self._on_smooth_toggled)
+        row.addWidget(self.smooth_check)
         row.addStretch(1)
         stack.addLayout(row)
         return stack
@@ -1297,14 +1338,13 @@ class AttitudeWidget(QWidget):
         dashboard uses.  Does arithmetic only -- no repaint here.
         """
         try:
-            timestamp = packet.mission_time_s
-            if not math.isfinite(timestamp):
-                timestamp = packet.gs_recv_epoch
-
+            # Mission time drives the integration; the receive time is the
+            # estimator's fallback when mission time is missing or stalls.
             self.estimator.update(
                 (packet.gyro_x, packet.gyro_y, packet.gyro_z),
                 (packet.acc_x, packet.acc_y, packet.acc_z),
-                timestamp,
+                packet.mission_time_s,
+                packet.gs_recv_epoch,
             )
             self._dirty = True
         except Exception:
@@ -1342,6 +1382,7 @@ class AttitudeWidget(QWidget):
         alongside it, not in place of it.
         """
         self.estimator.reset()
+        self.playback.reset()
         self.reset_camera()
         self._dirty = True
         self.redraw(force=True)
@@ -1350,15 +1391,41 @@ class AttitudeWidget(QWidget):
         """Session reset hook, called by the dashboard's Clear button."""
         self.reset_orientation()
 
+    def clear_playback(self) -> None:
+        """Drop the keyframe history and the playback clock, keeping the
+        orientation. Called when a new logging session starts."""
+        self.estimator.clear_history()
+        self.playback.reset()
+        self._dirty = True
+
     # -- rendering (timer driven) ------------------------------------------
 
+    def displayed_q(self) -> np.ndarray:
+        """The attitude to show now: interpolated playback, or the newest."""
+        if self.smooth:
+            return self.playback.sample(self.estimator, self.clock())
+        return self.estimator.q.copy()
+
     def redraw(self, force: bool = False) -> None:
-        """Apply the current estimate to the 3D model.  Called by a QTimer."""
-        if not (self._dirty or force):
+        """Draw the displayed attitude.  Called by a QTimer at
+        ATTITUDE_RENDER_HZ; draws only when the attitude to show has changed
+        (or a control changed, or *force*), so a held model costs nothing.
+
+        The 3D view, the 2D fallback and the R/P/Y readout all take the same
+        quaternion from :meth:`displayed_q`.
+        """
+        try:
+            q = self.displayed_q()
+        except Exception:
+            q = self.estimator.q.copy()
+        changed = self.shown_q is None or not np.array_equal(q, self.shown_q)
+        if not (changed or self._dirty or force):
             return
         self._dirty = False
+        self.shown_q = q
+        self.frames_drawn += 1
         try:
-            roll, pitch, yaw = self.estimator.euler_deg
+            roll, pitch, yaw = quat_to_euler_deg(q)
             self.rpy_label.setText(
                 "R %+7.1f  P %+7.1f  Y %+7.1f" % (roll, pitch, yaw)
             )
@@ -1367,7 +1434,7 @@ class AttitudeWidget(QWidget):
 
             if self.gl_available:
                 transform = np.eye(4)
-                transform[:3, :3] = self.estimator.matrix
+                transform[:3, :3] = quat_to_matrix(q)
                 matrix = _as_qmatrix(transform)
                 # Every part gets the *same* matrix, so the assembly can never
                 # come apart or rotate at different rates.  setTransform only:
@@ -1408,6 +1475,47 @@ class AttitudeWidget(QWidget):
         self.estimator.use_accel_reference = bool(checked)
         self._style_ref(self.estimator.accel_valid)
         self._dirty = True
+
+    def _on_smooth_toggled(self, checked: bool) -> None:
+        self.smooth = bool(checked)
+        self.playback.reset()
+        self._save_smooth_setting()
+        self._dirty = True
+        self.redraw(force=True)
+
+    # -- SMOOTH persistence ------------------------------------------------
+    # Kept in the map window's settings file when there is one, as one more
+    # key. No file: the choice lasts for the session only; this never
+    # creates the file.
+
+    _SMOOTH_KEY = "attitude_smooth"
+
+    def _load_smooth_setting(self) -> bool:
+        if not self.settings_path:
+            return True
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return True
+        if isinstance(data, dict) and isinstance(data.get(self._SMOOTH_KEY), bool):
+            return data[self._SMOOTH_KEY]
+        return True
+
+    def _save_smooth_setting(self) -> None:
+        if not self.settings_path or not os.path.isfile(self.settings_path):
+            return
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return
+            data[self._SMOOTH_KEY] = self.smooth
+            with open(self.settings_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        except Exception:
+            # Remembering a display preference must never break the panel.
+            pass
 
     def _style_ref(self, locked: bool) -> None:
         """Colour the toggle for its three meaningful states."""

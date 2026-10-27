@@ -2138,7 +2138,10 @@ class Dashboard(QMainWindow):
         self.attitude_box = attitude_box
         attitude_layout = QVBoxLayout(attitude_box)
         attitude_layout.setContentsMargins(8, 8, 8, 8)
-        self.attitude = AttitudeWidget()
+        # SMOOTH is remembered in the map window's settings file
+        # (MapWindow is given base_dir=os.getcwd(), file map_settings.json).
+        self.attitude = AttitudeWidget(
+            settings_path=os.path.join(os.getcwd(), "map_settings.json"))
         attitude_layout.addWidget(self.attitude)
         attitude_box.setMinimumWidth(248)
         row.addWidget(attitude_box)
@@ -3302,6 +3305,8 @@ class Dashboard(QMainWindow):
             # the run being recorded, not to whatever was on screen before.
             self.track_store.clear()
             self.map_window.canvas.invalidate_tracks()
+            # Nor does the attitude playback carry keyframes across.
+            self.attitude.clear_playback()
             self.log_path_label.setText("CSV: waiting for first packet (TEAM_ID)…")
             self.log_path_label.setToolTip("")
             self.append_event(
