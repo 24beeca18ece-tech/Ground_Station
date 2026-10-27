@@ -133,11 +133,6 @@ BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 #: keys on TEAM_ID in field 0 and would reject this outright.
 EJECT_COMMAND_BODY = "CMD,EJECT"
 
-#: Ground receive antennas in the SIMO diversity setup. This is a MANUAL
-#: selection, not telemetry: see the note on the combo's tooltip. Kept as a
-#: list so adding a third element later is a one-line change.
-ANTENNA_PATHS = ["WHIP", "PATCH", "BOTH", "UNSET"]
-
 #: The two ground radios. The flight transmitter alternates destinations per
 #: packet, so NEITHER of these receives the whole stream on its own -- each sees
 #: roughly every other packet, and the merge layer puts them back together.
@@ -1956,54 +1951,14 @@ class Dashboard(QMainWindow):
             "covers the whole receive path, not one antenna of the pair."
         )
 
-        # Antenna path is MANUAL. See ANTENNA_PATHS below for why.
-        antenna_box = QFrame()
-        antenna_box.setStyleSheet(
-            "QFrame { background-color: %s; border: 1px solid %s;"
-            " border-radius: 5px; }" % (COL_PANEL_HI, COL_BORDER)
-        )
-        ant_layout = QVBoxLayout(antenna_box)
-        ant_layout.setContentsMargins(8, 3, 8, 3)
-        ant_layout.setSpacing(0)
-        ant_caption = QLabel("ANTENNA")
-        ant_font = QFont()
-        ant_font.setPointSize(8)
-        ant_font.setBold(True)
-        ant_caption.setFont(ant_font)
-        ant_caption.setStyleSheet(
-            "color: %s; border: none; font-size: 8pt; font-weight: 700;"
-            % COL_TEXT_DIM
-        )
-        # Same trick the readout tiles use: a QLabel otherwise reports its full
-        # text width as a hard minimum, which is what starved the RSSI tile
-        # beside it down to 19 px.
-        ant_caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.antenna_combo = QComboBox()
-        self.antenna_combo.addItems(ANTENNA_PATHS)
-        self.antenna_combo.setToolTip(
-            "Which ground antenna is physically connected for this test session.\n\n"
-            "MANUAL LABEL - not read from the radio. The XBee 802.15.4 API has\n"
-            "no per-antenna field in any receive frame (0x80/0x81/0x90) and no\n"
-            "AT parameter for antenna selection, so the software cannot know\n"
-            "which element of a diversity pair received a given packet.\n\n"
-            "Set it to match the hardware so the Event Log and CSV notes\n"
-            "record which antenna a session's RSSI figures belong to."
-        )
-        self.antenna_combo.setMinimumContentsLength(8)
-        self.antenna_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
-        self.antenna_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.antenna_combo.currentTextChanged.connect(self._on_antenna_changed)
-        ant_layout.addWidget(ant_caption)
-        ant_layout.addWidget(self.antenna_combo)
-
         grid.addWidget(self.tile_rate, 0, 0)
         grid.addWidget(self.tile_age, 0, 1)
         grid.addWidget(self.tile_total, 1, 0)
-        grid.addWidget(self.tile_corrupt, 1, 1)
-        grid.addWidget(self.tile_rssi, 2, 0)
-        grid.addWidget(antenna_box, 2, 1)
-        # Even columns. Without this the combo's implicit minimum width claims
-        # the whole row and collapses the tiles in column 0 to slivers.
+        grid.addWidget(self.tile_rssi, 1, 1)
+        # Corrupt/Rej spans the bottom row: its C/R/A triple is the longest
+        # value in the panel, and the full width keeps it from clipping.
+        grid.addWidget(self.tile_corrupt, 2, 0, 1, 2)
+        # Even columns, so the two tiles in each upper row share the width.
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
@@ -3320,15 +3275,6 @@ class Dashboard(QMainWindow):
         self.append_event("UPLINK STATUS frame_id=%d: %s" % (frame_id, text))
         self.csv_logger.log_note(
             "uplink status frame_id=%d status=0x%02X" % (frame_id, status))
-
-    def _on_antenna_changed(self, text: str) -> None:
-        """Record a manual antenna-path change in the event log and CSV notes.
-
-        The selection is operator-supplied, so its only value is as an audit
-        note tying a session's RSSI figures to the hardware that produced them.
-        """
-        self.append_event("Antenna path set to %s (manual label)" % text)
-        self.csv_logger.log_note("antenna path: %s (manual)" % text)
 
     @staticmethod
     def _fmt(value: float, digits: int) -> str:

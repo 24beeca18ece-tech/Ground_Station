@@ -7,6 +7,8 @@ The ``ui-cleanup`` dashboard changes:
 * ``SHOW_WHEEL_RPM`` hides the reaction-wheel tile and chart without leaving
   anything half wired, and turning it back on restores them.
 * The altitude callout speaks exact whole metres, not the nearest 10 m.
+* The link status panel has no antenna box; Signal moves up beside
+  Valid/Total and Corrupt/Rej spans the bottom row.
 
     python -m pytest tools/test_ui_cleanup.py -v
 """
@@ -151,3 +153,49 @@ def test_callout_speaks_the_exact_altitude(altitude, phrase):
 def test_callout_has_no_rounding_setting_left():
     import altitude_callout
     assert not hasattr(altitude_callout, "ROUND_TO_M")
+
+
+# ---------------------------------------------------------------------------
+# Link status panel: no antenna box, three rows
+# ---------------------------------------------------------------------------
+
+def _grid_position(grid, widget):
+    index = grid.indexOf(widget)
+    assert index >= 0, "widget is not in the link grid"
+    return grid.getItemPosition(index)       # (row, column, rowSpan, colSpan)
+
+
+def test_link_grid_layout(make_dashboard):
+    from PyQt5.QtWidgets import QGridLayout
+    window = make_dashboard(False)
+    grid = window.tile_rate.parentWidget().layout()
+    assert isinstance(grid, QGridLayout)
+    assert _grid_position(grid, window.tile_rate) == (0, 0, 1, 1)
+    assert _grid_position(grid, window.tile_age) == (0, 1, 1, 1)
+    assert _grid_position(grid, window.tile_total) == (1, 0, 1, 1)
+    assert _grid_position(grid, window.tile_rssi) == (1, 1, 1, 1)
+    assert _grid_position(grid, window.tile_corrupt) == (2, 0, 1, 2)
+    assert grid.count() == 5
+    assert grid.rowCount() == 3
+
+
+def test_no_antenna_widget_exists(make_dashboard):
+    from PyQt5.QtWidgets import QComboBox, QLabel
+    window = make_dashboard(False)
+    assert not hasattr(dashboard_ui, "ANTENNA_PATHS")
+    assert not hasattr(window, "antenna_combo")
+    assert not hasattr(window, "_on_antenna_changed")
+    panel = window.tile_rate.parentWidget()
+    assert not any(label.text().strip().upper() == "ANTENNA"
+                   for label in window.findChildren(QLabel))
+    assert panel.findChildren(QComboBox) == []
+
+
+def test_link_tiles_still_update(make_dashboard, qapp):
+    window = make_dashboard(False)
+    window.show()
+    _feed(window, qapp, [cansat_packet(n) for n in range(1, 6)])
+    window._update_link_status()
+    assert window.tile_total.value.text().strip() not in ("", "--")
+    assert window.tile_corrupt.value.text().strip().count("/") == 2
+    assert _errors(window) == []
