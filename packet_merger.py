@@ -188,6 +188,11 @@ class PacketMerger:
                 "reset? Sequence rebased." % (self._next, count)
             )
             self._flush_all()
+            # Forget the old run's counts: the new run reuses them, and every
+            # one would otherwise be dropped as a "duplicate" until the new
+            # count passed the old one.
+            self._recent.clear()
+            self._recent_set.clear()
             self._next = count
 
         if count < self._next:
