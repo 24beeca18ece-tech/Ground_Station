@@ -119,6 +119,11 @@ AUTOSCALE_MIN_INTERVAL_S = 0.25
 #: pyqtgraph, so drag-to-pan and wheel-zoom on the small chart still work.
 CLICK_SLOP_PX = 5
 CLICK_MAX_S = 0.4
+#: Show the reaction-wheel RPM tile and strip chart in the CanSat payload page.
+#: Display only: reaction_wheel_rpm is still parsed, logged to CSV and listed
+#: in diagnostics either way. When False the two widgets are never built and
+#: the air-quality chart takes their height.
+SHOW_WHEEL_RPM = False
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 
@@ -1669,7 +1674,9 @@ class Dashboard(QMainWindow):
         self.reset_sensors_btn.setFixedHeight(26)
         self.reset_sensors_btn.setToolTip(
             "Clear the payload sensor history for this session:\n"
-            "particulate and reaction-wheel traces, all strip charts, the ground\n"
+            + ("particulate and reaction-wheel traces" if SHOW_WHEEL_RPM
+               else "particulate traces")
+            + ", all strip charts, the ground\n"
             "track, the attitude estimate and the link counters.\n"
             "The CSV log is NOT touched and keeps recording."
         )
@@ -1694,7 +1701,8 @@ class Dashboard(QMainWindow):
         return page
 
     def _build_cansat_page(self) -> QWidget:
-        """CanSat: SPS30 air quality, reaction wheel, recovery stage."""
+        """CanSat: SPS30 air quality, recovery stage and, if SHOW_WHEEL_RPM,
+        the reaction wheel."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1735,20 +1743,31 @@ class Dashboard(QMainWindow):
             legend=False,   # the colour-matched tiles above are the legend
             min_y_span=10.0,
         )
-        self.chart_pm.setMinimumHeight(86)
-        self.chart_pm.setMaximumHeight(104)
         self.chart_pm.setTitle(None)
         layout.addWidget(self.chart_pm)
 
-        # --- reaction wheel -------------------------------------------------
+        # --- recovery stage and (optionally) reaction wheel ------------------
+        # Without the wheel the page keeps its height and the particulate
+        # chart takes the wheel chart's share (its 84-96 px plus one spacing),
+        # while Recovery gets a full-width row instead of half of one.
+        self.tile_wheel = None
+        self.chart_wheel = None
+        if SHOW_WHEEL_RPM:
+            self.chart_pm.setMinimumHeight(86)
+            self.chart_pm.setMaximumHeight(104)
+        else:
+            self.chart_pm.setMinimumHeight(86 + 84 + 6)
+            self.chart_pm.setMaximumHeight(104 + 96 + 6)
+
         wheel_row = QHBoxLayout()
         wheel_row.setSpacing(6)
-        self.tile_wheel = ReadoutTile("Wheel RPM", "RPM", COL_WHEEL, value_pt=15)
-        self.tile_wheel.setToolTip(
-            "Active stabilisation reaction wheel speed.\n"
-            "Signed: sign indicates spin direction. Saturates at ±1124 RPM."
-        )
-        wheel_row.addWidget(self.tile_wheel, 1)
+        if SHOW_WHEEL_RPM:
+            self.tile_wheel = ReadoutTile("Wheel RPM", "RPM", COL_WHEEL, value_pt=15)
+            self.tile_wheel.setToolTip(
+                "Active stabilisation reaction wheel speed.\n"
+                "Signed: sign indicates spin direction. Saturates at ±1124 RPM."
+            )
+            wheel_row.addWidget(self.tile_wheel, 1)
 
         self.tile_recovery = ReadoutTile("Recovery", "", COL_TEXT, value_pt=15)
         self.tile_recovery.setToolTip(
@@ -1756,6 +1775,10 @@ class Dashboard(QMainWindow):
         )
         wheel_row.addWidget(self.tile_recovery, 1)
         layout.addLayout(wheel_row)
+
+        if not SHOW_WHEEL_RPM:
+            page.setMinimumHeight(336)
+            return page
 
         # --- reaction wheel history ----------------------------------------
         self.chart_wheel = StripChart(
@@ -2594,7 +2617,8 @@ class Dashboard(QMainWindow):
                 # The raw-CSV format carries particulates but no actuator
                 # telemetry, and a flat zero line reads as "wheel idle" rather
                 # than "no such measurement".
-                if getattr(packet, "has_actuator_data", True):
+                if (self.chart_wheel is not None
+                        and getattr(packet, "has_actuator_data", True)):
                     self.chart_wheel.add_point(
                         x, {"rpm": float(packet.reaction_wheel_rpm)}
                     )
@@ -2757,7 +2781,8 @@ class Dashboard(QMainWindow):
                 # it is redrawn explicitly rather than via self.charts (which is
                 # the main grid only) and only when that page is visible.
                 if self.payload_stack.currentIndex() == 1:
-                    self.chart_wheel.redraw(window_s, autoscale)
+                    if self.chart_wheel is not None:
+                        self.chart_wheel.redraw(window_s, autoscale)
                     self.chart_pm.redraw(window_s, autoscale)
                 self.gps_plot.redraw()
         except Exception as exc:  # pragma: no cover - defensive
@@ -3008,16 +3033,19 @@ class Dashboard(QMainWindow):
             # telemetry. "+0 rpm" and stage 0's name are dataclass defaults,
             # not readings, so say "--" rather than render them.
             if not getattr(packet, "has_actuator_data", True):
-                self.tile_wheel.set_value("--")
-                self.tile_wheel.set_level("normal")
+                if self.tile_wheel is not None:
+                    self.tile_wheel.set_value("--")
+                    self.tile_wheel.set_level("normal")
                 self.tile_recovery.set_value("--")
                 self.tile_recovery.value.setStyleSheet("color: %s;" % COL_TEXT_DIM)
             else:
-                rpm = packet.reaction_wheel_rpm
-                self.tile_wheel.set_value("%+d" % rpm)
-                # Near saturation the wheel can no longer authority-control the
-                # spin, which is worth flagging to the operator.
-                self.tile_wheel.set_level("alert" if abs(rpm) >= 1050 else "normal")
+                if self.tile_wheel is not None:
+                    rpm = packet.reaction_wheel_rpm
+                    self.tile_wheel.set_value("%+d" % rpm)
+                    # Near saturation the wheel can no longer authority-control
+                    # the spin, which is worth flagging to the operator.
+                    self.tile_wheel.set_level(
+                        "alert" if abs(rpm) >= 1050 else "normal")
 
                 stage = packet.recovery_stage
                 self.tile_recovery.set_value(
@@ -3355,6 +3383,8 @@ class Dashboard(QMainWindow):
         # ones while waiting for the next packet.
         for tile in (self.tile_pm1, self.tile_pm25, self.tile_pm4,
                      self.tile_pm10, self.tile_wheel, self.tile_recovery):
+            if tile is None:            # wheel tile when SHOW_WHEEL_RPM is off
+                continue
             tile.set_value("--")
             tile.set_level("normal")
         self.light_solenoid.set_state(None)
@@ -3373,7 +3403,8 @@ class Dashboard(QMainWindow):
         """Wipe the plots and the on-screen counters (does not touch the CSV)."""
         for chart in self.charts:
             chart.clear_data()
-        self.chart_wheel.clear_data()
+        if self.chart_wheel is not None:
+            self.chart_wheel.clear_data()
         self.chart_pm.clear_data()
         self.gps_plot.clear_data()
         self.attitude.clear()
