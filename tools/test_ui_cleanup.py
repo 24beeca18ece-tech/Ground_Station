@@ -6,6 +6,7 @@ The ``ui-cleanup`` dashboard changes:
 
 * ``SHOW_WHEEL_RPM`` hides the reaction-wheel tile and chart without leaving
   anything half wired, and turning it back on restores them.
+* The altitude callout speaks exact whole metres, not the nearest 10 m.
 
     python -m pytest tools/test_ui_cleanup.py -v
 """
@@ -123,3 +124,30 @@ def test_dashboard_takes_cansat_packets_either_way(make_dashboard, qapp,
     # The packet itself is untouched by the display switch.
     assert packets[0].reaction_wheel_rpm == -480
     assert packets[0].has_actuator_data
+
+
+# ---------------------------------------------------------------------------
+# Altitude callout phrases: exact whole metres
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("altitude,phrase", [
+    (503, "Altitude 503 meters"),
+    (0, "Altitude 0 meters"),
+    (9, "Altitude 9 meters"),
+    (10, "Altitude 10 meters"),
+    (99.5, "Altitude 100 meters"),       # half rounds away from zero
+    (-3, "Altitude minus 3 meters"),
+    (1250, "Altitude 1250 meters"),
+    (-1250, "Altitude minus 1250 meters"),
+    (593.4, "Altitude 593 meters"),      # was "590" with 10 m rounding
+    (-2.5, "Altitude minus 3 meters"),
+    (-0.4, "Altitude 0 meters"),         # never "minus 0"
+])
+def test_callout_speaks_the_exact_altitude(altitude, phrase):
+    from altitude_callout import format_altitude
+    assert format_altitude(altitude) == phrase
+
+
+def test_callout_has_no_rounding_setting_left():
+    import altitude_callout
+    assert not hasattr(altitude_callout, "ROUND_TO_M")

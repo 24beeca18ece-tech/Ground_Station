@@ -8,7 +8,7 @@ the sky instead of the screen.
 WHY A THREAD
 ------------
 Speech synthesis blocks for the length of the utterance -- two to three
-seconds for "Altitude 590 meters" on Windows SAPI5 -- and the GUI thread
+seconds for "Altitude 593 meters" on Windows SAPI5 -- and the GUI thread
 cannot be away that long: the charts would freeze and, worse, the merge
 buffer would stall. So the actual speaking happens here, on its own QThread,
 the same way serial ingestion and CSV logging do. The GUI thread only ever
@@ -52,6 +52,7 @@ and it works with no network at all, which is the point in the field.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -68,29 +69,35 @@ except Exception as exc:  # pragma: no cover - depends on the host
     TTS_AVAILABLE = False
     TTS_IMPORT_ERROR = "%s: %s" % (type(exc).__name__, exc)
 
-#: Words per minute. The SAPI5 default is 200, at which "Altitude 1250 meters"
-#: takes ~3.2 s -- longer than the 3 s cadence, so every other callout would
-#: be skipped as overlapping. At 240 every phrase measured here finishes in
-#: 1.7-2.6 s including engine setup, and numbers are still perfectly clear.
-SPEECH_RATE_WPM = 240
-
-#: Altitude is rounded to this many metres before it is spoken. At flight
-#: speeds the vehicle moves tens of metres between callouts, so "five hundred
-#: ninety-three" is false precision that costs syllables; "five hundred
-#: ninety" is what the operator actually needs.
-ROUND_TO_M = 10
+#: Words per minute. Every utterance must finish inside the 3 s cadence or
+#: the next callout is skipped as overlapping. Exact altitudes make the
+#: phrases longer than the old 10 m-rounded ones ("seventeen seventy-seven"
+#: rather than "seventeen eighty"), and measured on SAPI5 (Microsoft David,
+#: fresh engine per utterance, setup included):
+#:
+#:   240 wpm  "Altitude minus 1777 meters"  3.36 s   -- overruns
+#:   280 wpm  "Altitude minus 1777 meters"  3.02 s   -- overruns
+#:   300 wpm  "Altitude minus 1777 meters"  2.75 s,  "Altitude 1777 meters"
+#:            2.51 s, "Altitude minus 1250 meters" 2.42 s, "Altitude 503
+#:            meters" 1.85 s
+#:
+#: SAPI only has integer rate steps, so 240 and 260 are the same speed and
+#: 280 / 300 are the next two. 300 is the slowest that fits.
+SPEECH_RATE_WPM = 300
 
 
 def format_altitude(altitude_m: float) -> str:
-    """The spoken phrase for *altitude_m*, e.g. ``"Altitude 590 meters"``.
+    """The spoken phrase for *altitude_m*, e.g. ``"Altitude 503 meters"``.
 
-    Digits, not words: SAPI reads "590" as "five hundred ninety" on its own,
-    and the digit form is shorter to synthesise than spelling it out.
+    Exact whole metres, rounded half away from zero (99.5 -> 100, -2.5 ->
+    -3), so the spoken number is the displayed one to the metre. Digits, not
+    words: SAPI reads "503" as "five hundred three" on its own, and the digit
+    form is shorter to synthesise than spelling it out.
     """
-    rounded = int(round(altitude_m / ROUND_TO_M)) * ROUND_TO_M
-    if rounded < 0:
-        return "Altitude minus %d meters" % -rounded
-    return "Altitude %d meters" % rounded
+    metres = int(math.floor(abs(altitude_m) + 0.5))
+    if altitude_m < 0 and metres:
+        return "Altitude minus %d meters" % metres
+    return "Altitude %d meters" % metres
 
 
 #: Sentinel queued by warm_up(): build an engine, say nothing, discard it.
