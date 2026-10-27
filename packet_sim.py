@@ -59,7 +59,7 @@ import random
 import socket
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -78,7 +78,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
 DEFAULT_TEAM_ID = "2025ASI001"
 
-# Ground-station reference position (Jammu) — the sim walks away from here.
+# Default launch position (Jammu) -- the sim walks away from here. Override
+# with --origin LAT LON, e.g. --origin 26.720028 84.304583 for the launch pad.
 BASE_LAT = 32.7266
 BASE_LON = 74.8570
 BASE_ALT = 320.0
@@ -164,9 +165,16 @@ class MissionSim:
 
     def __init__(self, team_id: str = DEFAULT_TEAM_ID,
                  payload_type: str = PAYLOAD_CANSAT,
-                 gyro_bias: float = 0.0) -> None:
+                 gyro_bias: float = 0.0,
+                 origin: Optional[Tuple[float, float]] = None,
+                 no_fix_s: float = 0.0) -> None:
         self.team_id = team_id
         self.payload_type = payload_type
+        #: Where the flight starts; the track drifts downrange from here.
+        self.base_lat, self.base_lon = origin if origin else (BASE_LAT, BASE_LON)
+        #: For the first this-many seconds the receiver has no lock, and the
+        #: frame carries what the firmware sends then: 0,0 and no satellites.
+        self.no_fix_s = float(no_fix_s)
         # Constant per-axis gyro offset, as a real uncalibrated MEMS gyro has.
         # The default of 0 keeps the simulator ideal; set it to reproduce the
         # turn-on bias that only shows up on real hardware.
@@ -352,10 +360,13 @@ class MissionSim:
 
         # GPS/NavIC: drifts downrange with the wind once it leaves the pad.
         downrange = max(0.0, t - 12.0)
-        lat = BASE_LAT + 3.1e-5 * downrange + random.gauss(0, 1.5e-6)
-        lon = BASE_LON + 5.4e-5 * downrange + random.gauss(0, 1.5e-6)
+        lat = self.base_lat + 3.1e-5 * downrange + random.gauss(0, 1.5e-6)
+        lon = self.base_lon + 5.4e-5 * downrange + random.gauss(0, 1.5e-6)
         nav_alt = altitude + random.gauss(0.0, 2.0)
         sats = 4 if t < 6 else (9 + random.randint(-1, 2))
+        if t < self.no_fix_s:
+            lat = lon = nav_alt = 0.0
+            sats = 0
 
         nav_time = time.strftime("%H%M%S", time.gmtime()) + ".00"
 
@@ -562,7 +573,9 @@ def _emit_loop(send, args: argparse.Namespace) -> None:
     ``send(data: bytes) -> None`` may raise to signal that the peer went away.
     """
     sim = MissionSim(args.team_id, payload_type=args.payload_type,
-                     gyro_bias=args.gyro_bias)
+                     gyro_bias=args.gyro_bias,
+                     origin=tuple(args.origin) if args.origin else None,
+                     no_fix_s=args.no_fix_s)
     faults = FaultInjector(args)
     alt = AlternationFilter(getattr(args, "alternate", None))
     if alt.enabled:
@@ -753,6 +766,14 @@ def parse_args(argv=None) -> argparse.Namespace:
              "the solenoid and nichrome status flags; 'generic' emits the "
              "legacy 19-field v1 frame (default: cansat).",
     )
+    flight.add_argument("--origin", nargs=2, type=float, default=None,
+                        metavar=("LAT", "LON"),
+                        help="Start the flight here instead of Jammu (%.4f, "
+                             "%.4f). The launch pad is 26.720028 84.304583."
+                             % (BASE_LAT, BASE_LON))
+    flight.add_argument("--no-fix-s", type=float, default=0.0,
+                        help="Send no GPS lock (0,0, no satellites) for the "
+                             "first N seconds (default 0).")
     flight.add_argument("--rate", type=float, default=10.0,
                         help="Packets per second (default 10; competition is 20).")
     flight.add_argument("--duration", type=float, default=0.0,
@@ -811,6 +832,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Preset: a realistically hostile link.")
 
     args = parser.parse_args(argv)
+    if args.origin and not (-90.0 <= args.origin[0] <= 90.0
+                            and -180.0 <= args.origin[1] <= 180.0):
+        parser.error("--origin is LAT LON in degrees: %r is not a position"
+                     % (args.origin,))
 
     # Map the friendly CLI spelling onto the wire token.
     args.payload_type = {
