@@ -1361,6 +1361,16 @@ class MapCanvas(QWidget):
         return None
 
     @property
+    def pack_bounds(self) -> Optional[Tuple[float, float, float, float]]:
+        """(west, south, east, north) of the tile pack on screen, or None."""
+        return self.pack.bounds if self.pack.kind == "mbtiles" else None
+
+    def outside_pack(self, lat: float, lon: float) -> bool:
+        bounds = self.pack_bounds
+        return bounds is not None and not (
+            bounds[0] <= lon <= bounds[2] and bounds[1] <= lat <= bounds[3])
+
+    @property
     def overzoom_levels(self) -> int:
         """How far the view is past the tile source's max zoom (0 = not)."""
         source = self.provider.source
@@ -1434,8 +1444,10 @@ class MapCanvas(QWidget):
             painter.fillRect(self.rect(), QColor(COL_BG))
             self._draw_base(painter)
             self._draw_rings(painter)
-            self._draw_tracks(painter)
+            # The pad under the tracks: a vehicle sits on it before launch,
+            # and its track must not be hidden by the marker and label.
             self._draw_launch_pad(painter)
+            self._draw_tracks(painter)
             self._draw_ground_station(painter)
             self._draw_vehicles(painter)
             self._draw_scale_bar(painter)
@@ -2284,8 +2296,11 @@ class MapWindow(QDialog):
             bits.append("cursor %.6f, %.6f" % cursor)
         for track in store.non_empty():
             bits.append("%s %d fixes" % (track.vehicle, len(track.points)))
+            last = track.last
+            if last is not None and self.canvas.outside_pack(last.lat, last.lon):
+                bits.append("%s outside map pack" % track.vehicle)
         if not store.non_empty():
-            bits.append("no fixes yet")
+            bits.append("no GPS fix yet")
         levels = self.canvas.overzoom_levels
         if levels:
             source = self.canvas.provider.source
