@@ -230,23 +230,31 @@ can reach you.
 
 ### Satellite pack for the launch pad (Sentinel-2 cloudless)
 
-100 km x 100 km around the launch pad (50 km each way), zoom 8-14, from
-EOX's *Sentinel-2 cloudless 2023* (about 10 m per pixel; the map overzooms
-past z14):
+10 km x 10 km around the launch pad (5 km each way), zoom 8-14, from EOX's
+*Sentinel-2 cloudless 2023* (about 10 m per pixel; the map overzooms past
+z14):
 
 ```bash
 python tools/fetch_tiles.py \
-    --bbox 83.8012 26.2704 84.8080 27.1697 \
+    --bbox 84.2542 26.6751 84.3549 26.7650 \
     --zoom 8 14 \
     --source "Sentinel-2 cloudless 2023 (EOX)" \
-    --name "Launch pad 100 km - Sentinel-2 cloudless 2023" \
+    --name "Launch pad 10 km - Sentinel-2 cloudless 2023" \
     --out assets/maps/launchpad_s2.mbtiles
 ```
 
-3,016 tiles (z8 4, z9 6, z10 16, z11 49, z12 156, z13 576, z14 2,209) at
-1 request per second: **about 50 minutes**, giving a file of about
-@@SIZE@@. Interrupt it whenever you like; the same command resumes. The map
-picks the pack automatically when it is present.
+49 tiles (z8 1, z9 1, z10 2, z11 2, z12 4, z13 9, z14 30) at 1 request per
+second: **under a minute**, giving a file of about 0.85 MB. Interrupt it
+whenever you like; the same command resumes. The map picks the pack
+automatically when it is present. Outside the 10 km box the map shows the
+grid (grey squares), and zoomed out the pack covers only the centre of the
+view.
+
+For more context around the pad, widen the box; the tool prints the tile
+count and time before downloading anything (`--dry-run` to only look). A
+100 km box at zoom 8-14 is 3,016 tiles, about 50 minutes and roughly 57 MB (measured
+18.8 KB per tile on the first 1,450);
+the source's 4,000-tile cap per job applies.
 
 **Licence: CC BY-NC-SA 4.0 - non-commercial use only, share alike, and the
 attribution shown whenever the imagery is.** The map shows

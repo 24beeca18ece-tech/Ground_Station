@@ -407,15 +407,29 @@ def test_vehicle_label_measures_from_the_pad(qapp, tmp_path):
 BOX = ["--bbox", "83.8012", "26.2704", "84.8080", "27.1697"]
 
 
-def test_fetch_tiles_counts_the_launch_pad_pack():
+PAD_BOX_10KM = (84.2542, 26.6751, 84.3549, 26.7650)     # the README command
+
+
+@pytest.mark.parametrize("box,expected", [
+    (PAD_BOX_10KM, [1, 1, 2, 2, 4, 9, 30]),
+    ((83.8012, 26.2704, 84.8080, 27.1697), [4, 6, 16, 49, 156, 576, 2209]),
+])
+def test_fetch_tiles_counts_the_launch_pad_pack(box, expected):
     import fetch_tiles
     per_zoom = []
     for z in range(8, 15):
-        x0, y0, x1, y1 = fetch_tiles.tile_range(83.8012, 26.2704, 84.8080,
-                                                27.1697, z)
+        x0, y0, x1, y1 = fetch_tiles.tile_range(*box, z)
         per_zoom.append((x1 - x0 + 1) * (y1 - y0 + 1))
-    assert per_zoom == [4, 6, 16, 49, 156, 576, 2209]
-    assert sum(per_zoom) == 3016
+    assert per_zoom == expected
+
+
+def test_the_10km_box_is_5km_each_way_from_the_pad():
+    import math
+    from track_store import haversine_m
+    west, south, east, north = PAD_BOX_10KM
+    for lat, lon in ((PAD_LAT, west), (PAD_LAT, east),
+                     (south, PAD_LON), (north, PAD_LON)):
+        assert haversine_m(PAD_LAT, PAD_LON, lat, lon) == pytest.approx(5000, abs=15)
 
 
 def test_fetch_tiles_refuses_jobs_over_the_cap_even_with_force(capsys, tmp_path):
@@ -605,4 +619,79 @@ def test_the_dashboard_starts_with_no_network(qapp, tmp_path, no_network,
     assert window.map_window.canvas.pack.name == "launchpad_s2.mbtiles (tiles)"
     assert no_network == [], no_network
     window.map_window.shutdown()
+    window.close()
+
+
+# ---------------------------------------------------------------------------
+# Found on the real display
+# ---------------------------------------------------------------------------
+
+def test_the_automatic_default_is_not_saved_as_a_choice(qapp, tmp_path):
+    maps = pack_dir(tmp_path)
+    make_pack(os.path.join(maps, "launchpad_s2.mbtiles"), {})
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    window._save_settings()
+    saved = json.loads((tmp_path / mw.SETTINGS_FILE).read_text())
+    assert saved["map_pack"] == "launchpad_s2.mbtiles (tiles)"
+    assert saved["map_pack_chosen"] is False
+    window.shutdown()
+    window.close()
+
+
+def test_range_rings_are_visible_over_a_tile_pack(qapp, tmp_path):
+    maps = pack_dir(tmp_path)
+    tiles = {}
+    x, y = pad_tile(13)
+    for dx in (-2, -1, 0, 1, 2):
+        for dy in (-2, -1, 0, 1, 2):
+            tiles[(13, x + dx, y + dy)] = jpeg_tile("#1f4d1f")
+    make_pack(os.path.join(maps, "launchpad_s2.mbtiles"), tiles)
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    canvas = settled(qapp, window)
+    canvas.zoom = 13
+    for _ in range(5):
+        grab(canvas)
+        wait_for(qapp, lambda: False, frames=20)
+    image = grab(canvas)
+    assert canvas.rings_drawn
+    centre = canvas._lonlat_to_pixel(PAD_LON, PAD_LAT)
+    radius = 1000.0 / mw.metres_per_pixel(canvas.center_lat, 13)
+    on_ring = pixel(image, int(centre.x()), int(round(centre.y() + radius)))
+    tile = pixel(image, int(centre.x()) + 20, int(round(centre.y() + radius / 2)))
+    assert close_enough(tile, (0x1f, 0x4d, 0x1f), tol=25)    # imagery there
+    assert on_ring.lightness() > tile.lightness() + 60        # ring visible
+    window.shutdown()
+    window.close()
+
+
+def test_scale_bar_has_a_backing_over_imagery(qapp, tmp_path):
+    maps = pack_dir(tmp_path)
+    x, y = pad_tile(13)
+    tiles = {(13, x + dx, y + dy): jpeg_tile("#102010")
+             for dx in range(-4, 5) for dy in range(-4, 5)}
+    make_pack(os.path.join(maps, "launchpad_s2.mbtiles"), tiles)
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    canvas = settled(qapp, window)
+    canvas.zoom = 13
+    for _ in range(5):
+        grab(canvas)
+        wait_for(qapp, lambda: False, frames=20)
+    image = grab(canvas)
+    backing = pixel(image, 8, canvas.height() - 30)
+    assert backing.lightness() > 180
+    window.shutdown()
+    window.close()
+
+
+def test_missing_tiles_stay_light_grey_over_the_graticule(qapp, tmp_path):
+    maps = pack_dir(tmp_path)
+    make_pack(os.path.join(maps, "launchpad_s2.mbtiles"), {})   # no tiles
+    window = mw.MapWindow(TrackStore(), base_dir=str(tmp_path))
+    canvas = settled(qapp, window)
+    canvas.zoom = 13
+    image = grab(canvas)
+    # Inside a missing tile, away from its outline and labels.
+    inside = pixel(image, canvas.width() // 2 + 60, canvas.height() // 2 + 90)
+    assert inside.lightness() > 170, inside.name()
+    window.shutdown()
     window.close()
