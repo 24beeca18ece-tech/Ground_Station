@@ -31,10 +31,16 @@ sys.path.insert(0, HERE)
 
 import attitude_widget as aw  # noqa: E402
 from attitude_widget import (  # noqa: E402
-    ACCEL_GATE_HI, ACCEL_GATE_LO, BIAS_ACCEL_HI, BIAS_ACCEL_LO,
-    BIAS_MAX_RATE_DPS, GRAVITY_MS2, MAHONY_KP, quat_multiply, quat_normalise,
-    quat_to_euler_deg, quat_to_matrix,
+    BIAS_ACCEL_HI, BIAS_ACCEL_LO, BIAS_MAX_RATE_DPS, GRAVITY_MS2,
+    quat_multiply, quat_normalise, quat_to_euler_deg, quat_to_matrix,
 )
+
+# The Mahony constants the legacy estimator below used. attitude_widget no
+# longer has them (the attitude-level branch replaced that correction), so
+# they are kept here at their old values for the verbatim copy.
+MAHONY_KP = 1.6
+ACCEL_GATE_LO = 0.75
+ACCEL_GATE_HI = 1.25
 
 # ---------------------------------------------------------------------------
 # The estimator as it was before the attitude-smooth branch, kept VERBATIM

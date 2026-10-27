@@ -10,26 +10,30 @@ Integrates body angular rates into an orientation estimate and draws a model of
 the vehicle rotating in real time against a fixed world grid, so the operator
 can see the vehicle's attitude rather than reading three rate numbers.
 
-ESTIMATOR: quaternion integration + Mahony complementary filter
----------------------------------------------------------------
+ESTIMATOR: quaternion integration + accelerometer levelling
+-----------------------------------------------------------
 Orientation is held as a unit quaternion, not Euler angles.  This matters for
 this vehicle specifically: the rocket tumbles at high rate through the recovery
 events and the CanSat spins under an active reaction wheel, and Euler
 integration hits gimbal lock at 90 degrees of pitch and produces garbage
 exactly when the flight gets interesting.
 
-Pure gyro integration drifts without bound, so the accelerometer is used as a
-gravity reference through a Mahony-style complementary filter: the error
-between the measured gravity direction and the direction the current estimate
-predicts is fed back as a small rate correction.
+Pure gyro integration drifts without bound, and at about two packets a second
+it also misses any move made between samples -- measured on the real board,
+a tilt and return left the model 28 deg off in roll. So roll and pitch are
+eased towards the accelerometer's gravity direction (time constant
+:data:`LEVEL_TAU_S`), and yaw is left exactly as the gyro has it.
 
 **The gate matters more than the filter.**  An accelerometer only measures
 gravity when the vehicle is not accelerating.  Under a 7 g motor burn the
 accelerometer points along the thrust axis, and blindly trusting it would
 violently drag the estimate to a wrong attitude at the worst possible moment.
-So the correction is applied only while the measured specific force magnitude
-is close to 1 g (see :data:`ACCEL_GATE_LO` / :data:`ACCEL_GATE_HI`).  During
-boost and during parachute snatch loads the filter coasts on the gyro alone.
+So the levelling runs only while the specific force is within
+:data:`LEVEL_WINDOW_MS2` of gravity *and* the body rate is under
+:data:`LEVEL_GYRO_LIMIT_DPS`.  During boost, free fall, parachute snatch loads
+and hard manoeuvres the estimate coasts on the gyro alone.  "Gravity" is the
+board's own at-rest reading, learned once (see ``GRAVITY_REF_*``), because the
+test board's accelerometer reports half of 9.81.
 
 Known limitation: heading (rotation about the gravity vector) has no absolute
 reference, because there is no magnetometer in the packet.  Yaw therefore
@@ -242,16 +246,44 @@ CAMERA_AZIMUTH = 45
 #: bottom of the panel and was clipped.
 BUTTON_H = 26
 
-#: Mahony proportional feedback gain, 1/s.  Higher pulls harder towards the
-#: accelerometer reference (less drift, more vibration sensitivity).
-MAHONY_KP = 1.6
-
-#: Accelerometer trust gate, in g.  Outside this band the specific force is not
-#: gravity and the correction is skipped entirely.
-ACCEL_GATE_LO = 0.75
-ACCEL_GATE_HI = 1.25
-
 GRAVITY_MS2 = 9.80665
+
+# --- accelerometer levelling (roll and pitch only) ----------------------------
+# Gyro integration alone cannot bring the model back to level: on the real
+# board a tilt and return measured +28 deg of roll on the way up and nothing
+# on the way back, because the return happened between two packets, and the
+# untrimmed gyro offset added more. The accelerometer knows where "down" is
+# whenever the vehicle is not accelerating, so roll and pitch are eased
+# towards it then. Yaw has no such reference (no magnetometer) and is never
+# touched.
+
+#: Time constant of the levelling, seconds: each update removes the fraction
+#: 1 - exp(-dt / tau) of the roll and pitch error, whatever the packet rate.
+LEVEL_TAU_S = 2.0
+#: Levelling runs only while the specific force is within this many m/s^2 of
+#: gravity -- 9.81 +/- 1.5 on a correctly scaled sensor. Applied as the same
+#: fraction (+/- 15 %) of the board's own measured gravity, see GRAVITY_REF_*.
+LEVEL_WINDOW_MS2 = 1.5
+#: ... and only while the body rate (bias removed) is below this, deg/s, so a
+#: hard manoeuvre runs on the gyro alone.
+LEVEL_GYRO_LIMIT_DPS = 15.0
+#: Not near pitch +/-90 deg, where roll and yaw are not separable.
+LEVEL_MAX_PITCH_DEG = 80.0
+
+# The accelerometer's own reading of 1 g, learned rather than assumed: the
+# test board reports 0.50 g at rest on every axis-sum (4.9 m/s^2), most likely
+# a full-scale setting mismatch in the firmware. A fixed 9.81 window would never
+# let a correction or the bias learning run on it. Learned once, from a
+# continuous still stretch, then frozen; a correctly scaled sensor learns ~9.81.
+#: Body rate below which the board may be still, deg/s (raw, bias included).
+GRAVITY_REF_QUIET_DPS = 5.0
+#: |a| must not change by more than this fraction between packets.
+GRAVITY_REF_STEADY = 0.03
+#: Plausible |a| for "still", as a fraction of 9.81: excludes free fall and
+#: boost, whatever the scale error.
+GRAVITY_REF_MIN_G, GRAVITY_REF_MAX_G = 0.3, 2.0
+#: Continuous still time before the reference is taken and frozen, seconds.
+GRAVITY_REF_SETTLE_S = 2.0
 
 # --- packet timing ------------------------------------------------------------
 # The flight computer sends a frame every 300 ms and routes them by
@@ -304,7 +336,9 @@ KEYFRAME_HISTORY = 48
 BIAS_TAU_S = 7.5
 #: Body rate below which the vehicle may be considered at rest, deg/s.
 BIAS_MAX_RATE_DPS = 6.0
-#: Specific-force window for "at rest", in g.
+#: Specific-force window for "at rest", as a fraction of the gravity
+#: reference (see GRAVITY_REF_*), not of 9.81: on a mis-scaled accelerometer an
+#: absolute window never passes and the bias was never learned.
 BIAS_ACCEL_LO, BIAS_ACCEL_HI = 0.85, 1.15
 #: Accumulated time at rest before the estimate is reported as settled.
 BIAS_SETTLE_S = 5.0
@@ -400,6 +434,37 @@ def quat_from_rotvec(phi: np.ndarray) -> np.ndarray:
     return np.array([math.cos(half), *(math.sin(half) / theta * phi)])
 
 
+def quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """Logarithm map: the rotation vector (rad) of unit quaternion *q*,
+    taking the shorter way round."""
+    if q[0] < 0.0:
+        q = -q
+    v = np.asarray(q[1:], dtype=float)
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:
+        return 2.0 * v
+    return (2.0 * math.atan2(s, float(q[0])) / s) * v
+
+
+def quat_from_euler_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Inverse of :func:`quat_to_euler_deg` (aerospace Z-Y-X)."""
+    cr, sr = math.cos(math.radians(roll) / 2), math.sin(math.radians(roll) / 2)
+    cp, sp = math.cos(math.radians(pitch) / 2), math.sin(math.radians(pitch) / 2)
+    cy, sy = math.cos(math.radians(yaw) / 2), math.sin(math.radians(yaw) / 2)
+    return np.array([cr * cp * cy + sr * sp * sy,
+                     sr * cp * cy - cr * sp * sy,
+                     cr * sp * cy + sr * cp * sy,
+                     cr * cp * sy - sr * sp * cy])
+
+
+def accel_roll_pitch_deg(accel) -> Tuple[float, float]:
+    """Roll and pitch, degrees, of a body at rest measuring specific force
+    *accel* (gravity reads "up"). Independent of the accelerometer's scale."""
+    ax, ay, az = (float(v) for v in accel)
+    return (math.degrees(math.atan2(ay, az)),
+            math.degrees(math.atan2(-ax, math.hypot(ay, az))))
+
+
 def quat_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
     """Smallest rotation angle between two orientations, degrees."""
     dot = abs(float(np.dot(a, b)))
@@ -457,12 +522,25 @@ class AttitudeEstimator:
     __slots__ = ("q", "_last_t", "_last_recv", "_prev_raw", "_last_normal_dt",
                  "accel_valid", "samples", "corrected", "dropouts",
                  "use_accel_reference", "auto_bias", "bias", "bias_samples",
-                 "rest_time_s", "at_rest", "timeline_s", "keyframes", "epoch")
+                 "rest_time_s", "at_rest", "timeline_s", "keyframes", "epoch",
+                 "gravity_ref", "gravity_settled", "_g_sum", "_g_time",
+                 "_prev_norm", "last_accel", "levelled")
 
-    def __init__(self, use_accel_reference: bool = False,
+    def __init__(self, use_accel_reference: bool = True,
                  auto_bias: bool = True) -> None:
-        #: When False the estimate is a pure integral of the telemetry gyro.
+        #: Level roll and pitch from the accelerometer while it measures
+        #: gravity (on by default). False: a pure integral of the gyro.
         self.use_accel_reference = bool(use_accel_reference)
+        #: |a| the accelerometer reads at rest, m/s^2: 9.81 until learned.
+        #: Kept across RESET -- it describes the sensor, not the attitude.
+        self.gravity_ref = GRAVITY_MS2
+        self.gravity_settled = False
+        self._g_sum = 0.0
+        self._g_time = 0.0
+        self._prev_norm: Optional[float] = None
+        #: The most recent accelerometer sample, for RESET's re-levelling.
+        self.last_accel: Optional[np.ndarray] = None
+        self.levelled = 0
         #: Subtract an auto-learned turn-on bias from the raw gyro.
         self.auto_bias = bool(auto_bias)
         #: ``(time_s, q, rotvec)`` per update, oldest first. *rotvec* is the
@@ -509,6 +587,39 @@ class AttitudeEstimator:
         self.keyframes.clear()
         self.epoch += 1
 
+    def level_from_accel(self, accel) -> bool:
+        """Set roll and pitch from *accel* (a still body), yaw to zero.
+
+        False, and nothing changed, if there is no usable reading.
+        """
+        if accel is None:
+            return False
+        a = np.asarray(accel, dtype=float)
+        if not np.all(np.isfinite(a)) or float(np.linalg.norm(a)) < 1e-6:
+            return False
+        roll, pitch = accel_roll_pitch_deg(a)
+        self.q = quat_from_euler_deg(roll, pitch, 0.0)
+        return True
+
+    def _learn_gravity(self, norm: float, raw: np.ndarray, dt: float) -> None:
+        """Take the accelerometer's at-rest magnitude from one continuous still
+        stretch of GRAVITY_REF_SETTLE_S, then freeze it."""
+        if self.gravity_settled:
+            return
+        quiet = float(np.linalg.norm(raw)) < GRAVITY_REF_QUIET_DPS
+        steady = (self._prev_norm is not None and norm > 1e-6
+                  and abs(norm - self._prev_norm) <= GRAVITY_REF_STEADY * norm)
+        plausible = (GRAVITY_REF_MIN_G <= norm / GRAVITY_MS2
+                     <= GRAVITY_REF_MAX_G)
+        if quiet and steady and plausible:
+            self._g_sum += norm * dt
+            self._g_time += dt
+            if self._g_time >= GRAVITY_REF_SETTLE_S:
+                self.gravity_ref = self._g_sum / self._g_time
+                self.gravity_settled = True
+        else:
+            self._g_sum = self._g_time = 0.0       # must be one still stretch
+
     @property
     def bias_settled(self) -> bool:
         """True once enough time at rest has been averaged to trust it."""
@@ -550,6 +661,9 @@ class AttitudeEstimator:
         # integrator, so zero on all three axes means the orientation is held
         # exactly still and the rotation rate tracks GYRO_X/Y/Z one to one.
         raw = np.array([gx, gy, gz])
+        ax, ay, az = (v if math.isfinite(v) else 0.0 for v in accel_ms2)
+        accel = np.array([ax, ay, az])
+        self.last_accel = accel
 
         first = self.timeline_s is None
         elapsed = self._elapsed(timestamp_s, recv_s)
@@ -579,10 +693,10 @@ class AttitudeEstimator:
         self.timeline_s += elapsed
         self.samples += 1
 
-        ax, ay, az = (v if math.isfinite(v) else 0.0 for v in accel_ms2)
-        accel = np.array([ax, ay, az])
         norm = float(np.linalg.norm(accel))
         self.accel_valid = False
+        self._learn_gravity(norm, raw, dt)
+        self._prev_norm = norm
 
         # --- turn-on bias estimation -----------------------------------------
         # Learn only while the vehicle is demonstrably at rest: gravity-only
@@ -590,7 +704,7 @@ class AttitudeEstimator:
         # motion. In flight neither holds, so the estimate freezes at whatever
         # was learned on the pad -- which is the value that matters. Weighted
         # by time rather than by sample, so the packet rate does not matter.
-        g_ratio = norm / GRAVITY_MS2 if norm > 1e-6 else 0.0
+        g_ratio = norm / self.gravity_ref if norm > 1e-6 else 0.0
         self.at_rest = (
             BIAS_ACCEL_LO <= g_ratio <= BIAS_ACCEL_HI
             and float(np.max(np.abs(raw - self.bias))) < BIAS_MAX_RATE_DPS
@@ -606,34 +720,42 @@ class AttitudeEstimator:
         # the interval, both corrected with the current bias estimate.
         omega = np.radians(0.5 * ((prev_raw - bias) + (raw - bias)))
 
-        # --- optional gravity reference (Mahony proportional correction) -----
-        # Off by default.  This term is derived from the accelerometer, not the
-        # gyroscope, so while it is enabled the model can rotate even when the
-        # gyro reads zero -- that is the point of it (it pulls roll/pitch back
-        # towards the measured gravity vector) but it breaks the 1:1
-        # correspondence with GYRO_X/Y/Z, so the operator opts in.
-        if self.use_accel_reference and norm > 1e-6:
-            if ACCEL_GATE_LO <= g_ratio <= ACCEL_GATE_HI:
-                # Measured gravity direction in body frame.
-                measured = accel / norm
-                # Gravity direction the current estimate predicts, in body
-                # frame: world +Z rotated by the inverse of q, which for a
-                # rotation matrix is its transpose.
-                predicted = quat_to_matrix(self.q).T @ np.array([0.0, 0.0, 1.0])
-                # Rotation error as a vector; small-angle => cross product.
-                error = np.cross(measured, predicted)
-                # Per unit time: over dt the correction removes the fraction
-                # 1 - exp(-Kp * dt) of the error whatever the packet rate. A
-                # plain Kp * error * dt overshoots once Kp * dt > 1, which a
-                # 900 ms gap reaches.
-                gain = (1.0 - math.exp(-MAHONY_KP * dt)) / dt
-                omega = omega + gain * error
-                self.accel_valid = True
-                self.corrected += 1
-
         # --- quaternion integration: the exact rotation increment ------------
+        q_start = self.q
         phi = omega * dt
         self.q = quat_normalise(quat_multiply(self.q, quat_from_rotvec(phi)))
+
+        # --- accelerometer levelling: roll and pitch only --------------------
+        # Only while the accelerometer is measuring gravity (|a| within the
+        # window of the gravity reference) and the body is not turning hard
+        # (both rate samples of the interval under the limit). Boost, free
+        # fall, parachute snatch and tumbling all fail one test or the other
+        # and run on the gyro alone. Yaw is carried over unchanged.
+        window = LEVEL_WINDOW_MS2 / GRAVITY_MS2
+        if (self.use_accel_reference and norm > 1e-6
+                and abs(g_ratio - 1.0) <= window
+                and float(np.linalg.norm(raw - bias)) < LEVEL_GYRO_LIMIT_DPS
+                and float(np.linalg.norm(prev_raw - bias)) < LEVEL_GYRO_LIMIT_DPS):
+            roll_a, pitch_a = accel_roll_pitch_deg(accel)
+            roll, pitch, yaw = quat_to_euler_deg(self.q)
+            if (abs(pitch_a) < LEVEL_MAX_PITCH_DEG
+                    and abs(pitch) < LEVEL_MAX_PITCH_DEG):
+                k = 1.0 - math.exp(-dt / LEVEL_TAU_S)
+                roll += k * ((roll_a - roll + 180.0) % 360.0 - 180.0)
+                pitch += k * (pitch_a - pitch)
+                levelled = quat_from_euler_deg(roll, pitch, yaw)
+                if float(np.dot(levelled, self.q)) < 0.0:
+                    levelled = -levelled           # same rotation, same sign
+                self.q = levelled
+                # The keyframe's step is now the whole move, so the playback
+                # interpolates through the correction instead of jumping.
+                phi = quat_to_rotvec(quat_multiply(
+                    np.array([q_start[0], -q_start[1], -q_start[2],
+                              -q_start[3]]), self.q))
+                self.accel_valid = True
+                self.corrected += 1
+                self.levelled += 1
+
         self.keyframes.append((self.timeline_s, self.q.copy(),
                                None if dropout else phi))
 
@@ -1216,26 +1338,27 @@ class AttitudeWidget(QWidget):
         ref_font.setBold(True)
         self.ref_btn.setFont(ref_font)
         self.ref_btn.setCheckable(True)
-        self.ref_btn.setChecked(False)
+        # On by default: roll and pitch level from the accelerometer.
+        self.ref_btn.setChecked(self.estimator.use_accel_reference)
         # Fixed width so the toggle never squeezes the RESET button off the row.
         self.ref_btn.setFixedWidth(74)
         self.ref_btn.setFixedHeight(BUTTON_H)
         self.ref_btn.setToolTip(
-            "Attitude source toggle.\n\n"
-            "GYRO (off, default): orientation is the integral of GYRO_X/Y/Z only.\n"
+            "Attitude source toggle. Yaw drifts, no magnetometer.\n\n"
+            "On (default): roll and pitch are levelled from the accelerometer\n"
+            "  while it measures gravity, so the model returns to level after\n"
+            "  a tilt the sparse gyro samples missed. Shows G-LOCK while the\n"
+            "  accelerometer is within the gravity window and the body is\n"
+            "  turning slowly, and ACC REF while it is coasting on the gyro\n"
+            "  (boost, free fall, deployment shock, hard manoeuvres). Yaw is\n"
+            "  never corrected.\n\n"
+            "GYRO (off): orientation is the integral of GYRO_X/Y/Z only.\n"
             "  Rotation corresponds 1:1 with the transmitted body rates and the\n"
-            "  model holds perfectly still when they read zero. All axes drift\n"
-            "  slowly; use RESET between runs.\n\n"
-            "ACC REF (on): adds an accelerometer gravity reference that bounds\n"
-            "  roll and pitch drift. Because that correction comes from the\n"
-            "  accelerometer, the model can move slightly even at zero gyro.\n"
-            "  Shows G-LOCK while the accelerometer reads close to 1 g, and\n"
-            "  ACC REF while it is coasting on the gyro through boost or\n"
-            "  deployment shock, when the accelerometer is not a valid\n"
-            "  gravity reference."
+            "  model holds perfectly still when they read zero. All axes drift;\n"
+            "  use RESET between runs."
         )
         self.ref_btn.toggled.connect(self._on_ref_toggled)
-        self._style_ref(False)
+        self._style_ref(self.estimator.accel_valid)
         row.addWidget(self.ref_btn)
 
         self.reset_btn = QPushButton("RESET")
@@ -1243,8 +1366,10 @@ class AttitudeWidget(QWidget):
         self.reset_btn.setFixedWidth(72)
         self.reset_btn.setFixedHeight(BUTTON_H)
         self.reset_btn.setToolTip(
-            "Re-zero the orientation estimate.\n"
-            "Yaw has no absolute reference without a magnetometer, so it drifts;\n"
+            "RESET ATTITUDE: zero yaw, and set roll and pitch level from the\n"
+            "current accelerometer reading (exactly level if there is none\n"
+            "yet). Also restores the camera and re-arms gyro bias learning.\n\n"
+            "Yaw drifts, no magnetometer: it has no absolute reference, so\n"
             "reset it between test runs."
         )
         self.reset_btn.clicked.connect(self.reset_orientation)
@@ -1381,7 +1506,11 @@ class AttitudeWidget(QWidget):
         The orientation behaviour is unchanged -- the camera restore is added
         alongside it, not in place of it.
         """
+        last = self.estimator.last_accel
         self.estimator.reset()
+        # Re-level from the accelerometer rather than snapping to exactly
+        # level: a board resting at a slight angle shows that angle.
+        self.estimator.level_from_accel(last)
         self.playback.reset()
         self.reset_camera()
         self._dirty = True
@@ -1459,15 +1588,28 @@ class AttitudeWidget(QWidget):
                                                           BIAS_SETTLE_S)
         else:
             state = "not learned yet - hold the vehicle still"
+        if not est.use_accel_reference:
+            level = "OFF (pure gyro)"
+        elif est.gravity_settled:
+            level = "on, gravity reference %.2f m/s^2 (%.2f g) learned" % (
+                est.gravity_ref, est.gravity_ref / GRAVITY_MS2)
+        else:
+            level = "on, learning the gravity reference - hold still 2 s"
         self.rpy_label.setToolTip(
-            "Roll / pitch / yaw, degrees.\n\n"
+            "Roll / pitch / yaw, degrees.\n"
+            "Yaw drifts, no magnetometer: RESET zeros it.\n\n"
+            "Roll and pitch levelling from the accelerometer: %s\n"
+            "  applied while |a| is within %.0f %% of the reference and the\n"
+            "  body rate is under %.0f deg/s; last update levelled: %s\n\n"
             "Gyro turn-on bias auto-zero: %s\n"
             "  estimated bias  X %+.3f  Y %+.3f  Z %+.3f deg/s\n"
             "  vehicle at rest: %s\n\n"
             "A real MEMS gyro reads a small non-zero rate when perfectly still.\n"
             "That bias is learned while the vehicle is stationary and subtracted,\n"
             "so the model holds position instead of drifting. RESET re-arms it."
-            % (state, bx, by, bz, "yes" if est.at_rest else "no")
+            % (level, 100.0 * LEVEL_WINDOW_MS2 / GRAVITY_MS2,
+               LEVEL_GYRO_LIMIT_DPS, "yes" if est.accel_valid else "no",
+               state, bx, by, bz, "yes" if est.at_rest else "no")
         )
 
     def _on_ref_toggled(self, checked: bool) -> None:
