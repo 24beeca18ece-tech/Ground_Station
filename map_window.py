@@ -57,8 +57,8 @@ from urllib.parse import quote
 
 import numpy as np
 
-from PyQt5.QtCore import (QObject, QPoint, QPointF, QRect, QRunnable, Qt,
-                          QThreadPool, QTimer, pyqtSignal)
+from PyQt5.QtCore import (QObject, QPoint, QPointF, QRect, QRectF, QRunnable,
+                          Qt, QThreadPool, QTimer, pyqtSignal)
 from PyQt5.QtGui import (QColor, QFont, QImage, QPainter, QPainterPath, QPen,
                          QPolygonF)
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
@@ -193,8 +193,13 @@ LAUNCH_PAD_FIELD = "launch_pad"
 COL_PAD = "#e8590c"
 
 #: Zoom levels past a source's or pack's max_zoom that are drawn by scaling
-#: up the parent tile, rather than as grey squares.
+#: up the parent tile. It is also how far in the user can zoom on that map:
+#: past it there is nothing left worth drawing.
 OVERZOOM_LEVELS = 3
+#: How far out past a tile source's lowest zoom the user can zoom.
+UNDERZOOM_LEVELS = 2
+#: Zoom GO TO PAD puts the view at.
+PAD_ZOOM = 13
 #: Scaled-up tiles kept in memory (never written to disk).
 OVERZOOM_CACHE_MAX = 200
 
@@ -817,8 +822,13 @@ class TileProvider(QObject):
         return None
 
     def overzoomed(self, z: int, x: int, y: int) -> Optional[QImage]:
-        """A stand-in for a tile that is not available: its parent, cropped
-        and scaled up, from up to OVERZOOM_LEVELS zoom levels above.
+        """A stand-in for a tile that is not available: the nearest parent
+        that is, cropped to this tile's area and scaled up.
+
+        Every parent level is tried, down to the source's lowest zoom, so a
+        square is grey only when no level at all has that place. (Searching
+        just 3 levels up is what left the map blank when zoomed in at the
+        edge of a small pack, though a coarser tile covered the spot.)
 
         Past the source's max_zoom this is the only way anything is drawn,
         so the parent at max_zoom is requested if it is not here yet. Inside
@@ -834,10 +844,8 @@ class TileProvider(QObject):
         if beyond > OVERZOOM_LEVELS:
             return None
         local = source.type == "mbtiles"
-        for up in range(max(1, beyond), OVERZOOM_LEVELS + 1):
+        for up in range(max(1, beyond), z - source.min_zoom + 1):
             pz = z - up
-            if pz < source.min_zoom:
-                break
             key = (source.name, z, x, y, up)
             scaled = self._scaled.get(key)
             if scaled is not None:
@@ -847,12 +855,24 @@ class TileProvider(QObject):
             parent_key = (source.name, pz, px, py)
             parent = self._cache.get(parent_key)
             if parent is None:
+                if parent_key in self._pending:
+                    return None                # being read; wait for it
+                expiry = self._failed.get(parent_key)
+                if expiry is not None and time.monotonic() < expiry:
+                    continue                   # known to be missing: go up
                 if local or up == beyond:
                     self.get(pz, px, py)       # ask for it; drawn next frame
+                    if local:
+                        # One level at a time. Asking for every level at once
+                        # flooded the reader pool, and a provider destroyed
+                        # with reads in flight deadlocked on the GIL.
+                        return None
                 continue
-            size = TILE_PX >> up
-            crop = parent.copy((x - (px << up)) * size, (y - (py << up)) * size,
-                               size, size)
+            # Below 1 px of the parent (more than 8 levels up) the crop is
+            # that single pixel: a flat colour, which is all there is.
+            size = max(1, TILE_PX >> up)
+            crop = parent.copy(((x - (px << up)) * TILE_PX) >> up,
+                               ((y - (py << up)) * TILE_PX) >> up, size, size)
             scaled = crop.scaled(TILE_PX, TILE_PX, Qt.IgnoreAspectRatio,
                                  Qt.SmoothTransformation)
             self._scaled[key] = scaled
@@ -1159,6 +1179,7 @@ class MapCanvas(QWidget):
         #: Set by the paint that drew the launch-pad marker / rings (tests).
         self.pad_drawn = False
         self.rings_drawn = False
+        self.coverage_drawn = False
         self.paint_errors = 0
         self._last_paint_error = ""
 
@@ -1235,6 +1256,7 @@ class MapCanvas(QWidget):
 
     def set_source(self, source: MapSource, base_dir: str = ".") -> None:
         self.provider.set_source(source, base_dir)
+        self.clamp_zoom()
         self.request_redraw()
 
     def set_pack(self, pack: MapPack, base_dir: str = ".") -> str:
@@ -1278,6 +1300,7 @@ class MapCanvas(QWidget):
         else:
             self.provider.set_source(
                 MapSource(name="none", type="mbtiles", path=""), base_dir)
+        self.clamp_zoom()
         self.request_redraw()
         return note
 
@@ -1304,7 +1327,8 @@ class MapCanvas(QWidget):
         self.request_redraw()
 
     def set_zoom(self, zoom: int, anchor: Optional[QPoint] = None) -> None:
-        zoom = max(MIN_ZOOM, min(MAX_ZOOM, int(zoom)))
+        low, high = self.zoom_range
+        zoom = max(low, min(high, int(zoom)))
         if zoom == self.zoom:
             return
         if anchor is None:
@@ -1325,9 +1349,10 @@ class MapCanvas(QWidget):
         box = self.store.bounds()
         if box is None and self.ground_station is None:
             return
+        low, high = self.zoom_range
         if box is None:
             self.center_lat, self.center_lon = self.ground_station
-            self.zoom = 15
+            self.zoom = max(low, min(high, 15))
             self.request_redraw()
             return
         min_lat, min_lon, max_lat, max_lon = box
@@ -1337,7 +1362,7 @@ class MapCanvas(QWidget):
             min_lon, max_lon = min(min_lon, gs_lon), max(max_lon, gs_lon)
         self.center_lat = (min_lat + max_lat) / 2.0
         self.center_lon = (min_lon + max_lon) / 2.0
-        for zoom in range(MAX_ZOOM, MIN_ZOOM - 1, -1):
+        for zoom in range(high, low - 1, -1):
             x0, y0 = lonlat_to_world(min_lon, max_lat, zoom)
             x1, y1 = lonlat_to_world(max_lon, min_lat, zoom)
             if (abs(x1 - x0) <= self.width() * 0.85
@@ -1345,7 +1370,7 @@ class MapCanvas(QWidget):
                 self.zoom = zoom
                 break
         else:
-            self.zoom = MIN_ZOOM
+            self.zoom = low
         self.request_redraw()
 
     # -- coordinate helpers -------------------------------------------------
@@ -1361,14 +1386,64 @@ class MapCanvas(QWidget):
         return None
 
     @property
+    def zoom_range(self) -> Tuple[int, int]:
+        """The zoom levels the view may be at on the current map.
+
+        For a tile pack or online source: from UNDERZOOM_LEVELS below its
+        lowest zoom to OVERZOOM_LEVELS above its highest. Beyond those
+        there is nothing worth drawing, so the view is not allowed there.
+        Grid, vector and image packs draw at any zoom.
+        """
+        source = self.provider.source
+        if (self.pack.kind != "mbtiles" or source is None
+                or source.name == "none"):
+            return MIN_ZOOM, MAX_ZOOM
+        low = max(MIN_ZOOM, source.min_zoom - UNDERZOOM_LEVELS)
+        high = min(MAX_ZOOM, source.max_zoom + OVERZOOM_LEVELS)
+        return low, max(low, high)
+
+    def clamp_zoom(self) -> None:
+        """Bring the current zoom inside :attr:`zoom_range` (map changed)."""
+        low, high = self.zoom_range
+        if not low <= self.zoom <= high:
+            self.zoom = max(low, min(high, self.zoom))
+            self.request_redraw()
+
+    @property
     def pack_bounds(self) -> Optional[Tuple[float, float, float, float]]:
         """(west, south, east, north) of the tile pack on screen, or None."""
         return self.pack.bounds if self.pack.kind == "mbtiles" else None
+
+    def view_bounds(self) -> Tuple[float, float, float, float]:
+        """(west, south, east, north) of what is on screen."""
+        west, north = self._pixel_to_lonlat(QPoint(0, 0))
+        east, south = self._pixel_to_lonlat(QPoint(self.width(), self.height()))
+        return west, south, east, north
+
+    def view_outside_pack(self) -> bool:
+        """True when a tile pack is selected but none of it is in view."""
+        bounds = self.pack_bounds
+        if bounds is None:
+            return False
+        west, south, east, north = self.view_bounds()
+        return (east < bounds[0] or west > bounds[2]
+                or north < bounds[1] or south > bounds[3])
 
     def outside_pack(self, lat: float, lon: float) -> bool:
         bounds = self.pack_bounds
         return bounds is not None and not (
             bounds[0] <= lon <= bounds[2] and bounds[1] <= lat <= bounds[3])
+
+    def go_to_pad(self) -> None:
+        """Centre on the launch pad at PAD_ZOOM (stops Follow)."""
+        if self.launch_pad is None:
+            return
+        self.follow = ""
+        _name, lat, lon = self.launch_pad
+        self.center_lat, self.center_lon = lat, lon
+        low, high = self.zoom_range
+        self.zoom = max(low, min(high, PAD_ZOOM))
+        self.request_redraw()
 
     @property
     def overzoom_levels(self) -> int:
@@ -1443,6 +1518,7 @@ class MapCanvas(QWidget):
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.fillRect(self.rect(), QColor(COL_BG))
             self._draw_base(painter)
+            self._draw_coverage(painter)
             self._draw_rings(painter)
             # The pad under the tracks: a vehicle sits on it before launch,
             # and its track must not be hidden by the marker and label.
@@ -1496,6 +1572,21 @@ class MapCanvas(QWidget):
                        lambda lon, lat: self._lonlat_to_pixel(lon, lat))
         draw_north_arrow(painter, self.width(), self.height())
 
+    def _draw_coverage(self, painter: QPainter) -> None:
+        """A thin outline of the tile pack's coverage, so a view at the edge
+        or outside it shows where the imagery is."""
+        bounds = self.pack_bounds
+        if bounds is None:
+            return
+        west, south, east, north = bounds
+        top_left = self._lonlat_to_pixel(west, north)
+        bottom_right = self._lonlat_to_pixel(east, south)
+        pen = QPen(QColor(COL_PAD), 1.5, Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(QRectF(top_left, bottom_right))
+        self.coverage_drawn = True
+
     def _draw_rings(self, painter: QPainter) -> None:
         """Range rings around the ground station, or the launch pad.
 
@@ -1525,6 +1616,15 @@ class MapCanvas(QWidget):
 
         wanted = set()
         source_name = self.provider.source.name if self.provider.source else ""
+        bounds = self.pack_bounds
+        covered = None
+        if bounds is not None:
+            # Tiles wholly outside the pack's bounds are not asked for or
+            # drawn: the grid shows there, not a field of "no tile" squares.
+            bx0, by0 = lonlat_to_world(bounds[0], bounds[3], self.zoom)
+            bx1, by1 = lonlat_to_world(bounds[2], bounds[1], self.zoom)
+            covered = (int(bx0 // TILE_PX), int(by0 // TILE_PX),
+                       int(bx1 // TILE_PX), int(by1 // TILE_PX))
         for row in range(rows):
             for col in range(cols):
                 tx, ty = first_x + col, first_y + row
@@ -1544,6 +1644,10 @@ class MapCanvas(QWidget):
                     painter.fillRect(rect, QColor(COL_BG))
                     continue
                 wrapped = tx % span                 # the world repeats east-west
+                if covered is not None and not (
+                        covered[0] <= wrapped <= covered[2]
+                        and covered[1] <= ty <= covered[3]):
+                    continue
                 image = self.provider.get(self.zoom, wrapped, ty)
                 if image is None or image.isNull():
                     image = self.provider.overzoomed(self.zoom, wrapped, ty)
@@ -1887,6 +1991,13 @@ class MapWindow(QDialog):
         self.fit_btn.clicked.connect(self.canvas.fit_all)
         bar.addWidget(self.fit_btn)
 
+        self.pad_btn = QPushButton("GO TO PAD")
+        self.pad_btn.setToolTip(
+            "Centre the map on the launch pad at zoom %d (stops Follow). The "
+            "pad's position is \"launch_pad\" in %s." % (PAD_ZOOM, SETTINGS_FILE))
+        self.pad_btn.clicked.connect(self._on_go_to_pad)
+        bar.addWidget(self.pad_btn)
+
         self.opacity_label = QLabel("Opacity:")
         self.opacity = QSlider(Qt.Horizontal)
         self.opacity.setRange(10, 100)
@@ -2073,6 +2184,10 @@ class MapWindow(QDialog):
     def _on_opacity(self, value: int) -> None:
         self.canvas.overlay_opacity = value / 100.0
         self.canvas.request_redraw()
+
+    def _on_go_to_pad(self) -> None:
+        self.follow_combo.setCurrentText("Off")
+        self.canvas.go_to_pad()
 
     def _on_follow(self, text: str) -> None:
         self.canvas.follow = "" if text == "Off" else text
@@ -2301,15 +2416,18 @@ class MapWindow(QDialog):
                 bits.append("%s outside map pack" % track.vehicle)
         if not store.non_empty():
             bits.append("no GPS fix yet")
+        low, high = self.canvas.zoom_range
+        if self.canvas.zoom >= high and high < MAX_ZOOM:
+            bits.append("max zoom for this map")
+        elif self.canvas.zoom <= low and low > MIN_ZOOM:
+            bits.append("min zoom for this map")
         levels = self.canvas.overzoom_levels
         if levels:
             source = self.canvas.provider.source
-            if levels <= OVERZOOM_LEVELS:
-                bits.append("overzoomed x%d from z%d" % (1 << levels,
-                                                         source.max_zoom))
-            else:
-                bits.append("overzoomed past the %d-level limit (z%d data) — "
-                            "zoom out" % (OVERZOOM_LEVELS, source.max_zoom))
+            bits.append("overzoomed x%d from z%d" % (1 << levels,
+                                                     source.max_zoom))
+        if self.canvas.view_outside_pack():
+            bits.append("outside map pack — GO TO PAD to return")
         if self.canvas.pack.kind == "grid":
             bits.append("grid only — no map pack loaded, see README")
         elif self.canvas.vector_pack is not None:

@@ -163,8 +163,22 @@ QUADS = ("#ff0000", "#00ff00", "#0000ff", "#ffff00")
 QUAD_RGB = ((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0))
 
 
+_providers = []
+
+
+@pytest.fixture(autouse=True)
+def _shut_down_providers():
+    """A bare TileProvider garbage-collected with pack reads still running
+    deadlocks (its pool's destructor waits while holding the GIL), so every
+    one made here is shut down, as the map window does."""
+    yield
+    while _providers:
+        _providers.pop().shutdown()
+
+
 def provider_for(path, max_zoom):
     provider = mw.TileProvider()
+    _providers.append(provider)
     provider.set_source(mw.MapSource(name="pack", type="mbtiles", path=path,
                                      min_zoom=0, max_zoom=max_zoom))
     return provider
@@ -244,9 +258,12 @@ def test_status_says_overzoomed(qapp, tmp_path):
     window.canvas.zoom = 16
     window._update_status()
     assert "overzoomed x4 from z14" in window.status.text()
-    window.canvas.zoom = 18
+    # Past 3 levels is no longer reachable: zoom stops at z17 and says so.
+    window.canvas.set_zoom(18)
+    assert window.canvas.zoom == 17
     window._update_status()
-    assert "past the 3-level limit" in window.status.text()
+    assert "overzoomed x8 from z14" in window.status.text()
+    assert "max zoom for this map" in window.status.text()
     window.shutdown()
     window.close()
 
