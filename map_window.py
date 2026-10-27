@@ -184,6 +184,20 @@ OSM_CONTACT_HELP = ("Your email address or a URL where OpenStreetMap's "
                     "of every OSM tile request, as their tile usage policy "
                     "asks.")
 
+#: The launch pad, used for the marker and -- when no ground station is set
+#: -- as the origin of the range rings and of distance and bearing. Written
+#: into map_settings.json ("launch_pad") so it can be edited there.
+DEFAULT_LAUNCH_PAD: Dict[str, Any] = {"name": "Launch pad",
+                                      "lat": 26.720028, "lon": 84.304583}
+LAUNCH_PAD_FIELD = "launch_pad"
+COL_PAD = "#e8590c"
+
+#: Zoom levels past a source's or pack's max_zoom that are drawn by scaling
+#: up the parent tile, rather than as grey squares.
+OVERZOOM_LEVELS = 3
+#: Scaled-up tiles kept in memory (never written to disk).
+OVERZOOM_CACHE_MAX = 200
+
 #: The map_settings.json field holding a contact for bulk tile downloads
 #: (tools/fetch_tiles.py puts it in the User-Agent). Empty until filled in.
 TILE_CONTACT_FIELD = "tile_contact"
@@ -434,6 +448,12 @@ class MapPack:
     path: str = ""
     attribution: str = ""
     error: str = ""
+    #: Tile packs: the zoom range stored, from the MBTiles metadata. Past
+    #: max_zoom the map overzooms rather than asking for absent tiles.
+    min_zoom: int = 0
+    max_zoom: int = 19
+    #: Tile packs: (west, south, east, north) from the metadata, or None.
+    bounds: Optional[Tuple[float, float, float, float]] = None
 
 
 #: Always present, always works, needs nothing.
@@ -457,8 +477,7 @@ def find_packs(base_dir: str = ".") -> List[MapPack]:
         path = os.path.join(directory, entry)
         lower = entry.lower()
         if lower.endswith(".mbtiles"):
-            packs.append(MapPack(name="%s (tiles)" % entry, kind="mbtiles",
-                                 path=path, attribution="Offline tile pack"))
+            packs.append(mbtiles_pack(entry, path))
         elif lower.endswith(".osmpack.json"):
             packs.append(MapPack(
                 name="%s (vector)" % entry[:-len(".osmpack.json")],
@@ -473,6 +492,35 @@ def find_packs(base_dir: str = ".") -> List[MapPack]:
                                      kind="image", path=path,
                                      attribution="Operator-supplied image"))
     return packs
+
+
+def mbtiles_pack(entry: str, path: str) -> MapPack:
+    """A tile pack described by its own metadata table.
+
+    The attribution travels in the file, so a pack built from a licensed
+    source (Sentinel-2 cloudless, say) carries the exact notice its licence
+    requires and the map shows it. Missing or odd metadata falls back to
+    plain defaults rather than refusing the pack.
+    """
+    meta = read_mbtiles_metadata(path)
+
+    def zoom(key: str, default: int) -> int:
+        try:
+            return max(0, min(MAX_ZOOM, int(float(meta.get(key, default)))))
+        except (TypeError, ValueError):
+            return default
+
+    bounds = None
+    try:
+        parts = [float(v) for v in meta.get("bounds", "").split(",")]
+        if len(parts) == 4 and all(math.isfinite(v) for v in parts):
+            bounds = (parts[0], parts[1], parts[2], parts[3])
+    except ValueError:
+        bounds = None
+    return MapPack(name="%s (tiles)" % entry, kind="mbtiles", path=path,
+                   attribution=meta.get("attribution", "") or "Offline tile pack",
+                   min_zoom=zoom("minzoom", 0), max_zoom=zoom("maxzoom", 19),
+                   bounds=bounds)
 
 
 def find_mbtiles(directory: str) -> List[str]:
@@ -613,6 +661,10 @@ class TileProvider(QObject):
         self.network_errors = 0
         self.tiles_drawn = 0
         self.cache_hits = 0
+        #: (source, z, x, y, levels up) -> parent crop scaled to a full tile.
+        #: Memory only; rebuilt from the parent whenever it is needed again.
+        self._scaled: "OrderedDict[Any, QImage]" = OrderedDict()
+        self.overzoom_drawn = 0
 
     # -- configuration -----------------------------------------------------
 
@@ -644,6 +696,7 @@ class TileProvider(QObject):
     def set_source(self, source: MapSource, base_dir: str = ".") -> None:
         self.source = source
         self._cache.clear()
+        self._scaled.clear()
         self.abort_pending()
         self._failed.clear()
         self._consecutive_failures = 0
@@ -761,6 +814,51 @@ class TileProvider(QObject):
         if self.is_offline:
             return None
         self._request(key)
+        return None
+
+    def overzoomed(self, z: int, x: int, y: int) -> Optional[QImage]:
+        """A stand-in for a tile that is not available: its parent, cropped
+        and scaled up, from up to OVERZOOM_LEVELS zoom levels above.
+
+        Past the source's max_zoom this is the only way anything is drawn,
+        so the parent at max_zoom is requested if it is not here yet. Inside
+        the range -- a tile still loading, or missing from a pack -- only a
+        parent that is already cached is used, except for an offline pack,
+        where asking costs nothing but a local read. Results are kept in a
+        small memory cache, never on disk.
+        """
+        source = self.source
+        if source is None or z <= source.min_zoom:
+            return None
+        beyond = z - source.max_zoom
+        if beyond > OVERZOOM_LEVELS:
+            return None
+        local = source.type == "mbtiles"
+        for up in range(max(1, beyond), OVERZOOM_LEVELS + 1):
+            pz = z - up
+            if pz < source.min_zoom:
+                break
+            key = (source.name, z, x, y, up)
+            scaled = self._scaled.get(key)
+            if scaled is not None:
+                self._scaled.move_to_end(key)
+                return scaled
+            px, py = x >> up, y >> up
+            parent_key = (source.name, pz, px, py)
+            parent = self._cache.get(parent_key)
+            if parent is None:
+                if local or up == beyond:
+                    self.get(pz, px, py)       # ask for it; drawn next frame
+                continue
+            size = TILE_PX >> up
+            crop = parent.copy((x - (px << up)) * size, (y - (py << up)) * size,
+                               size, size)
+            scaled = crop.scaled(TILE_PX, TILE_PX, Qt.IgnoreAspectRatio,
+                                 Qt.SmoothTransformation)
+            self._scaled[key] = scaled
+            while len(self._scaled) > OVERZOOM_CACHE_MAX:
+                self._scaled.popitem(last=False)
+            return scaled
         return None
 
     def _request(self, key) -> None:
@@ -1055,6 +1153,11 @@ class MapCanvas(QWidget):
         self.zoom = 13
         self.follow = ""                   # "", "CANSAT" or "ROCKET"
         self.ground_station: Optional[Tuple[float, float]] = None
+        #: (name, lat, lon) of the launch pad, or None. Marked on the map,
+        #: and the range origin whenever no ground station is set.
+        self.launch_pad: Optional[Tuple[str, float, float]] = None
+        #: Set by the paint that drew the launch-pad marker (for tests).
+        self.pad_drawn = False
         self.paint_errors = 0
         self._last_paint_error = ""
 
@@ -1113,7 +1216,8 @@ class MapCanvas(QWidget):
         source = self.provider.source
         return (round(self.center_lat, 9), round(self.center_lon, 9),
                 self.zoom, self.width(), self.height(), revisions, age_s,
-                self.ground_station, source.name if source else None,
+                self.ground_station, self.launch_pad,
+                source.name if source else None,
                 self.provider.is_offline, self.provider.generation)
 
     def _tick(self) -> None:
@@ -1146,7 +1250,7 @@ class MapCanvas(QWidget):
         if pack.kind == "mbtiles":
             source = MapSource(name=pack.name, type="mbtiles", path=pack.path,
                                attribution=pack.attribution,
-                               min_zoom=0, max_zoom=19)
+                               min_zoom=pack.min_zoom, max_zoom=pack.max_zoom)
             self.provider.set_source(source, base_dir)
             if not self.provider.offline_ready:
                 note = ("Map pack %r could not be opened; showing the grid."
@@ -1245,6 +1349,25 @@ class MapCanvas(QWidget):
 
     # -- coordinate helpers -------------------------------------------------
 
+    @property
+    def range_origin(self) -> Optional[Tuple[float, float]]:
+        """Where range rings, distance and bearing are measured from: the
+        ground station when one is set, otherwise the launch pad."""
+        if self.ground_station is not None:
+            return self.ground_station
+        if self.launch_pad is not None:
+            return self.launch_pad[1], self.launch_pad[2]
+        return None
+
+    @property
+    def overzoom_levels(self) -> int:
+        """How far the view is past the tile source's max zoom (0 = not)."""
+        source = self.provider.source
+        if (self.pack.kind != "mbtiles" or source is None
+                or source.name == "none"):
+            return 0
+        return max(0, self.zoom - source.max_zoom)
+
     def _origin(self) -> Tuple[float, float]:
         """World pixel at the widget's top-left corner."""
         cx, cy = lonlat_to_world(self.center_lon, self.center_lat, self.zoom)
@@ -1310,6 +1433,7 @@ class MapCanvas(QWidget):
             painter.fillRect(self.rect(), QColor(COL_BG))
             self._draw_base(painter)
             self._draw_tracks(painter)
+            self._draw_launch_pad(painter)
             self._draw_ground_station(painter)
             self._draw_vehicles(painter)
             self._draw_scale_bar(painter)
@@ -1357,8 +1481,9 @@ class MapCanvas(QWidget):
                        (bottom_right[0], bottom_right[1]),
                        lambda lon, lat: self._lonlat_to_pixel(lon, lat))
         draw_north_arrow(painter, self.width(), self.height())
-        if self.ground_station is not None and self.show_rings:
-            lat, lon = self.ground_station
+        origin = self.range_origin
+        if origin is not None and self.show_rings:
+            lat, lon = origin
             draw_range_rings(painter, lat, lon,
                              lambda a, b: self._lonlat_to_pixel(a, b),
                              metres_per_pixel(self.center_lat, self.zoom))
@@ -1396,6 +1521,10 @@ class MapCanvas(QWidget):
                     continue
                 wrapped = tx % span                 # the world repeats east-west
                 image = self.provider.get(self.zoom, wrapped, ty)
+                if image is None or image.isNull():
+                    image = self.provider.overzoomed(self.zoom, wrapped, ty)
+                    if image is not None:
+                        self.provider.overzoom_drawn += 1
                 if image is not None and not image.isNull():
                     painter.drawImage(rect, image)
                     self.provider.tiles_drawn += 1
@@ -1495,6 +1624,35 @@ class MapCanvas(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawPolyline(polygon)
 
+    def _draw_launch_pad(self, painter: QPainter) -> None:
+        """An orange diamond with the pad's name on a white label."""
+        if self.launch_pad is None:
+            return
+        name, lat, lon = self.launch_pad
+        pos = self._lonlat_to_pixel(lon, lat)
+        size = 8.0
+        diamond = QPolygonF([QPointF(pos.x(), pos.y() - size),
+                             QPointF(pos.x() + size, pos.y()),
+                             QPointF(pos.x(), pos.y() + size),
+                             QPointF(pos.x() - size, pos.y())])
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.setBrush(QColor(COL_PAD))
+        painter.drawPolygon(diamond)
+        font = QFont()
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        box = QRect(int(pos.x()) + 12, int(pos.y()) - 9,
+                    metrics.horizontalAdvance(name) + 10, 18)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 222))
+        painter.drawRect(box)
+        painter.setPen(QColor(COL_PAD))
+        painter.drawText(box.adjusted(5, 0, 0, 0),
+                         Qt.AlignVCenter | Qt.AlignLeft, name)
+        self.pad_drawn = True
+
     def _draw_ground_station(self, painter: QPainter) -> None:
         if self.ground_station is None:
             return
@@ -1544,8 +1702,9 @@ class MapCanvas(QWidget):
 
             alt = ("%.0f m" % last.alt_m) if last.has_valid_alt else "no alt"
             label = "%s  %s  %.0fs" % (track.vehicle, alt, age)
-            if self.ground_station is not None:
-                gs_lat, gs_lon = self.ground_station
+            origin = self.range_origin
+            if origin is not None:
+                gs_lat, gs_lon = origin
                 label += "  %.0fm @ %.0f°" % (
                     haversine_m(gs_lat, gs_lon, last.lat, last.lon),
                     bearing_deg(gs_lat, gs_lon, last.lat, last.lon))
@@ -1682,7 +1841,7 @@ class MapWindow(QDialog):
             "Tiles (.mbtiles), vector (.osmpack.json) and image overlays "
             "are all offline. Online sources are listed last and are the "
             "only ones that touch the network." % MAPS_DIR)
-        self.pack_combo.currentIndexChanged.connect(self._on_pack)
+        self.pack_combo.currentIndexChanged.connect(self._on_pack_chosen)
         bar.addWidget(self.pack_combo)
 
         bar.addWidget(QLabel("Follow:"))
@@ -1798,18 +1957,42 @@ class MapWindow(QDialog):
                 self.pack_combo.addItem("%s  (online)" % source.name)
         self.pack_combo.blockSignals(False)
 
-        # The remembered choice, if it is still there; otherwise the first
-        # real pack; otherwise the grid. Never an online source by default.
-        wanted = self._saved_pack
-        index = 0
-        if wanted:
-            for i, pack in enumerate(self.packs):
-                if pack.name == wanted:
-                    index = i
-                    break
-        if index == 0 and len(self.packs) > 1 and not wanted:
-            index = 1
+        index = self._default_pack_index()
         self.pack_combo.setCurrentIndex(index)
+        self._on_pack(index)
+
+    def _default_pack_index(self) -> int:
+        """Which pack to show at startup. Never an online source.
+
+        A pack the operator chose from the list, if it is still there.
+        Otherwise the best offline map: a tile pack covering the launch pad,
+        then any tile pack, then a vector or image pack, and only then the
+        grid. (A pack picked by this rule is not "chosen", so a tile pack
+        added later still wins over one picked automatically before.)
+        """
+        if self._saved_pack and self._pack_chosen:
+            for i, pack in enumerate(self.packs):
+                if pack.name == self._saved_pack:
+                    return i
+        pad = self.canvas.launch_pad
+
+        def covers_pad(pack: MapPack) -> bool:
+            if pad is None or pack.bounds is None:
+                return False
+            west, south, east, north = pack.bounds
+            return west <= pad[2] <= east and south <= pad[1] <= north
+
+        for rule in (lambda p: p.kind == "mbtiles" and covers_pad(p),
+                     lambda p: p.kind == "mbtiles",
+                     lambda p: p.kind in ("vector", "image")):
+            for i, pack in enumerate(self.packs):
+                if rule(pack):
+                    return i
+        return 0
+
+    def _on_pack_chosen(self, index: int) -> None:
+        """The operator picked from the list: remember it as their choice."""
+        self._pack_chosen = True
         self._on_pack(index)
 
     def _on_pack(self, index: int) -> None:
@@ -1962,6 +2145,12 @@ class MapWindow(QDialog):
 
     def _load_settings(self) -> None:
         self._saved_pack = ""
+        #: True when the remembered pack was picked by the operator rather
+        #: than by the startup default.
+        self._pack_chosen = False
+        self.tile_contact = ""
+        self._settings_data: Dict[str, Any] = {}
+        self._apply_launch_pad(None)
         #: An email or URL where the OpenStreetMap operations team can reach
         #: whoever runs this station. Their tile usage policy asks for it in
         #: the User-Agent; it is the operator's to fill in, in
@@ -1974,8 +2163,12 @@ class MapWindow(QDialog):
             self._apply_contact()
             return                      # no file, or unreadable: show nothing
         if isinstance(data, dict):
+            self._settings_data = data
             self._saved_pack = str(data.get("map_pack", "") or "")
+            self._pack_chosen = bool(data.get("map_pack_chosen", False))
             self.osm_contact = str(data.get(OSM_CONTACT_FIELD, "") or "").strip()
+            self.tile_contact = str(data.get(TILE_CONTACT_FIELD, "") or "").strip()
+            self._apply_launch_pad(data.get(LAUNCH_PAD_FIELD))
         self._apply_contact()
         station = data.get("ground_station") if isinstance(data, dict) else None
         if not isinstance(station, dict):
@@ -1991,15 +2184,54 @@ class MapWindow(QDialog):
         self.gs_lon.setValue(lon)
         self.gs_check.setChecked(bool(station.get("show", True)))
 
+    def _apply_launch_pad(self, entry: Any) -> None:
+        """Use *entry* ({"name", "lat", "lon"}) as the launch pad, or the
+        default when it is missing or not a valid position."""
+        pad = dict(DEFAULT_LAUNCH_PAD)
+        if isinstance(entry, dict):
+            try:
+                lat, lon = float(entry.get("lat")), float(entry.get("lon"))
+                if (math.isfinite(lat) and math.isfinite(lon)
+                        and -90 <= lat <= 90 and -180 <= lon <= 180):
+                    pad = {"name": str(entry.get("name") or pad["name"]),
+                           "lat": lat, "lon": lon}
+            except (TypeError, ValueError):
+                pass
+        self.launch_pad = pad
+        self.canvas.launch_pad = (pad["name"], pad["lat"], pad["lon"])
+        # Open over the pad: that is where the map pack is and where the
+        # flight will be, rather than at an unrelated default.
+        if not self.canvas.store.non_empty():
+            self.canvas.center_lat, self.canvas.center_lon = pad["lat"], pad["lon"]
+        self.canvas.request_redraw()
+
     def _save_settings(self) -> None:
-        payload = {"ground_station": {"lat": self.gs_lat.value(),
-                                      "lon": self.gs_lon.value(),
-                                      "show": self.gs_check.isChecked()},
-                   "map_pack": getattr(self, "_saved_pack", ""),
-                   # Written back even when empty, so the field is there to
-                   # be found and filled in rather than having to be known.
-                   OSM_CONTACT_FIELD: getattr(self, "osm_contact", ""),
-                   OSM_CONTACT_FIELD + "_help": OSM_CONTACT_HELP}
+        # Merged into what is already in the file, so keys this window does
+        # not own (the attitude panel's SMOOTH choice, anything added by
+        # hand) survive a save instead of being dropped.
+        payload: Dict[str, Any] = {}
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            if isinstance(existing, dict):
+                payload.update(existing)
+        except Exception:
+            pass
+        payload.update({
+            "ground_station": {"lat": self.gs_lat.value(),
+                               "lon": self.gs_lon.value(),
+                               "show": self.gs_check.isChecked()},
+            LAUNCH_PAD_FIELD: dict(getattr(self, "launch_pad",
+                                           DEFAULT_LAUNCH_PAD)),
+            "map_pack": getattr(self, "_saved_pack", ""),
+            "map_pack_chosen": bool(getattr(self, "_pack_chosen", False)),
+            # Written back even when empty, so the fields are there to be
+            # found and filled in rather than having to be known.
+            OSM_CONTACT_FIELD: getattr(self, "osm_contact", ""),
+            OSM_CONTACT_FIELD + "_help": OSM_CONTACT_HELP,
+            TILE_CONTACT_FIELD: getattr(self, "tile_contact", ""),
+            TILE_CONTACT_FIELD + "_help": TILE_CONTACT_HELP,
+        })
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
@@ -2029,6 +2261,15 @@ class MapWindow(QDialog):
             bits.append("%s %d fixes" % (track.vehicle, len(track.points)))
         if not store.non_empty():
             bits.append("no fixes yet")
+        levels = self.canvas.overzoom_levels
+        if levels:
+            source = self.canvas.provider.source
+            if levels <= OVERZOOM_LEVELS:
+                bits.append("overzoomed x%d from z%d" % (1 << levels,
+                                                         source.max_zoom))
+            else:
+                bits.append("overzoomed past the %d-level limit (z%d data) — "
+                            "zoom out" % (OVERZOOM_LEVELS, source.max_zoom))
         if self.canvas.pack.kind == "grid":
             bits.append("grid only — no map pack loaded, see README")
         elif self.canvas.vector_pack is not None:
