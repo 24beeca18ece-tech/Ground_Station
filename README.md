@@ -259,9 +259,10 @@ the source's 4,000-tile cap per job applies.
 **Licence: CC BY-NC-SA 4.0 - non-commercial use only, share alike, and the
 attribution shown whenever the imagery is.** The map shows
 "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH (Contains
-modified Copernicus Sentinel data 2023)". EOX allows offline packs inside an
-application but not redistribution of the raw tiles, so the `.mbtiles` is
-gitignored: build it on each machine with the command above.
+modified Copernicus Sentinel data 2023)". The 10 km pack is committed in
+`assets/maps/` (see `assets/maps/README.md` for its credit, licence, bounds
+and zoom), so the map works straight after a clone; the command above
+rebuilds it. Any other `.mbtiles` you build stays gitignored.
 
 **Or build the pack in a GUI**, which is often easier and is the only route
 for providers this tool refuses:

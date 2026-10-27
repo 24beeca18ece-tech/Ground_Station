@@ -119,8 +119,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Sentinel-2 cloudless (EOX) offline pack. EOX permits it inside this
-# application for non-commercial use but not redistribution of the raw tiles,
-# so it is rebuilt locally with tools/fetch_tiles.py (see README), never committed.
-assets/maps/launchpad_s2.mbtiles
+# The 10 km launch pad satellite pack (Sentinel-2 cloudless 2023, EOX,
+# CC BY-NC-SA 4.0; see assets/maps/README.md) is committed so the map works
+# straight after a clone. This one file only: every other .mbtiles stays
+# ignored, and so does its SQLite journal.
+!assets/maps/launchpad_s2.mbtiles
 assets/maps/launchpad_s2.mbtiles-journal

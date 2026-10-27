@@ -7,9 +7,9 @@ MBTiles file, the launch pad marker and range origin, overzoom past the
 pack's max zoom, the polite downloader -- and that the whole thing runs with
 no network at all.
 
-The real pack (assets/maps/launchpad_s2.mbtiles) is gitignored and rebuilt
-locally, so these tests build small packs of their own; the one test that
-reads the real pack is skipped when it is absent.
+These tests build small packs of their own, so they do not depend on the
+real one (assets/maps/launchpad_s2.mbtiles); the tests that read the real
+pack are skipped when it is absent.
 
     python -m pytest tools/test_sat_pack.py -v
 """
@@ -712,3 +712,25 @@ def test_missing_tiles_stay_light_grey_over_the_graticule(qapp, tmp_path):
     assert inside.lightness() > 170, inside.name()
     window.shutdown()
     window.close()
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_PACK),
+                    reason="launchpad_s2.mbtiles not present")
+def test_the_committed_pack_matches_its_readme():
+    """assets/maps/README.md states the pack's bounds, zoom and credit; the
+    file's own metadata must agree, and the map shows the same credit."""
+    meta = mw.read_mbtiles_metadata(REAL_PACK)
+    bounds = [float(v) for v in meta["bounds"].split(",")]
+    assert bounds == pytest.approx([84.2542, 26.6751, 84.3549, 26.7650])
+    assert (meta["minzoom"], meta["maxzoom"]) == ("8", "14")
+    assert meta["attribution"] == EOX
+    with open(os.path.join(ROOT, "assets", "maps", "README.md"),
+              encoding="utf-8") as handle:
+        readme = handle.read()
+    assert EOX in readme
+    for text in ("CC BY-NC-SA 4.0", "non-commercial", "W 84.2542, E 84.3549, "
+                 "S 26.6751, N 26.7650", "8 to 14", "26.720028 N, 84.304583 E",
+                 "Sentinel-2 cloudless 2023 by EOX IT Services GmbH (contains "
+                 "modified Copernicus Sentinel data 2023)"):
+        assert text in readme, text
+    assert mw.mbtiles_pack("launchpad_s2.mbtiles", REAL_PACK).attribution == EOX
