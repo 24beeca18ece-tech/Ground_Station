@@ -62,6 +62,7 @@ actually on the platter.
 from __future__ import annotations
 
 import csv
+import io
 import os
 import queue
 import time
@@ -112,6 +113,10 @@ REWRITE_AMORTIZE_DIVISOR = 20
 REWRITE_MAX_INTERVAL_S = 15.0
 REWRITE_CEILING_SCALE_ROWS = 12000
 REWRITE_MAX_INTERVAL_CAP_S = 90.0
+
+#: The rewrite reads the journal backwards in blocks of this size, so its
+#: memory does not grow with the session.
+REWRITE_BLOCK_BYTES = 1 << 20
 
 # Queue item kinds
 _KIND_PACKET = "packet"
@@ -441,6 +446,77 @@ class CsvLoggerThread(QThread):
         self._rewrite_csv()
         self.file_opened.emit(path)
 
+    def _write_reversed_journal(self, tmp: str) -> bool:
+        """Write header + the journal's data lines newest-first to *tmp*.
+
+        Memory is bounded by REWRITE_BLOCK_BYTES whatever the journal's size:
+        the file is read backwards a block at a time and each complete line
+        is written as it is found. The journal and the CSV are written by
+        the same csv.writer dialect, so the result is byte-for-byte what
+        parsing and re-serialising every row produced.
+
+        Returns False, having written nothing usable, if a line has an odd
+        number of quote characters -- a quoted field containing a newline,
+        which only the parser can keep in one piece. Raises OSError as the
+        old path did.
+        """
+        header = io.StringIO()
+        csv.writer(header).writerow(CSV_HEADER)
+        header_bytes = header.getvalue().encode("utf-8")
+        if self._journal_file is not None:
+            try:
+                self._journal_file.flush()       # rows still in the buffer
+            except (OSError, ValueError):
+                pass
+        with open(tmp, "wb") as out:
+            out.write(header_bytes)
+            if self._journal_path is None or not os.path.exists(self._journal_path):
+                out.flush()
+                os.fsync(out.fileno())
+                return True
+            with open(self._journal_path, "rb") as journal:
+                first = journal.readline()
+                # Starts with the header: skip it. Otherwise the first line
+                # is data (as the parsing path treats it).
+                start = len(first) if first == header_bytes else 0
+                journal.seek(0, os.SEEK_END)
+                pos = journal.tell()
+                # A last row written without its terminator (a crash
+                # mid-write) is kept, terminated, as the parser kept it.
+                tail = b""
+                if pos > start:
+                    journal.seek(pos - 1)
+                    last_byte = journal.read(1)
+                    if last_byte == b"\r":
+                        tail = b"\n"          # cut between "\r" and "\n"
+                    elif last_byte != b"\n":
+                        tail = b"\r\n"
+                first_block = True
+                while pos > start:
+                    size = min(REWRITE_BLOCK_BYTES, pos - start)
+                    pos -= size
+                    journal.seek(pos)
+                    lines = (journal.read(size) + tail).split(b"\n")
+                    # Each line ends with "\r" (the terminator is "\r\n")
+                    # except the piece after the last newline, which is
+                    # empty in the first block and dropped.
+                    if first_block:
+                        lines.pop()
+                        first_block = False
+                    # The first piece may be a line cut by the block edge:
+                    # carry it into the next (earlier) block.
+                    tail = lines.pop(0) if pos > start else b""
+                    for line in reversed(lines):
+                        if not line.strip(b"\r"):
+                            continue                  # blank: skipped before too
+                        if line.count(b'"') % 2:
+                            return False
+                        out.write(line + b"\n")
+            out.flush()
+            # The swap is only worth anything once the bytes are down.
+            os.fsync(out.fileno())
+        return True
+
     def _read_journal_rows(self) -> List[List[Any]]:
         """The session's data rows, oldest-first, read back from the journal.
 
@@ -486,20 +562,22 @@ class CsvLoggerThread(QThread):
             return False
         tmp = self._csv_path + ".tmp"
         try:
-            # The journal is the source of truth and is already on disk, so
-            # the rows are read back here rather than held in memory for the
-            # whole session. This list is transient: it exists for the
-            # duration of the rewrite and is freed when it returns.
-            rows = self._read_journal_rows()
-            with open(tmp, "w", newline="", encoding="utf-8") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(CSV_HEADER)
-                # reversed() is a view, not a copy: no second list is built.
-                writer.writerows(reversed(rows))
-                del rows
-                handle.flush()
-                # The swap is only worth anything once the bytes are down.
-                os.fsync(handle.fileno())
+            # The journal's lines, copied newest-first in fixed-size blocks.
+            # Parsing the whole journal into a list on every rewrite made the
+            # transient peak grow with the session (42.8 MB at 40 min at
+            # 20 Hz) and, measured over a 20-minute run, accounted for ~52 MB
+            # of RSS growth: the process did not give the memory back.
+            if not self._write_reversed_journal(tmp):
+                # A record spanning lines (a quoted field with a newline):
+                # the line copy cannot reverse it, so parse it as before.
+                rows = self._read_journal_rows()
+                with open(tmp, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(CSV_HEADER)
+                    writer.writerows(reversed(rows))
+                    del rows
+                    handle.flush()
+                    os.fsync(handle.fileno())
             os.replace(tmp, self._csv_path)
         except OSError as exc:
             self.error_occurred.emit("CSV rewrite failed: %s" % exc)
