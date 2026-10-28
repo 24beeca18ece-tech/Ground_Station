@@ -77,15 +77,27 @@ FLUSH_MS = 200
 STICKY_TOP_PX = 32
 
 
+#: A stored row is one string, its cells' text joined by this separator (ASCII
+#: unit separator: never in telemetry and never typed into the filter). Held
+#: as a list of ~38 objects a row cost ~1.5 KB, about 30 MB at MAX_ROWS --
+#: measured as most of the remaining RSS growth over a 20-minute session.
+CELL_SEP = "\x1f"
+
+
 class CsvTableModel(QAbstractTableModel):
     """Bounded, filterable table over the rows written to the CSV."""
 
     def __init__(self, headers: List[str], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._headers = list(headers)
-        self._rows: Deque[List[Any]] = deque(maxlen=MAX_ROWS)
-        self._view: List[List[Any]] = []      # rows passing the current filter
+        #: Rows as CELL_SEP-joined strings, newest first.
+        self._rows: Deque[str] = deque(maxlen=MAX_ROWS)
+        self._view: List[str] = []            # rows passing the current filter
         self._filter = ""
+        # data() is asked for one cell at a time, row by row: split each row
+        # once, not once per cell.
+        self._split_row: Optional[str] = None
+        self._split_cells: List[str] = []
         try:
             self._state_col = self._headers.index("fsm_state_name")
             self._valid_col = self._headers.index("checksum_valid")
@@ -117,9 +129,9 @@ class CsvTableModel(QAbstractTableModel):
             # renumbered on each arrival. seq is stamped by the logger in
             # arrival order and travels with the row.
             if 0 <= self._seq_col and section < len(self._view):
-                row = self._view[section]
-                if self._seq_col < len(row) and str(row[self._seq_col]) != "":
-                    return str(row[self._seq_col])
+                row = self._cells(self._view[section])
+                if self._seq_col < len(row) and row[self._seq_col] != "":
+                    return row[self._seq_col]
             return section + 1
         if role == Qt.ForegroundRole and orientation == Qt.Horizontal:
             return QColor(COL_HEADER)
@@ -128,14 +140,14 @@ class CsvTableModel(QAbstractTableModel):
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
-        row = self._view[index.row()]
+        row = self._cells(self._view[index.row()])
         col = index.column()
         if role == Qt.DisplayRole:
-            return "" if col >= len(row) else str(row[col])
+            return "" if col >= len(row) else row[col]
         if role == Qt.ForegroundRole:
             # A failed checksum should never appear here (only validated packets
             # are logged), so flag it loudly if one ever does.
-            if col == self._valid_col and col < len(row) and str(row[col]) != "1":
+            if col == self._valid_col and col < len(row) and row[col] != "1":
                 return QColor(COL_ALERT)
             if col == self._state_col:
                 return QColor(COL_OK)
@@ -156,6 +168,7 @@ class CsvTableModel(QAbstractTableModel):
         """
         if not rows:
             return
+        rows = [CELL_SEP.join(str(cell) for cell in row) for row in rows]
         # Reversed, so the newest row of this batch is the first one inserted.
         matching = [r for r in reversed(rows) if self._matches(r)]
         # The deque may evict from the tail; if it does, the filtered view has
@@ -185,14 +198,22 @@ class CsvTableModel(QAbstractTableModel):
         self._view = []
         self.endResetModel()
 
-    def _matches(self, row: List[Any]) -> bool:
-        """Case-insensitive substring match against any cell in the row."""
+    def _cells(self, row: str) -> List[str]:
+        """A stored row's cells, as text."""
+        if row is not self._split_row:
+            self._split_row = row
+            self._split_cells = row.split(CELL_SEP)
+        return self._split_cells
+
+    def _matches(self, row: str) -> bool:
+        """Case-insensitive substring match against any cell in the row.
+
+        One search over the joined row: the filter cannot contain CELL_SEP,
+        so it can never match across two cells.
+        """
         if not self._filter:
             return True
-        for cell in row:
-            if self._filter in str(cell).lower():
-                return True
-        return False
+        return self._filter in row.lower()
 
     @property
     def total_rows(self) -> int:
