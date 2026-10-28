@@ -2410,7 +2410,10 @@ class MapWindow(QDialog):
         if cursor:
             bits.append("cursor %.6f, %.6f" % cursor)
         for track in store.non_empty():
-            bits.append("%s %d fixes" % (track.vehicle, len(track.points)))
+            # len(track), not len(track.points): .points builds an object per
+            # fix (38 ms at 40,000), and this runs twice a second even with
+            # the map window closed.
+            bits.append("%s %d fixes" % (track.vehicle, len(track)))
             last = track.last
             if last is not None and self.canvas.outside_pack(last.lat, last.lon):
                 bits.append("%s outside map pack" % track.vehicle)

@@ -95,6 +95,8 @@ STATUS_HZ = 5                  # link-status (staleness, rate) refresh rate
 STALE_AFTER_S = 2.0            # telemetry considered stale after this gap
 RATE_WINDOW_S = 3.0            # averaging window for packets/sec
 MAX_PLOT_POINTS = 40000        # hard cap per series (~33 min at 20 Hz)
+#: Most points the ground-track plot draws; the history is thinned to this.
+GROUND_TRACK_MAX_DRAWN = 2000
 
 #: Headroom above MAX_PLOT_POINTS so the window is compacted once every
 #: _COMPACT_SLACK samples rather than shifting the whole array on every
@@ -1054,7 +1056,20 @@ class GpsTrackPlot(pg.PlotWidget):
         if not self._dirty or not self._lats:
             return
         self._dirty = False
-        self._track.setData(self._lons, self._lats)
+        # Draw at most GROUND_TRACK_MAX_DRAWN points of the history (every
+        # step-th fix, plus the newest). Handing pyqtgraph the whole history
+        # -- up to MAX_PLOT_POINTS, a line and a dot per fix, on every render
+        # -- grew to 57 ms per redraw at 40,000 fixes, 15 times a second:
+        # the GUI thread saturated about half an hour into a 20 Hz session.
+        # The panel is ~300 px wide, so 2,000 points draw the same shape.
+        n = len(self._lats)
+        step = max(1, -(-n // GROUND_TRACK_MAX_DRAWN))
+        lons = self._lons[::step]
+        lats = self._lats[::step]
+        if (n - 1) % step:
+            lons.append(self._lons[-1])
+            lats.append(self._lats[-1])
+        self._track.setData(np.asarray(lons), np.asarray(lats))
         self._current.setData([self._lons[-1]], [self._lats[-1]])
 
 
