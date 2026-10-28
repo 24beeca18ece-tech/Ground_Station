@@ -125,3 +125,7 @@ Desktop.ini
 # ignored, and so does its SQLite journal.
 !assets/maps/launchpad_s2.mbtiles
 assets/maps/launchpad_s2.mbtiles-journal
+
+# Soak runs (tools/soak_guard.py): measurements, not source.
+tools/soak_log.csv
+tools/.soak.lock
