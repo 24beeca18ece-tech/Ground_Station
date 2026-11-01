@@ -22,7 +22,7 @@ vehicle-specific sensors appended after ``FSM_STATE``::
 
     CANSAT (26 fields)  adds  PM1_0,PM2_5,PM4_0,PM10,REACTION_WHEEL_RPM,
                               RECOVERY_STAGE   (25-field pre-PM4_0 also read)
-    ROCKET (22 fields)  adds  SOLENOID_FIRED,NICHROME_FIRED
+    ROCKET (22 fields)  adds  SOLENOID_FIRED,<reserved/ignored>
 
 * The frame starts at ``$`` and ends at ``*`` followed by exactly two hex digits.
 * ``CS`` is the XOR of every byte *between* ``$`` and ``*`` (NMEA-0183 style).
@@ -145,9 +145,9 @@ FIELDS_CANSAT_EXTRA_LEGACY: List[str] = [
     "PM1_0", "PM2_5", "PM10", "REACTION_WHEEL_RPM", "RECOVERY_STAGE",
 ]
 
-#: Dual-stage pyrotechnic / mechanical recovery status flags.
+#: Rocket extra fields. The second field is reserved and ignored by the GCS.
 FIELDS_ROCKET_EXTRA: List[str] = [
-    "SOLENOID_FIRED", "NICHROME_FIRED",
+    "SOLENOID_FIRED", "_RESERVED",
 ]
 
 FIELD_COUNT_V1 = len(FIELDS_V1)                                    # 19
@@ -376,7 +376,7 @@ def format_mission_time(seconds: float) -> str:
 #: Number of vehicle-specific cells every packet contributes to a CSV row.
 #: A packet that does not carry a given sensor writes an empty cell for it, so
 #: one CSV can hold a mixed CanSat/Rocket session without a schema change.
-_VARIANT_CELL_COUNT = 9
+_VARIANT_CELL_COUNT = 8
 
 #: CSV column order.  ``CSV_HEADER``, :meth:`TelemetryPacket.to_csv_row` and
 #: :meth:`TelemetryPacket._variant_cells` are kept adjacent on purpose -- if you
@@ -419,7 +419,6 @@ CSV_HEADER: List[str] = [
     "recovery_stage",         # CanSat: 0/1/2
     "recovery_stage_name",    # CanSat: STOWED/DROGUE/PARAFOIL
     "solenoid_fired",         # Rocket: 6 V latch at apogee
-    "nichrome_fired",         # Rocket: cutter at 400 m AGL
     # -----------------------------------------------------------------------
     "raw_frame",
 ]
@@ -680,18 +679,16 @@ class CanSatPacket(TelemetryPacket):
             self.pm1_0, self.pm2_5, self.pm4_0, self.pm10,
             self.reaction_wheel_rpm,
             self.recovery_stage, self.recovery_stage_name,
-            "", "",          # solenoid / nichrome: not fitted to the CanSat
+            "",              # solenoid: not fitted to the CanSat
         ]
 
 
 @dataclass(slots=True)
 class RocketPacket(TelemetryPacket):
-    """Rocket frame: dual-stage pyrotechnic / mechanical recovery status."""
+    """Rocket frame: solenoid drogue status."""
 
     #: 6 V solenoid latch released at apogee (drogue event).
     solenoid_fired: bool = False
-    #: Nichrome cutter fired at 400 m AGL (main deployment event).
-    nichrome_fired: bool = False
 
     def _variant_cells(self) -> List[Any]:
         return [
@@ -699,7 +696,6 @@ class RocketPacket(TelemetryPacket):
             # recovery stage name: all CanSat-only, blank on a rocket.
             "", "", "", "", "", "", "",
             1 if self.solenoid_fired else 0,
-            1 if self.nichrome_fired else 0,
         ]
 
 
@@ -894,7 +890,7 @@ def parse_frame(frame: str, gs_recv_epoch: Optional[float] = None) -> TelemetryP
         **shared,
         **common,
         solenoid_fired=_opt_bool(fields[extra_at]),
-        nichrome_fired=_opt_bool(fields[extra_at + 1]),
+        # fields[extra_at + 1] is transmitted but reserved; ignored by the GCS.
     )
 
 

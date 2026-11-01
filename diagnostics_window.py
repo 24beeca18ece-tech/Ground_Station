@@ -220,7 +220,6 @@ SECTIONS: List[Tuple[str, List[Tuple[str, str]]]] = [
     ("FLIGHT STATE / RECOVERY", [
         ("fsm", "FSM STATE"),
         ("solenoid", "SOLENOID FIRED"),
-        ("nichrome", "NICHROME FIRED"),
     ]),
     ("LINK DIAGNOSTICS", [
         ("rate", "PACKET RATE"),
@@ -418,13 +417,11 @@ class DiagnosticsWindow(QDialog):
             # Rocket-only recovery flags.  A CanSat or legacy packet does not
             # carry them, and showing "SAFE" there would be a lie.
             if packet.is_rocket:
-                for key, fired in (("solenoid", packet.solenoid_fired),
-                                   ("nichrome", packet.nichrome_fired)):
-                    self._set(key, "FIRED" if fired else "SAFE",
-                              COL_ALERT if fired else COL_OK)
+                self._set("solenoid",
+                          "FIRED" if packet.solenoid_fired else "SAFE",
+                          COL_ALERT if packet.solenoid_fired else COL_OK)
             else:
                 self._set("solenoid", "n/a", COL_DIM)
-                self._set("nichrome", "n/a", COL_DIM)
         except Exception:
             # A diagnostics view must never disturb the ingestion path.
             pass

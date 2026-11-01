@@ -134,6 +134,10 @@ BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "921600"]
 #: "$CMD" sentence type can never be mistaken for a telemetry frame: the parser
 #: keys on TEAM_ID in field 0 and would reject this outright.
 EJECT_COMMAND_BODY = "CMD,EJECT"
+#: Single-byte payloads for rocket telemetry control. The firmware treats these
+#: as absolute states, so repeating either command is always harmless.
+TX_START_COMMAND = b"A"   # rocket: start transmitting
+TX_STOP_COMMAND  = b"B"   # rocket: stop transmitting
 
 #: The two ground radios. The flight transmitter alternates destinations per
 #: packet, so NEITHER of these receives the whole stream on its own -- each sees
@@ -336,6 +340,16 @@ QPushButton#ejectBtn {{
 }}
 QPushButton#ejectBtn:hover {{ background-color: #d8283c; border-color: #8c1220; }}
 QPushButton#ejectBtn:pressed {{ background-color: #8c1220; }}
+QPushButton#txStartBtn {{
+    background-color: {COL_OK}; border-color: #0a5c2e; color: #ffffff;
+    font-weight: 700; letter-spacing: 1px;
+}}
+QPushButton#txStartBtn:hover {{ background-color: #138f4d; }}
+QPushButton#txStopBtn {{
+    background-color: {COL_WARN}; border-color: #7a3d00; color: #ffffff;
+    font-weight: 700; letter-spacing: 1px;
+}}
+QPushButton#txStopBtn:hover {{ background-color: #b85c00; }}
 /* Voice callout toggle. Quiet when speaking is enabled (it is the normal
    state); amber when muted, because a muted callout during a flight is the
    thing an operator would want to notice. */
@@ -1117,6 +1131,10 @@ class Dashboard(QMainWindow):
         self.telemetry_active = False
         self._was_stale = False
         self._last_fsm: Optional[int] = None
+        #: True after TX STOP until the next valid packet; suppresses stale alarm.
+        self._tx_cmd_stopped = False
+        self._tx_start_time: Optional[float] = None
+        self._tx_stop_time:  Optional[float] = None
         #: PAYLOAD_TYPE seen in the stream; drives the auto-detected panel.
         self._detected_payload: str = ""
 
@@ -1827,12 +1845,7 @@ class Dashboard(QMainWindow):
         self.light_solenoid.setToolTip(
             "6 V solenoid latch, released at apogee to deploy the drogue."
         )
-        self.light_nichrome = StatusLight("Nichrome")
-        self.light_nichrome.setToolTip(
-            "Nichrome line cutter, fired at 400 m AGL to deploy the main."
-        )
         lights.addWidget(self.light_solenoid)
-        lights.addWidget(self.light_nichrome)
         layout.addLayout(lights)
 
         self.recovery_summary = QLabel("Recovery sequence not started")
@@ -1888,7 +1901,7 @@ class Dashboard(QMainWindow):
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 2, 0, 0)
-        layout.setSpacing(3)
+        layout.setSpacing(2)
 
         rule = QFrame()
         rule.setFrameShape(QFrame.HLine)
@@ -1910,6 +1923,26 @@ class Dashboard(QMainWindow):
             "you can confirm the radio is delivering before you start."
         )
 
+        self.tx_start_btn = QPushButton("ROCKET TX START (A)")
+        self.tx_start_btn.setObjectName("txStartBtn")
+        self.tx_start_btn.setEnabled(False)
+        self.tx_start_btn.setToolTip(
+            "UPLINK COMMAND — sends a single byte 0x41 ('A') to the rocket.\n\n"
+            "Tells the flight computer to begin transmitting telemetry. The\n"
+            "command is sent 3 times, 200 ms apart (safe to repeat).\n\n"
+            "Routed through RX1 if connected, otherwise RX2."
+        )
+
+        self.tx_stop_btn = QPushButton("ROCKET TX STOP (B)")
+        self.tx_stop_btn.setObjectName("txStopBtn")
+        self.tx_stop_btn.setEnabled(False)
+        self.tx_stop_btn.setToolTip(
+            "UPLINK COMMAND — sends a single byte 0x42 ('B') to the rocket.\n\n"
+            "Tells the flight computer to stop transmitting telemetry. The\n"
+            "LoRa recovery beacon keeps running. Asks for confirmation.\n\n"
+            "Routed through RX1 if connected, otherwise RX2."
+        )
+
         self.eject_btn = QPushButton("EJECT PAYLOAD")
         self.eject_btn.setObjectName("ejectBtn")
         self.eject_btn.setToolTip(
@@ -1925,9 +1958,10 @@ class Dashboard(QMainWindow):
         # buttons sharing that clip "START TELEMETRY" and "EJECT PAYLOAD".
         # Full width each also gives EJECT a deliberately large target that is
         # hard to hit by accident on the way to something else.
-        for button in (self.telemetry_btn, self.eject_btn):
+        for button in (self.telemetry_btn, self.tx_start_btn,
+                       self.tx_stop_btn, self.eject_btn):
             button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            button.setMinimumHeight(29)
+            button.setMinimumHeight(28)
             layout.addWidget(button)
         return box
 
@@ -2206,9 +2240,12 @@ class Dashboard(QMainWindow):
                 self.on_connection_changed(ok, msg, rid))
             worker.log_message.connect(
                 lambda text, rid=radio_id: self.append_event("%s: %s" % (rid, text)))
-        # Uplink is RX1's job only; a command must go out once, not twice.
-        self.serial_worker.command_sent.connect(self.on_command_sent)
-        self.serial_worker.transmit_status.connect(self.on_transmit_status)
+        # Uplink signals from both workers: TX START/STOP may go through either.
+        # EJECT still uses RX1 only; connecting both here costs nothing extra
+        # because command_sent fires only when the worker actually writes bytes.
+        for worker in self.serial_workers.values():
+            worker.command_sent.connect(self.on_command_sent)
+            worker.transmit_status.connect(self.on_transmit_status)
 
         self.csv_logger.file_opened.connect(self.on_log_file_opened)
         # Every row the logger writes also lands in the live table.
@@ -2228,6 +2265,8 @@ class Dashboard(QMainWindow):
         # Start stopped, and show it: the banner and the green START label are
         # set through the same path a button press uses.
         self._apply_telemetry_state()
+        self.tx_start_btn.clicked.connect(self.on_tx_start_clicked)
+        self.tx_stop_btn.clicked.connect(self.on_tx_stop_clicked)
         self.eject_btn.clicked.connect(self.on_eject_clicked)
         self.diag_btn.clicked.connect(self.toggle_diagnostics)
         self.csv_table_btn.clicked.connect(self.toggle_csv_table)
@@ -2340,6 +2379,8 @@ class Dashboard(QMainWindow):
         any_up = any(st["connected"] for st in self.radio_state.values())
         both_up = all(st["connected"] for st in self.radio_state.values())
         self.is_connected = any_up
+        self.tx_start_btn.setEnabled(any_up)
+        self.tx_stop_btn.setEnabled(any_up)
 
         if both_up:
             text, color = "● RX1+RX2", COL_OK
@@ -2550,6 +2591,9 @@ class Dashboard(QMainWindow):
             # TELEMETRY STALE quiet) while ingestion is deliberately stopped.
             self.last_packet_epoch = packet.gs_recv_epoch
             self.recv_times.append(packet.gs_recv_epoch)
+
+            if self._tx_cmd_stopped:
+                self._tx_cmd_stopped = False
 
             # STOPPED: ignore the packet entirely. Nothing is charted, logged,
             # or fed to the attitude estimator -- the packet is dropped here.
@@ -3029,12 +3073,8 @@ class Dashboard(QMainWindow):
 
         elif packet.is_rocket:
             self.light_solenoid.set_state(packet.solenoid_fired)
-            self.light_nichrome.set_state(packet.nichrome_fired)
 
-            if packet.nichrome_fired:
-                text = "Main deployed (400 m AGL)"
-                style = "color:#0b1219; background:%s;" % COL_OK
-            elif packet.solenoid_fired:
+            if packet.solenoid_fired:
                 text = "Drogue deployed (apogee)"
                 style = "color:#0b1219; background:%s;" % COL_WARN
             else:
@@ -3100,17 +3140,24 @@ class Dashboard(QMainWindow):
             return
 
         age = now - self.last_packet_epoch
-        self.tile_age.set_value("%.1f" % age)
-
         stale = age > STALE_AFTER_S
-        self.tile_age.set_level("alert" if stale else "ok")
+        if stale and self._tx_cmd_stopped:
+            self.tile_age.set_value("TX STOP")
+            self.tile_age.set_level("warn")
+        else:
+            self.tile_age.set_value("%.1f" % age)
+            self.tile_age.set_level("alert" if stale else "ok")
 
         if stale != self._was_stale:
             self._was_stale = stale
             if stale:
-                self.append_event("TELEMETRY STALE — no valid packet for >%.0f s"
-                                  % STALE_AFTER_S)
-                self.csv_logger.log_note("telemetry stale")
+                if self._tx_cmd_stopped:
+                    self.append_event("TX STOPPED BY COMMAND — link quiet as expected.")
+                    self.csv_logger.log_note("tx stopped by command")
+                else:
+                    self.append_event("TELEMETRY STALE — no valid packet for >%.0f s"
+                                      % STALE_AFTER_S)
+                    self.csv_logger.log_note("telemetry stale")
             else:
                 self.append_event("Telemetry recovered.")
                 self.csv_logger.log_note("telemetry recovered")
@@ -3229,6 +3276,99 @@ class Dashboard(QMainWindow):
         self.telemetry_btn.setProperty("running", "true" if running else "false")
         self.telemetry_btn.style().unpolish(self.telemetry_btn)
         self.telemetry_btn.style().polish(self.telemetry_btn)
+
+    # ------------------------------------------------------------------
+    # Rocket telemetry start / stop uplink
+    # ------------------------------------------------------------------
+
+    def _pick_tx_worker(self):
+        """Return (SerialWorker, radio_id) for uplink, preferring RX1."""
+        for rid in RADIO_IDS:
+            if self.radio_state[rid]["connected"]:
+                return self.serial_workers[rid], rid
+        return None, None
+
+    def _queue_repeated(self, worker, payload: bytes,
+                        description: str, count: int, interval_ms: int) -> None:
+        """Queue *payload* through *worker* exactly *count* times, spaced by
+        *interval_ms* ms. Uses QTimer so the GUI thread is never blocked."""
+        for i in range(count):
+            QTimer.singleShot(
+                i * interval_ms,
+                lambda idx=i + 1: worker.send_command(
+                    payload, "%s (%d/%d)" % (description, idx, count)))
+
+    def on_tx_start_clicked(self) -> None:
+        """Queue TX START (b'A') 3 times, 200 ms apart."""
+        worker, radio_id = self._pick_tx_worker()
+        if worker is None:
+            QMessageBox.warning(self, "Not connected",
+                                "No receiver is connected; cannot transmit.")
+            return
+
+        stamp = datetime.now().isoformat(timespec="milliseconds")
+        self.append_event(
+            "TX START queued at %s via %s: %r" % (stamp, radio_id, TX_START_COMMAND))
+        self.csv_logger.log_note(
+            "TX START command queued via %s: %r" % (radio_id, TX_START_COMMAND))
+
+        self._queue_repeated(worker, TX_START_COMMAND, "TX START", 3, 200)
+
+        self._tx_start_time = time.time()
+        QTimer.singleShot(3000, self._check_tx_start_confirmed)
+
+    def on_tx_stop_clicked(self) -> None:
+        """Confirm, then queue TX STOP (b'B') 3 times, 200 ms apart."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Stop rocket telemetry?")
+        box.setText("Stop rocket telemetry?")
+        box.setInformativeText(
+            "The rocket stops sending packets until you press START.\n"
+            "The LoRa recovery beacon keeps running."
+        )
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Cancel)
+        box.button(QMessageBox.Ok).setText("STOP TELEMETRY")
+        if box.exec_() != QMessageBox.Ok:
+            return
+
+        worker, radio_id = self._pick_tx_worker()
+        if worker is None:
+            QMessageBox.warning(self, "Not connected",
+                                "No receiver is connected; cannot transmit.")
+            return
+
+        stamp = datetime.now().isoformat(timespec="milliseconds")
+        self.append_event(
+            "TX STOP queued at %s via %s: %r" % (stamp, radio_id, TX_STOP_COMMAND))
+        self.csv_logger.log_note(
+            "TX STOP command queued via %s: %r" % (radio_id, TX_STOP_COMMAND))
+
+        self._queue_repeated(worker, TX_STOP_COMMAND, "TX STOP", 3, 200)
+
+        self._tx_cmd_stopped = True
+        self._tx_stop_time = time.time()
+        QTimer.singleShot(3000, self._check_tx_stop_confirmed)
+
+    def _check_tx_start_confirmed(self) -> None:
+        """3 s after TX START: warn if no packets have arrived."""
+        if self._tx_start_time is None:
+            return
+        if (self.last_packet_epoch is not None
+                and self.last_packet_epoch > self._tx_start_time):
+            return   # at least one packet arrived after the command — confirmed
+        self.append_event("TX START not confirmed: no packets received")
+        self.csv_logger.log_note("TX START not confirmed: no packets received")
+
+    def _check_tx_stop_confirmed(self) -> None:
+        """3 s after TX STOP: warn if packets are still arriving."""
+        if self._tx_stop_time is None:
+            return
+        if (self.last_packet_epoch is not None
+                and self.last_packet_epoch > self._tx_stop_time):
+            self.append_event("TX STOP not confirmed: packets still arriving")
+            self.csv_logger.log_note("TX STOP not confirmed: packets still arriving")
 
     def on_eject_clicked(self) -> None:
         """Confirm, then transmit a real ejection command over the radio."""
@@ -3354,7 +3494,6 @@ class Dashboard(QMainWindow):
             tile.set_value("--")
             tile.set_level("normal")
         self.light_solenoid.set_state(None)
-        self.light_nichrome.set_state(None)
         self.recovery_summary.setText("Recovery sequence not started")
         self.recovery_summary.setStyleSheet(
             "color:%s; background:#242c38; border-radius:4px; padding:5px;"

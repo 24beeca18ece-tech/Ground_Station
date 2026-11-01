@@ -30,7 +30,7 @@ USAGE
     python packet_sim.py                        # TCP server on 127.0.0.1:5555
     python packet_sim.py --rate 20              # 20 Hz (competition nominal)
     python packet_sim.py --payload-type cansat  # SPS30 + reaction wheel (default)
-    python packet_sim.py --payload-type rocket  # solenoid + nichrome flags
+    python packet_sim.py --payload-type rocket  # solenoid flag
     python packet_sim.py --payload-type generic # legacy 19-field v1 frames
     python packet_sim.py --serial COM11         # write to a real/virtual COM port
     python packet_sim.py --stdout               # just print frames to the console
@@ -147,7 +147,7 @@ class MissionSim:
 
     * ``CANSAT`` -- Sensirion SPS30 particulate channels, reaction-wheel RPM and
       the recovery-stage sequencer.
-    * ``ROCKET`` -- solenoid latch and nichrome cutter status flags.
+    * ``ROCKET`` -- solenoid latch status flag.
     * ``GENERIC`` -- neither; emits the legacy 19-field v1 frame, which is what
       the pre-v2 firmware and the older log files use.
     """
@@ -157,7 +157,7 @@ class MissionSim:
     T_APOGEE = 22.0
     T_DROGUE_END = 24.0        # end of the DEPLOY transient
     DROGUE_MPS = 20.0
-    MAIN_DEPLOY_AGL = 400.0    # nichrome cutter altitude, per the CDR
+    MAIN_DEPLOY_AGL = 400.0    # main deployment altitude
     MAIN_MPS = 8.0
 
     #: Reaction wheel saturation, per the CanSat CDR.
@@ -195,7 +195,6 @@ class MissionSim:
         # state rather than recomputed from t -- that way a clock glitch in the
         # simulator cannot make an already-fired charge report SAFE again.
         self._solenoid_fired = False
-        self._nichrome_fired = False
         self._recovery_stage = 0
         self._wheel_rpm = 0.0
 
@@ -301,18 +300,16 @@ class MissionSim:
         events, so they stay in step with the FSM banner on the dashboard:
 
         * ``DEPLOY`` (state 4)            -> drogue out  / solenoid latch fires
-        * ``AEROBRAKE_RELEASE`` (state 6) -> parafoil out / nichrome cutter fires
+        * ``AEROBRAKE_RELEASE`` (state 6) -> parafoil out / stage 2
         """
         if state >= 4 and state != 7:
             self._solenoid_fired = True
             self._recovery_stage = max(self._recovery_stage, 1)
         if state >= 6 and state != 7:
-            self._nichrome_fired = True
             self._recovery_stage = max(self._recovery_stage, 2)
         if state == 7:
-            # Landed: both events are long since latched.
+            # Landed: solenoid is long since latched.
             self._solenoid_fired = True
-            self._nichrome_fired = True
             self._recovery_stage = 2
 
     # -- packet assembly -----------------------------------------------------
@@ -396,7 +393,7 @@ class MissionSim:
             body = "%s,%s,%s,%d,%d" % (
                 self.team_id, PAYLOAD_ROCKET, common,
                 1 if self._solenoid_fired else 0,
-                1 if self._nichrome_fired else 0,
+                0,   # reserved field; keeps the frame at 22 fields
             )
             expected = FIELD_COUNT_ROCKET
         else:
@@ -763,7 +760,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=["cansat", "rocket", "generic"],
         help="Vehicle to simulate. 'cansat' adds the SPS30 particulate "
              "channels, reaction-wheel RPM and recovery stage; 'rocket' adds "
-             "the solenoid and nichrome status flags; 'generic' emits the "
+             "the solenoid status flag; 'generic' emits the "
              "legacy 19-field v1 frame (default: cansat).",
     )
     flight.add_argument("--origin", nargs=2, type=float, default=None,
