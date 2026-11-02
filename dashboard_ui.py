@@ -1945,14 +1945,13 @@ class Dashboard(QMainWindow):
 
         self.eject_btn = QPushButton("EJECT PAYLOAD")
         self.eject_btn.setObjectName("ejectBtn")
+        self.eject_btn.setEnabled(False)   # enabled once any radio connects
         self.eject_btn.setToolTip(
-            "UPLINK COMMAND - this transmits to the flight computer.\n\n"
-            "Sends $" + EJECT_COMMAND_BODY + "*XX inside an XBee 0x10 Transmit\n"
-            "Request frame. Asks for confirmation first, and logs the exact\n"
-            "bytes sent to the Event Log.\n\n"
-            "NOT YET END TO END: the flight firmware does not currently\n"
-            "listen for commands, so this transmits but nothing acts on it\n"
-            "yet."
+            "UPLINK COMMAND — transmits to the flight computer.\n\n"
+            "Sends the single byte 'E' inside an XBee 0x10 Transmit Request.\n"
+            "The FC fires pin 22 (drogue solenoid) unconditionally on receipt,\n"
+            "regardless of flight state or whether the drogue already deployed.\n"
+            "Asks for confirmation first; logs the exact command to the Event Log."
         )
         # Stacked, not side by side: this column is ~254 px wide, and two
         # buttons sharing that clip "START TELEMETRY" and "EJECT PAYLOAD".
@@ -2381,6 +2380,7 @@ class Dashboard(QMainWindow):
         self.is_connected = any_up
         self.tx_start_btn.setEnabled(any_up)
         self.tx_stop_btn.setEnabled(any_up)
+        self.eject_btn.setEnabled(any_up)
 
         if both_up:
             text, color = "● RX1+RX2", COL_OK
@@ -3371,10 +3371,8 @@ class Dashboard(QMainWindow):
             self.csv_logger.log_note("TX STOP not confirmed: packets still arriving")
 
     def on_eject_clicked(self) -> None:
-        """Confirm, then transmit a real ejection command over the radio."""
+        """Confirm, then transmit the single-byte 'E' eject command over the radio."""
         team = self.latest.team_id if self.latest is not None else "UNKNOWN"
-        body = EJECT_COMMAND_BODY
-        frame_text = build_frame(body)
 
         if not self.is_connected:
             QMessageBox.warning(
@@ -3390,11 +3388,10 @@ class Dashboard(QMainWindow):
         box.setWindowTitle("Confirm payload ejection")
         box.setText("Send EJECT command to %s?" % team)
         box.setInformativeText(
-            "This transmits %s to the flight computer over the radio.\n"
-            "This cannot be undone.\n\n"
-            "Note: the flight firmware does not yet listen for commands, so "
-            "this will be transmitted but is not expected to actuate anything "
-            "until that firmware exists." % frame_text
+            "This transmits the single-byte command 'E' to the flight computer.\n"
+            "The FC will immediately de-energise the drogue solenoid (pin 22),\n"
+            "releasing the parachute latch — regardless of flight state.\n\n"
+            "This cannot be undone."
         )
         box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
         box.setDefaultButton(QMessageBox.Cancel)   # never fire on a stray Enter
@@ -3404,16 +3401,17 @@ class Dashboard(QMainWindow):
             self.csv_logger.log_note("EJECT cancelled by operator")
             return
 
-        payload = frame_text.encode("ascii")
+        # Single-byte 'E' — FC handleCommand() strips whitespace, requires
+        # exactly one byte; multi-byte payloads like $CMD,EJECT*XX are ignored.
+        payload = b"E"
         queued = self.serial_worker.send_command(payload, "EJECT")
         stamp = datetime.now().isoformat(timespec="milliseconds")
         if not queued:
             self.append_event("EJECT NOT SENT — link closed at %s" % stamp)
             self.csv_logger.log_note("EJECT not sent: link closed")
             return
-        # Audit trail: the exact payload, before the radio has said anything.
-        self.append_event("EJECT command queued at %s: %s" % (stamp, frame_text))
-        self.csv_logger.log_note("EJECT command queued: %s" % frame_text)
+        self.append_event("EJECT command queued at %s: b'E'" % stamp)
+        self.csv_logger.log_note("EJECT command queued: b'E'")
 
     def on_command_sent(self, ok: bool, detail: str) -> None:
         """Report what actually went out of the serial port."""

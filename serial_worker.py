@@ -127,6 +127,10 @@ API_TX_REQUEST = 0x10
 #: 64-bit broadcast address, and the 16-bit "unknown/broadcast" value.
 API_ADDR64_BROADCAST = b"\x00\x00\x00\x00\x00\x00\xff\xff"
 API_ADDR16_UNKNOWN = b"\xff\xfe"
+#: Flight computer XBee 64-bit MAC (ATSH+ATSL = 0013A200428DCA31).
+#: Using unicast instead of broadcast gives a real MAC-layer ACK so
+#: "delivered" in the TX Status actually confirms the FC received it.
+API_ADDR64_FC = b"\x00\x13\xa2\x00\x42\x8d\xca\x31"
 #: Delivery status byte of an 0x8B frame; 0x00 means the radio got an ack.
 API_TX_STATUS_OK = 0x00
 
