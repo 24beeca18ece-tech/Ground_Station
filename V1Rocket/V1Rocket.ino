@@ -769,14 +769,14 @@ static size_t buildTelemetry(char* out, size_t cap, uint32_t count, uint32_t now
 
   char body[240];
   int n = snprintf(body, sizeof(body),
-      "%s,ROCKET,%lu.%02lu,%lu,%.2f,%.2f,%.2f,%.2f,%s,%s,%s,%s,%u,%s,%s,%s,%s,%s,%s,%u,%u",
+      "%s,ROCKET,%lu.%02lu,%lu,%.2f,%.2f,%.2f,%.2f,%s,%s,%s,%s,%u,%s,%s,%s,%s,%s,%s,%u,%u,%u",
       TEAM_ID,
       (unsigned long)(nowMs / 1000UL), (unsigned long)((nowMs % 1000UL) / 10UL),
       (unsigned long)count,
       (double)aglRaw, (double)(baroPa / 100.0f), (double)baroTempC, (double)vbatFC,
       fix ? gTime : "", lat, lon, nalt, (unsigned)gSats,
       ax, ay, az, gx, gy, gz,
-      (unsigned)fsmState, solFlag ? 1u : 0u);
+      (unsigned)fsmState, solFlag ? 1u : 0u, 0u);
   if (n <= 0 || (size_t)n >= sizeof(body)) return 0;
 
   int m = snprintf(out, cap, "$%s*%02X", body, (unsigned)xorChecksum(body));
