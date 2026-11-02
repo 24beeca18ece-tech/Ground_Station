@@ -947,10 +947,20 @@ static void xbeePoll() {
         } else if (fpos >= 6 && fdata[0] == 0x8B) {
           noteTxStatus(fdata[1], fdata[5]);
         } else if (fpos >= 12 && fdata[0] == 0x90) {
+          // ZigBee-style 64-bit receive (header = 12 bytes)
           uint8_t sender[8];
           memcpy(sender, &fdata[1], 8);
-          size_t payLen = flen - 12;
-          handleGcsCommand(sender, &fdata[12], payLen);
+          if (flen > 12) handleGcsCommand(sender, &fdata[12], flen - 12);
+        } else if (fpos >= 11 && fdata[0] == 0x80) {
+          // 802.15.4 legacy 64-bit receive (header = 11: type+addr64+rssi+opts)
+          uint8_t sender[8];
+          memcpy(sender, &fdata[1], 8);
+          if (flen > 11) handleGcsCommand(sender, &fdata[11], flen - 11);
+        } else if (fpos >= 5 && fdata[0] == 0x81) {
+          // 802.15.4 legacy 16-bit receive (header = 5: type+addr16+rssi+opts)
+          // XBee 3 in 802.15.4 mode produces this exclusively on real hardware.
+          // No 64-bit sender MAC available; reply goes to RX1 by default.
+          if (flen > 5) handleGcsCommand(XBEE_MAC_RX1, &fdata[5], flen - 5);
         }
         break;
     }
