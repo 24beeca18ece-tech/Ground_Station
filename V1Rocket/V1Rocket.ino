@@ -579,12 +579,12 @@ static void releaseDrogueLatch() {
 
 static void fireMain() {
   if (mainFired) return;
-  digitalWriteFast(PIN_SOL_MAIN, HIGH);
+  digitalWriteFast(PIN_SOL_MAIN, LOW);
   mainFireOffMs = millis() + MAIN_FIRE_DURATION_MS;
   mainFired    = true;
   flagNichrome = true;
   beepOnce(500);
-  Serial.println("[ACT] Main solenoid ON — 3 s pulse");
+  Serial.println("[ACT] Main solenoid RELEASED — 3 s LOW pulse");
 }
 
 static void serviceActuators() {
@@ -595,9 +595,9 @@ static void serviceActuators() {
     Serial.println("[ACT] Main solenoid OFF");
   }
   if (droguePulseOffMs != 0 && (int32_t)(now - droguePulseOffMs) >= 0) {
-    digitalWriteFast(PIN_SOL_DROGUE, LOW);
+    digitalWriteFast(PIN_SOL_DROGUE, HIGH);
     droguePulseOffMs = 0;
-    Serial.println("[ACT] Drogue test pulse complete — pin LOW");
+    Serial.println("[ACT] Drogue test pulse complete — pin HIGH (hold restored)");
   }
   // Failsafe: if apogee never detected, release drogue hold after 45 s in ASCENT
   if (!drogueFired && fsmState == FSM_ASCENT && (now - tLaunchMs > DROGUE_MAX_HOLD_MS)) {
@@ -921,7 +921,7 @@ static void handleCommand(const uint8_t* p, size_t n) {
       if (fsmState < FSM_DEPLOY) { tDeployMs = now; fsmState = FSM_DEPLOY; }
     } else {
       // Ground / pad / post-flight — 1 s pulse every press, FSM unchanged
-      digitalWriteFast(PIN_SOL_DROGUE, HIGH);
+      digitalWriteFast(PIN_SOL_DROGUE, LOW);
       droguePulseOffMs = now + 1000;
     }
     cmdAccepted++; lastCmd = 'E'; lastCmdMs = now;
@@ -1100,8 +1100,8 @@ void setup() {
   pinMode(PIN_LED_B,      OUTPUT);
   pinMode(PIN_SOL_DROGUE, OUTPUT);
   pinMode(PIN_SOL_MAIN,   OUTPUT);
-  digitalWriteFast(PIN_SOL_DROGUE, LOW);
-  digitalWriteFast(PIN_SOL_MAIN,   LOW);
+  digitalWriteFast(PIN_SOL_DROGUE, HIGH);  // hold latch closed until ejection
+  digitalWriteFast(PIN_SOL_MAIN,   HIGH);  // hold latch closed until main deploy
   digitalWrite(PIN_BUZZER, LOW);
   digitalWrite(PIN_LED_R, HIGH);
 
