@@ -1105,7 +1105,7 @@ void setup() {
   pinMode(PIN_SOL_DROGUE, OUTPUT);
 
   digitalWriteFast(PIN_BUZZER,     LOW);
-  digitalWriteFast(PIN_SOL_DROGUE, LOW);  // starts LOW; energized once PAD calibration completes
+  digitalWriteFast(PIN_SOL_DROGUE, HIGH); // energized immediately on power-on; LOW only on EJECT
   digitalWriteFast(PIN_LED_R,      HIGH); // solid red on boot
 
   Serial.begin(115200);
